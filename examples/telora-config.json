@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "members": [
+    "app",
+    "domain-method"
+  ]
+}

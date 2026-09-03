@@ -40,11 +40,10 @@
         std::fs::write(dependency.join("src/bin/tool.telora"), "0").unwrap();
         std::fs::write(dependency.join("src/entry/serve.telora"), "0").unwrap();
         std::fs::write(dependency.join("tests/query.telora"), "0").unwrap();
-        std::fs::write(
-            app.join("telora-deps.json"),
-            r#"{"name":"app","dependencies":{"dep":{"path":"../dependency"}}}"#,
-        )
-        .unwrap();
+        write_test_workspace(
+            &temporary,
+            &[("app", "app", &["dep"]), ("dependency", "dep", &[])],
+        );
 
         let catalog = ModuleResolver::catalog_from_cwd(
             &app,
@@ -52,7 +51,7 @@
                 ("std/string".to_owned(), 1),
                 ("std/_rt".to_owned(), 2),
                 ("std/_host".to_owned(), 3),
-                ("std/entry/default".to_owned(), 4),
+                ("std/_entry".to_owned(), 4),
             ],
         )
         .unwrap();
@@ -65,8 +64,12 @@
             by_name.keys().map(String::as_str).collect::<Vec<_>>(),
             [
                 "app/_rules",
+                "app/bin/tool",
+                "app/entry/serve",
                 "app/lib",
                 "app/schema.json",
+                "dep/bin/tool",
+                "dep/entry/serve",
                 "dep/public",
                 "std/string",
             ]
@@ -91,18 +94,17 @@
     fn path_dependencies_keep_logical_identity() {
         let temporary =
             std::env::temp_dir().join(format!("telora-module-id-test-{}", std::process::id()));
-        std::fs::create_dir_all(temporary.join("app")).unwrap();
-        std::fs::create_dir_all(temporary.join("models")).unwrap();
-        std::fs::write(temporary.join("app/main.telora"), "0").unwrap();
-        std::fs::write(
-            temporary.join("telora-deps.json"),
-            r#"{"name":"app","dependencies":{"models":{"path":"models"}}}"#,
-        )
-        .unwrap();
-        std::fs::write(temporary.join("models/user.telora"), "0").unwrap();
-        let resolver = ModuleResolver::for_root(&temporary.join("app/main.telora")).unwrap();
+        std::fs::create_dir_all(temporary.join("app/src")).unwrap();
+        std::fs::create_dir_all(temporary.join("models/src")).unwrap();
+        std::fs::write(temporary.join("app/src/main.telora"), "0").unwrap();
+        std::fs::write(temporary.join("models/src/user.telora"), "0").unwrap();
+        write_test_workspace(
+            &temporary,
+            &[("app", "app", &["models"]), ("models", "models", &[])],
+        );
+        let resolver = ModuleResolver::for_root(&temporary.join("app/src/main.telora")).unwrap();
         let root = resolver
-            .resolve_root(&temporary.join("app/main.telora"))
+            .resolve_root(&temporary.join("app/src/main.telora"))
             .unwrap();
         let dependency = resolver.resolve_import(&root.id, "models/user").unwrap();
         assert_eq!(dependency.id.to_string(), "models/user");
@@ -135,13 +137,16 @@
         std::fs::write(dependency.join("src/bad.name.json"), "0").unwrap();
         std::fs::write(shadow.join("src/array.telora"), "0").unwrap();
         std::fs::write(shadow.join("src/extension.telora"), "0").unwrap();
-        std::fs::write(
-            app.join("telora-deps.json"),
-            r#"{"name":"app","dependencies":{"dep":{"path":"../dependency"},"std":{"path":"../shadow"}}}"#,
-        )
-        .unwrap();
+        write_test_workspace(
+            &temporary,
+            &[
+                ("app", "app", &["dep", "std"]),
+                ("dependency", "dep", &[]),
+                ("shadow", "std", &[]),
+            ],
+        );
 
-        let entry = ModuleCName::builtin("std/entry/default");
+        let entry = ModuleCName::builtin("std/_entry");
         let resolver = ModuleResolver::for_root(&main)
             .unwrap()
             .with_builtins([
@@ -225,7 +230,7 @@
     }
 
     #[test]
-    fn crate_layout_resolves_binary_source_and_contextual_source_roots() {
+    fn crate_layout_resolves_cataloged_and_contextual_source_roots() {
         let temporary =
             std::env::temp_dir().join(format!("telora-crate-layout-test-{}", std::process::id()));
         let app = temporary.join("app");
@@ -237,13 +242,12 @@
         std::fs::write(&main, "0").unwrap();
         std::fs::write(app.join("src/model/a.telora"), "0").unwrap();
         std::fs::write(dependency.join("src/model/a.telora"), "0").unwrap();
-        std::fs::write(
-            app.join("telora-deps.json"),
-            r#"{"name":"app","dependencies":{"parser":{"path":"../dependency"}}}"#,
-        )
-        .unwrap();
+        write_test_workspace(
+            &temporary,
+            &[("app", "app", &["parser"]), ("dependency", "parser", &[])],
+        );
 
-        let entry = ModuleCName::builtin("std/entry/default");
+        let entry = ModuleCName::builtin("std/_entry");
         let resolver = ModuleResolver::for_root(&main)
             .unwrap()
             .with_builtins([("std/_rt".to_owned(), 26)])
@@ -251,9 +255,9 @@
         let root = resolver.resolve_root(&main).unwrap();
         assert_eq!(
             root.id,
-            ModuleCName::Binary {
+            ModuleCName::Source {
                 owner: "app".into(),
-                path: PathBuf::from("tool"),
+                path: PathBuf::from("bin/tool"),
             }
         );
         assert_eq!(root.to_string(), "app/bin/tool");
@@ -262,11 +266,7 @@
             .resolve_import(&root.id, "@src/model/a")
             .unwrap();
         assert_eq!(local.to_string(), "app/model/a");
-        assert!(matches!(
-            resolver.resolve_import(&root.id, "./model/a"),
-            Err(ResolveModuleError::InvalidImport(message))
-                if message.contains("binary and test roots must import crate sources with @src/...")
-        ));
+        assert!(resolver.resolve_import(&root.id, "./model/a").is_err());
 
         let dependency = resolver
             .resolve_import(&root.id, "parser/model/a")
@@ -279,20 +279,13 @@
                 .id,
             dependency.id
         );
-        assert!(matches!(
-            resolver.resolve_import(&local.id, "@bin/tool"),
-            Err(ResolveModuleError::InvalidImport(_))
-        ));
-        assert_eq!(entry.to_string(), "std/entry/default");
+        assert_eq!(entry.to_string(), "std/_entry");
         assert_eq!(
             resolver
-                .resolve_import(&entry, "@bin/tool")
+                .resolve_import(&entry, "app/bin/tool")
                 .unwrap()
                 .id,
-            ModuleCName::Binary {
-                owner: "app".into(),
-                path: PathBuf::from("tool"),
-            }
+            root.id
         );
         assert_eq!(
             resolver
@@ -340,42 +333,38 @@
         std::fs::write(app.join("tests/nested/query.telora"), "0").unwrap();
         std::fs::write(dependency.join("src/helper.telora"), "0").unwrap();
         std::fs::write(dependency.join("src/entry/tool.telora"), "0").unwrap();
-        std::fs::write(
-            app.join("telora-deps.json"),
-            r#"{"name":"app","dependencies":{"dep":{"path":"../dependency"}}}"#,
-        )
-        .unwrap();
+        write_test_workspace(
+            &temporary,
+            &[("app", "app", &["dep"]), ("dependency", "dep", &[])],
+        );
 
         let main = app.join("src/bin/main.telora");
-        let selected_entry = ModuleCName::Entry {
-            owner: "app".into(),
-            path: "tool".into(),
-        };
+        let selected_entry = ModuleCName::builtin("std/_entry");
         let resolver = ModuleResolver::for_root(&main)
             .unwrap()
-            .with_builtins([("std/entry/default".to_owned(), 1)])
+            .with_builtins([("std/_entry".to_owned(), 1)])
             .with_entry_context(selected_entry.clone());
         let library = ModuleCName::Source {
             owner: "app".into(),
             path: "lib".into(),
         };
 
+        assert_eq!(
+            resolver.resolve_import(&library, "./entry/tool").unwrap().id.to_string(),
+            "app/entry/tool"
+        );
+        assert_eq!(
+            resolver.resolve_import(&library, "dep/entry/tool").unwrap().id.to_string(),
+            "dep/entry/tool"
+        );
         assert!(matches!(
-            resolver.resolve_import(&library, "./entry/tool"),
-            Err(ResolveModuleError::EntryModuleAccess(_))
+            resolver.resolve_import(&library, "std/_entry"),
+            Err(ResolveModuleError::PrivateModuleAccess(_))
         ));
-        assert!(matches!(
-            resolver.resolve_import(&library, "dep/entry/tool"),
-            Err(ResolveModuleError::EntryModuleAccess(_))
-        ));
-        assert!(matches!(
-            resolver.resolve_import(&library, "std/entry/default"),
-            Err(ResolveModuleError::EntryModuleAccess(_))
-        ));
-        assert!(matches!(
-            resolver.resolve_import(&selected_entry, "app/bin/other"),
-            Err(ResolveModuleError::InvalidImport(_))
-        ));
+        assert_eq!(
+            resolver.resolve_import(&selected_entry, "app/bin/other").unwrap().id.to_string(),
+            "app/bin/other"
+        );
         assert_eq!(
             resolver
                 .resolve_import(&selected_entry, "app/bin/main")
@@ -385,33 +374,15 @@
             "app/bin/main"
         );
 
-        let dependency_entry = resolver.resolve_entry("dep/entry/tool").unwrap();
-        let dependency_resolver = resolver
-            .clone()
-            .with_entry_context(dependency_entry.id.clone());
-        assert_eq!(
-            dependency_resolver
-                .resolve_import(&dependency_entry.id, "@src/helper")
-                .unwrap()
-                .id
-                .to_string(),
-            "dep/helper"
-        );
-
-        for selector in ["@bin/nested/tool", "@test/nested/query"] {
-            assert!(matches!(
-                ModuleResolver::from_cwd(&app, selector),
-                Err(ResolveModuleError::InvalidImport(message)) if message.contains("files only")
-            ));
-        }
         assert!(matches!(
-            ModuleResolver::for_root(&app.join("src/entry/nested/tool.telora")),
+            ModuleResolver::from_cwd(&app, "@test/nested/query"),
             Err(ResolveModuleError::InvalidImport(message)) if message.contains("files only")
         ));
+        assert!(ModuleResolver::for_root(&app.join("src/entry/nested/tool.telora")).is_ok());
 
         let catalog = ModuleResolver::catalog_from_cwd(
             &app,
-            [("std/entry/default".to_owned(), 1)],
+            [("std/_entry".to_owned(), 1)],
         )
         .unwrap();
         assert_eq!(
@@ -419,7 +390,16 @@
                 .into_iter()
                 .map(|module| module.id.to_string())
                 .collect::<Vec<_>>(),
-            ["app/lib", "dep/helper"]
+            [
+                "app/bin/main",
+                "app/bin/nested/tool",
+                "app/bin/other",
+                "app/entry/nested/tool",
+                "app/entry/tool",
+                "app/lib",
+                "dep/entry/tool",
+                "dep/helper",
+            ]
         );
 
         std::fs::remove_dir_all(temporary).unwrap();
@@ -437,7 +417,7 @@
         let app = temporary.join("app");
         std::fs::create_dir_all(app.join("src/bin")).unwrap();
         std::fs::create_dir_all(app.join("tests")).unwrap();
-        std::fs::write(app.join("telora-deps.json"), r#"{"name":"app"}"#).unwrap();
+        write_test_workspace(&temporary, &[("app", "app", &[])]);
         std::fs::write(temporary.join("outside.telora"), "export def output = 1;").unwrap();
         symlink(
             temporary.join("outside.telora"),
@@ -451,7 +431,7 @@
         .unwrap();
 
         assert!(matches!(
-            ModuleResolver::from_cwd(&app, "@bin/escape"),
+            ModuleResolver::from_cwd(&app, "@src/bin/escape"),
             Err(ResolveModuleError::CrateEscape(_))
         ));
         assert!(matches!(
@@ -468,7 +448,7 @@
         std::fs::create_dir_all(temporary.join("app/sub")).unwrap();
         let main = temporary.join("app/main.telora");
         let data = temporary.join("app/data.json");
-        std::fs::write(&main, "option \"crate.name\" \"app\"; 0").unwrap();
+        std::fs::write(&main, "0").unwrap();
         std::fs::write(&data, "{}").unwrap();
         let resolver = ModuleResolver::for_root(&main).unwrap();
         let root = resolver.resolve_root(&main).unwrap();
@@ -497,36 +477,8 @@
         let resolver = ModuleResolver::standalone(&root).unwrap();
         assert_eq!(
             resolver.selected_root().unwrap().id.to_string(),
-            "standalone/bin/main"
+            "standalone/main"
         );
-
-        std::fs::remove_dir_all(temporary).unwrap();
-    }
-
-    #[test]
-    fn standalone_overlay_options_build_the_complete_resolve_graph() {
-        let temporary = std::env::temp_dir().join(format!(
-            "telora-standalone-overlay-test-{}",
-            std::process::id()
-        ));
-        let dependency = temporary.join("dep");
-        std::fs::create_dir_all(&dependency).unwrap();
-        std::fs::write(dependency.join("value.telora"), "export def value = 42;").unwrap();
-        let root = temporary.join("main.telora");
-        let source = crate::DocumentText::new(
-            r#"option "crate.name" "standalone";
-option "crate.dependency" {name: "dep", source: 'Path({path: "dep"})};
-import "dep/value" {value};
-export {value};"#,
-        );
-
-        let resolver = ModuleResolver::for_root_with_source(&root, &source).unwrap();
-        let selected = resolver.resolve_root(&root).unwrap();
-        assert_eq!(selected.id.to_string(), "standalone/bin/main");
-        let imported = resolver.resolve_import(&selected.id, "dep/value").unwrap();
-        assert_eq!(imported.id.to_string(), "dep/value");
-        let expected = std::fs::canonicalize(dependency.join("value.telora")).unwrap();
-        assert_eq!(imported.path(), Some(expected.as_path()));
 
         std::fs::remove_dir_all(temporary).unwrap();
     }
@@ -537,14 +489,10 @@ export {value};"#,
             "telora-standalone-relative-import-test-{}",
             std::process::id()
         ));
-        let dependency = temporary.join("dep");
         std::fs::create_dir_all(temporary.join("nested")).unwrap();
-        std::fs::create_dir_all(dependency.join("sub")).unwrap();
         std::fs::write(temporary.join("main.telora"), "0").unwrap();
         std::fs::write(temporary.join("nested/first.telora"), "0").unwrap();
         std::fs::write(temporary.join("nested/second.telora"), "0").unwrap();
-        std::fs::write(dependency.join("sub/first.telora"), "0").unwrap();
-        std::fs::write(dependency.join("sub/second.telora"), "0").unwrap();
 
         let resolver = ModuleResolver::standalone(&temporary.join("main.telora"))
             .unwrap()
@@ -560,47 +508,21 @@ export {value};"#,
             .unwrap();
         assert_eq!(nested.id.to_string(), "standalone/nested/second");
 
-        let source = crate::DocumentText::new(
-            r#"option "crate.dependency" {name: "dep", source: 'Path({path: "dep"})}; 0"#,
-        );
-        let resolver = ModuleResolver::for_root_with_source(&temporary.join("main.telora"), &source)
-            .unwrap();
-        let dependency_module = resolver
-            .resolve_import(
-                &ModuleCName::Dependency {
-                    name: "dep".into(),
-                    path: PathBuf::from("sub/first"),
-                },
-                "./second",
-            )
-            .unwrap();
-        assert_eq!(dependency_module.id.to_string(), "dep/sub/second");
-
         std::fs::remove_dir_all(temporary).unwrap();
     }
 
     #[test]
-    fn crate_source_registration_is_first_win_and_immutable() {
+    fn crate_sources_are_unique_and_builtin_registration_is_first_win() {
         assert!(validate_crate_name("std").is_ok());
         let temporary = std::env::temp_dir().join(format!(
             "telora-crate-owner-collision-test-{}",
             std::process::id()
         ));
         let app = temporary.join("app");
-        let dependency = temporary.join("dependency");
-        let second_dependency = temporary.join("second-dependency");
         std::fs::create_dir_all(app.join("src")).unwrap();
-        std::fs::create_dir_all(&dependency).unwrap();
-        std::fs::create_dir_all(&second_dependency).unwrap();
         std::fs::write(app.join("src/main.telora"), "0").unwrap();
         std::fs::write(app.join("src/value.telora"), "0").unwrap();
-        std::fs::write(dependency.join("value.telora"), "0").unwrap();
-        std::fs::write(second_dependency.join("value.telora"), "0").unwrap();
-        std::fs::write(
-            app.join("telora-deps.json"),
-            r#"{"name":"app","dependencies":{"app":{"path":"../dependency"}}}"#,
-        )
-        .unwrap();
+        write_test_workspace(&temporary, &[("app", "app", &[])]);
         let resolver = ModuleResolver::for_root(&app.join("src/main.telora")).unwrap();
         let root = resolver.selected_root().unwrap();
         let selected = resolver.resolve_import(&root.id, "app/value").unwrap();
@@ -612,33 +534,7 @@ export {value};"#,
                 .as_path()
         );
 
-        std::fs::write(temporary.join("value.telora"), "0").unwrap();
-        let source = crate::DocumentText::new(
-            r#"option "crate.dependency" {name: "dep", source: 'Path({path: "dependency"})};
-option "crate.dependency" {name: "dep", source: 'Path({path: "second-dependency"})};
-option "crate.dependency" {name: "standalone", source: 'Path({path: "dependency"})}; 0"#,
-        );
-        let resolver =
-            ModuleResolver::for_root_with_source(&temporary.join("main.telora"), &source).unwrap();
-        let root = resolver.selected_root().unwrap();
-        let dependency_value = resolver.resolve_import(&root.id, "dep/value").unwrap();
-        assert_eq!(
-            dependency_value.path().unwrap(),
-            std::fs::canonicalize(dependency.join("value.telora"))
-                .unwrap()
-                .as_path()
-        );
-        let standalone_value = resolver
-            .resolve_import(&root.id, "standalone/value")
-            .unwrap();
-        assert_eq!(
-            standalone_value.path().unwrap(),
-            std::fs::canonicalize(temporary.join("value.telora"))
-                .unwrap()
-                .as_path()
-        );
-
-        std::fs::write(app.join("telora-deps.json"), r#"{"name":"std"}"#).unwrap();
+        write_test_workspace(&temporary, &[("app", "std", &[])]);
         let resolver = ModuleResolver::for_root(&app.join("src/main.telora"))
             .unwrap()
             .with_builtins([("std/array".to_owned(), 5)]);
@@ -659,40 +555,36 @@ option "crate.dependency" {name: "standalone", source: 'Path({path: "dependency"
         ));
         let app = temporary.join("app");
         let dependency = temporary.join("dependency");
-        std::fs::create_dir_all(&app).unwrap();
-        std::fs::create_dir_all(&dependency).unwrap();
-        let main = app.join("main.telora");
+        std::fs::create_dir_all(app.join("src")).unwrap();
+        std::fs::create_dir_all(dependency.join("src")).unwrap();
+        let main = app.join("src/main.telora");
         std::fs::write(&main, "0").unwrap();
-        std::fs::write(dependency.join("schema.json"), "{}").unwrap();
-        std::fs::write(
-            temporary.join("telora-deps.json"),
-            r#"{
-                "name": "app",
-                "dependencies": {"dep": {"path": "dependency"}}
-            }"#,
-        )
-        .unwrap();
+        std::fs::write(dependency.join("src/schema.json"), "{}").unwrap();
+        write_test_workspace(
+            &temporary,
+            &[("app", "app", &["dep"]), ("dependency", "dep", &[])],
+        );
         let resolver = ModuleResolver::for_root(&main).unwrap();
         let root = resolver.resolve_root(&main).unwrap();
         let schema = resolver.resolve_import(&root.id, "dep/schema.json").unwrap();
         assert_eq!(schema.format, ModuleFormat::Json);
 
         std::fs::write(
-            temporary.join("telora-deps.json"),
-            r#"{"name":"app","dependencies": []}"#,
+            app.join(crate::package::CRATE_FILE),
+            r#"{"name":"app","modules":["@src/main"],"dependencies": {}}"#,
         )
         .unwrap();
         assert!(matches!(
             ModuleResolver::for_root(&main),
             Err(ResolveModuleError::Manifest(message))
-                if message.contains("dependencies") && message.contains("object")
+                if message.contains("telora-crate.json") && message.contains("sequence")
         ));
 
-        std::fs::write(temporary.join("telora-deps.json"), "{").unwrap();
+        std::fs::write(app.join(crate::package::CRATE_FILE), "{").unwrap();
         assert!(matches!(
             ModuleResolver::for_root(&main),
             Err(ResolveModuleError::Manifest(message))
-                if message.contains("invalid") && message.contains("telora-deps.json")
+                if message.contains("invalid") && message.contains("telora-crate.json")
         ));
         std::fs::remove_dir_all(temporary).unwrap();
     }
@@ -706,22 +598,21 @@ option "crate.dependency" {name: "standalone", source: 'Path({path: "dependency"
             std::env::temp_dir().join(format!("telora-module-escape-test-{}", std::process::id()));
         let app = temporary.join("app");
         let dependency = temporary.join("dependency");
-        std::fs::create_dir_all(&app).unwrap();
-        std::fs::create_dir_all(&dependency).unwrap();
-        std::fs::write(app.join("main.telora"), "0").unwrap();
+        std::fs::create_dir_all(app.join("src")).unwrap();
+        std::fs::create_dir_all(dependency.join("src")).unwrap();
+        std::fs::write(app.join("src/main.telora"), "0").unwrap();
         std::fs::write(temporary.join("outside.telora"), "0").unwrap();
-        std::fs::write(
-            temporary.join("telora-deps.json"),
-            r#"{"name":"app","dependencies":{"dep":{"path":"dependency"}}}"#,
-        )
-        .unwrap();
         symlink(
             temporary.join("outside.telora"),
-            dependency.join("escape.telora"),
+            dependency.join("src/escape.telora"),
         )
         .unwrap();
-        let resolver = ModuleResolver::for_root(&app.join("main.telora")).unwrap();
-        let root = resolver.resolve_root(&app.join("main.telora")).unwrap();
+        write_test_workspace(
+            &temporary,
+            &[("app", "app", &["dep"]), ("dependency", "dep", &[])],
+        );
+        let resolver = ModuleResolver::for_root(&app.join("src/main.telora")).unwrap();
+        let root = resolver.resolve_root(&app.join("src/main.telora")).unwrap();
         assert!(matches!(
             resolver.resolve_import(&root.id, "dep/../outside"),
             Err(ResolveModuleError::CrateEscape(_))
@@ -731,4 +622,73 @@ option "crate.dependency" {name: "standalone", source: 'Path({path: "dependency"
             Err(ResolveModuleError::CrateEscape(_))
         ));
         std::fs::remove_dir_all(temporary).unwrap();
+    }
+    fn write_test_workspace(root: &Path, members: &[(&str, &str, &[&str])]) {
+        fn collect(root: &Path, directory: &Path, modules: &mut Vec<String>) {
+            let Ok(entries) = std::fs::read_dir(directory) else {
+                return;
+            };
+            let mut entries = entries.collect::<Result<Vec<_>, _>>().unwrap();
+            entries.sort_by_key(std::fs::DirEntry::file_name);
+            for entry in entries {
+                let path = entry.path();
+                let file_type = entry.file_type().unwrap();
+                if file_type.is_dir() {
+                    collect(root, &path, modules);
+                    continue;
+                }
+                if !file_type.is_file() {
+                    continue;
+                }
+                let Ok(format) = ModuleFormat::from_path(&path) else {
+                    continue;
+                };
+                if canonical_path_for_physical(path.strip_prefix(root).unwrap()).is_err() {
+                    continue;
+                }
+                let mut logical = path.strip_prefix(root).unwrap().to_owned();
+                if format == ModuleFormat::Telora {
+                    logical.set_extension("");
+                }
+                modules.push(format!(
+                    "@src/{}",
+                    logical.to_string_lossy().replace('\\', "/")
+                ));
+            }
+        }
+
+        let mut member_paths = Vec::new();
+        for (relative, name, dependencies) in members {
+            let crate_root = root.join(relative);
+            let mut modules = Vec::new();
+            collect(&crate_root.join("src"), &crate_root.join("src"), &mut modules);
+            modules.sort();
+            let mut dependencies = dependencies.to_vec();
+            dependencies.sort();
+            std::fs::write(
+                crate_root.join(crate::package::CRATE_FILE),
+                serde_json::to_vec(&serde_json::json!({
+                    "name": name,
+                    "modules": modules,
+                    "dependencies": dependencies,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            member_paths.push(*relative);
+        }
+        std::fs::write(
+            root.join(crate::package::CONFIG_FILE),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "members": member_paths,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let spec = crate::package::WorkspaceSpec::discover(root).unwrap();
+        let lock = spec
+            .generate_lock(&std::collections::BTreeMap::new())
+            .unwrap();
+        spec.write_lock(&lock).unwrap();
     }

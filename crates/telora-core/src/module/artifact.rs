@@ -31,14 +31,7 @@ pub struct LoadedModule {
     pub function: BytecodeFunction,
     pub sources: SourceDatabase,
     pub workspace: WorkspaceSnapshot,
-    options: Vec<LoadedOptionAction>,
     runtime: Arc<ModuleRuntime>,
-}
-
-#[derive(Clone, Debug)]
-pub struct LoadedOptionAction {
-    pub key: String,
-    pub value: crate::DataWorld,
 }
 
 #[derive(Clone)]
@@ -49,7 +42,6 @@ pub struct PendingModule {
 struct PendingModuleInner {
     path: PathBuf,
     resolver: ModuleResolver,
-    options: Vec<LoadedOptionAction>,
     config: EngineConfig,
     debug_sink: Arc<dyn DebugSink>,
     state: Mutex<PendingModuleState>,
@@ -98,14 +90,14 @@ impl PendingModule {
                     Ok(bindings)
                 }
                 PendingModuleState::Initializing => {
-                    return Err(ModuleError::new(
+                    Err(ModuleError::new(
                         "module initialization is already in progress",
-                    ));
+                    ))
                 }
                 PendingModuleState::Ready(_) => {
-                    return Err(ModuleError::new("module is already initialized"));
+                    Err(ModuleError::new("module is already initialized"))
                 }
-                PendingModuleState::Failed(error) => return Err(error.clone()),
+                PendingModuleState::Failed(error) => Err(error.clone()),
             }
         }
     }
@@ -173,7 +165,6 @@ struct CompiledTeloraModule {
     analysis: Analysis,
     function: BytecodeFunction,
     externals: HashMap<String, Val>,
-    options: Vec<LoadedOptionAction>,
 }
 
 fn loaded_from_compiled(
@@ -191,7 +182,6 @@ fn loaded_from_compiled(
         function: compiled.function,
         sources,
         workspace,
-        options: compiled.options,
         runtime: Arc::new(ModuleRuntime {
             main,
             externals: compiled.externals,

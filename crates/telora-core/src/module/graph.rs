@@ -122,28 +122,6 @@ impl ModuleGraph {
             };
             let source_id = scan_sources.add(cname.to_string(), source);
             let parsed = parse_registered(&scan_sources, source_id);
-            if let Some(option) = parsed
-                .options
-                .iter()
-                .find(|option| option.key.value.starts_with("crate.") && !resolver.is_standalone())
-            {
-                return Err(ModuleError::new(scan_sources.render(&Diagnostic::error(
-                    format!(
-                        "resolver option {:?} is only allowed in standalone mode",
-                        option.key.value
-                    ),
-                    option.location,
-                ))));
-            }
-            if let Some(option) = parsed.options.iter().find(|_| !resolver.is_root(&cname)) {
-                return Err(ModuleError::new(scan_sources.render(&Diagnostic::error(
-                    format!(
-                        "option {:?} is only allowed in the selected root",
-                        option.key.value
-                    ),
-                    option.location,
-                ))));
-            }
             let mut blueprint = match parsed.program.as_ref() {
                 Some(program) => {
                     reject_nested_imports(program, &cname.to_string())?;
@@ -593,6 +571,11 @@ fn install_native_modules_observed(
     }
     let mut default_prelude: Option<BTreeMap<String, PersistentValue>> = None;
     for spec in specs {
+        // Semantic catalog queries can install built-ins before their selected
+        // graph is available. Keep those provisional identities distinct.
+        let graph_module_id = main.modules.id(&ModuleCName::builtin(&spec.name));
+        let module_id = graph_module_id
+            .unwrap_or_else(|| ModuleId::from_raw(u32::MAX - spec.id));
         let source_name = spec.name.clone();
         let source_id = sources.add(source_name.clone(), &spec.source);
         let parsed = parse_registered(sources, source_id);
@@ -747,10 +730,6 @@ fn install_native_modules_observed(
             }
         }
         let mut account = QuotaAccount::new(Quota::new(100_000, 1_000, u64::MAX));
-        let module_id = main
-            .modules
-            .id(&ModuleCName::builtin(&spec.name))
-            .unwrap_or(ModuleId::ANONYMOUS);
         let analysis = analyze_program_with_bindings_observed(
             &source_name,
             module_id,
@@ -778,7 +757,9 @@ fn install_native_modules_observed(
             )
         })?;
         install_type_family_roots(&mut external_roots, &analysis);
-        let static_funcs = main.modules.static_funcs(module_id);
+        let static_funcs = graph_module_id
+            .map(|module_id| main.modules.static_funcs(module_id))
+            .unwrap_or_default();
         let mut runtime_program = program.clone();
         if let ExprKind::Dict(fields) = &mut runtime_program.value.body.value.result.value {
             let location = runtime_program.value.body.value.result.location;

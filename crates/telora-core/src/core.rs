@@ -1,14 +1,13 @@
 use crate::value::{
-    CoreArrayFunction, CoreAttributesFunction, CoreCodecFunction, CoreDictFunction,
-    CoreDynFunction, CoreEqFunction, CoreHashFunction, CoreJsonFunction, CoreModelFunction,
-    CorePathFunction, CoreResultFunction, CoreStringFunction, CoreTypeDescFunction, NativeFunction,
+    CoreArrayFunction, CoreCodecFunction, CoreDictFunction, CoreDynFunction, CoreEqFunction,
+    CoreHashFunction, CoreJsonFunction, CoreModelFunction, CorePathFunction, CoreResultFunction,
+    CoreStringFunction, CoreTypeDescFunction, NativeFunction,
 };
 
 pub(crate) const PRELUDE_MODULE: &str = "std/prelude";
+pub(crate) const PRIVATE_CODEC_MODULE: &str = "std/_codec";
 pub(crate) const ARRAY_MODULE: &str = "std/array";
-pub(crate) const ATTRIBUTES_MODULE: &str = "std/attributes";
 pub(crate) const DICT_MODULE: &str = "std/dict";
-pub(crate) const BUILD_MODULE: &str = "std/build";
 pub(crate) const EXEC_MODULE: &str = "std/rt-types/exec";
 pub(crate) const ARGV_MODULE: &str = "std/argv";
 pub(crate) const CODEC_MODULE: &str = "std/codec";
@@ -29,15 +28,19 @@ pub(crate) const REGEX_MODULE: &str = "std/regex";
 pub(crate) const FMT_MODULE: &str = "std/fmt";
 pub(crate) const FMT_CAPABILITY_BINDING: &str = "\0std:fmt";
 pub(crate) const EDGE_RUNTIME_MODULE: &str = "std/_rt";
-pub(crate) const DEFAULT_ENTRY_MODULE: &str = "std/entry/default";
-pub(crate) const SERVE_ENTRY_MODULE: &str = "std/entry/serve";
+pub(crate) const EES_MODULE: &str = "std/ees";
+pub(crate) const ACTOR_MODULE: &str = "std/actor";
+pub(crate) const ENTRY_MODULE: &str = "std/entry";
+pub(crate) const PRIVATE_ENTRY_MODULE: &str = "std/_entry";
+pub(crate) const RUN_ENTRY_MODE: &str = "run";
+pub(crate) const SERVE_ENTRY_MODE: &str = "serve";
 
-pub(crate) fn default_entry_source() -> &'static str {
-    include_str!("../modules/std/entry/default.telora")
+pub(crate) fn run_entry_source() -> &'static str {
+    include_str!("../modules/std/_entry/run.telora")
 }
 
 pub(crate) fn serve_entry_source() -> &'static str {
-    include_str!("../modules/std/entry/serve.telora")
+    include_str!("../modules/std/_entry/serve.telora")
 }
 
 pub(crate) struct BuiltinModuleSpec {
@@ -50,15 +53,45 @@ pub(crate) struct BuiltinModuleSpec {
 pub(crate) fn module_specs() -> Vec<BuiltinModuleSpec> {
     let mut specs = vec![
         BuiltinModuleSpec {
+            native_id: 4,
+            name: PRIVATE_CODEC_MODULE,
+            source: include_str!("../modules/std/_codec.telora"),
+            functions: vec![],
+        },
+        BuiltinModuleSpec {
+            native_id: 27,
+            name: EES_MODULE,
+            source: include_str!("../modules/std/ees.telora"),
+            functions: vec![],
+        },
+        BuiltinModuleSpec {
+            native_id: 30,
+            name: ACTOR_MODULE,
+            source: include_str!("../modules/std/actor.telora"),
+            functions: vec![],
+        },
+        BuiltinModuleSpec {
+            native_id: 32,
+            name: ENTRY_MODULE,
+            source: include_str!("../modules/std/entry.telora"),
+            functions: vec![],
+        },
+        BuiltinModuleSpec {
             native_id: 26,
             name: EDGE_RUNTIME_MODULE,
             source: include_str!("../modules/std/_rt.telora"),
-            functions: vec![(
-                "call_with_diagnostics",
-                NativeFunction::core_runtime(
-                    crate::value::CoreRuntimeFunction::CallWithDiagnostics,
+            functions: vec![
+                (
+                    "call_with_diagnostics",
+                    NativeFunction::core_runtime(
+                        crate::value::CoreRuntimeFunction::CallWithDiagnostics,
+                    ),
                 ),
-            )],
+                (
+                    "state_type",
+                    NativeFunction::new("std/_rt.state_type", 1, crate::types::native_value_type),
+                ),
+            ],
         },
         BuiltinModuleSpec {
             native_id: 25,
@@ -194,43 +227,8 @@ pub(crate) fn module_specs() -> Vec<BuiltinModuleSpec> {
                     NativeFunction::core_type_desc(CoreTypeDescFunction::Resolve),
                 ),
                 (
-                    "strip_attributes",
-                    NativeFunction::core_type_desc(CoreTypeDescFunction::StripAttributes),
-                ),
-                (
                     "variants",
                     NativeFunction::core_type_desc(CoreTypeDescFunction::Variants),
-                ),
-            ],
-        },
-        BuiltinModuleSpec {
-            native_id: 4,
-            name: ATTRIBUTES_MODULE,
-            source: include_str!("../modules/std/attributes.telora"),
-            functions: vec![
-                (
-                    "add",
-                    NativeFunction::core_attributes(CoreAttributesFunction::Add),
-                ),
-                (
-                    "all",
-                    NativeFunction::core_attributes(CoreAttributesFunction::All),
-                ),
-                (
-                    "get",
-                    NativeFunction::core_attributes(CoreAttributesFunction::Get),
-                ),
-                (
-                    "has",
-                    NativeFunction::core_attributes(CoreAttributesFunction::Has),
-                ),
-                (
-                    "normalize",
-                    NativeFunction::core_attributes(CoreAttributesFunction::Normalize),
-                ),
-                (
-                    "strip",
-                    NativeFunction::core_attributes(CoreAttributesFunction::Strip),
                 ),
             ],
         },
@@ -397,12 +395,6 @@ pub(crate) fn module_specs() -> Vec<BuiltinModuleSpec> {
                 "parse_raw",
                 NativeFunction::core_json(CoreJsonFunction::ParseYaml),
             )],
-        },
-        BuiltinModuleSpec {
-            native_id: 11,
-            name: BUILD_MODULE,
-            source: include_str!("../modules/std/build.telora"),
-            functions: vec![],
         },
         BuiltinModuleSpec {
             native_id: 13,
@@ -643,19 +635,23 @@ pub(crate) fn module_specs() -> Vec<BuiltinModuleSpec> {
     // stable and are independent of this installation sequence.
     specs.sort_by_key(|spec| match spec.name {
         TYPE_PROPERTY_MODULE => 0,
+        PRIVATE_CODEC_MODULE => 1,
         VALUE_MODULE => 1,
         EQ_MODULE => 2,
         DYN_MODULE => 3,
         TYPE_DESC_MODULE => 4,
-        ATTRIBUTES_MODULE => 5,
-        ARRAY_MODULE => 6,
-        DICT_MODULE => 7,
-        REGEX_MODULE => 8,
-        STRING_MODULE => 9,
-        FMT_MODULE => 10,
-        CODEC_MODULE => 11,
-        JSON_MODULE => 12,
-        _ => 13,
+        ARRAY_MODULE => 5,
+        DICT_MODULE => 6,
+        REGEX_MODULE => 7,
+        STRING_MODULE => 8,
+        FMT_MODULE => 9,
+        CODEC_MODULE => 10,
+        JSON_MODULE => 11,
+        EES_MODULE => 12,
+        ACTOR_MODULE => 13,
+        EDGE_RUNTIME_MODULE => 14,
+        ENTRY_MODULE => 15,
+        _ => 12,
     });
     specs
 }

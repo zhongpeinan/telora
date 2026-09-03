@@ -534,8 +534,8 @@ TypeDesc   用户态解释器观察的擦除后 descriptor 视图
 
 `TypeDesc` 在这里表示公开观察模型，不是与 `Type` 并列的可构造静态类型。当前
 `std/type-desc` observer 接受 `Type` 值，并通过 kind、children 和 resolve 等操作
-暴露该擦除视图。`strip_attributes` 递归去掉 `WithAttributes` wrapper 并返回同一图中的
-inner descriptor；consumer 不需要依赖 wrapper 的 Dict 编码。
+暴露规范 descriptor 视图。声明类型以 `'Ref` 暴露，通过 `resolve` 获得其结构 descriptor；
+property 由独立的 property registry 按目标与 property 类型查询。
 
 内建元数据构造器也是普通 callable 值：
 
@@ -823,30 +823,22 @@ TypeScheme、concrete/recursive TypeMetadata graph、type-family template、opaq
 identity 和 provenance；不包装、重求值或重建 binding。Namespace binding 的导出仍是
 语义 Module，必须保留其 nested Module interface，不能退化为普通 Dict。
 
-Telora crate 使用 `src/`、`src/bin/`、`src/entry/` 和 `tests/`。`src/bin`、
-`src/entry`、`tests` 只允许直接包含文件。Host 从当前工作目录向上查找最近的
-`telora-deps.json`，其 `name` 字段给出稳定 crate 身份。Host 通过 selector 选择根：
-普通 source 是 `@src/<path>`，应用是 `@bin/<name>`，Entry 是
-`@src/entry/<name>`，测试是 `@test/<name>`。例如：
-
-```telora
-# src/bin/report.telora，selector 为 @bin/report，canonical cname 为 my-crate/bin/report
-import "@src/model/report" { compile };
-```
+Telora crate 使用 `src/` 和 `tests/`。Host 从当前工作目录向上查找最近的
+`telora-config.json`，并从 workspace 的 `telora-crate.json` 得到稳定 crate 身份、
+权威模块清单和直接依赖。`src/` 中的目录没有执行身份；工具对普通 module export 的
+名义类型进行验收。测试由 Host 以 `@test/<name>` 选择。
 
 逻辑 ID 到 crate 内物理位置的映射为：
 
 ```text
-@src/x          -> <crate>/src/x.telora          -> my-crate/x
-@bin/x          -> <crate>/src/bin/x.telora      -> my-crate/bin/x
-@src/entry/x    -> <crate>/src/entry/x.telora    -> my-crate/entry/x
-@test/x         -> <crate>/tests/x.telora        -> my-crate/tests/x
+@src/x          -> <crate>/src/x.telora            -> my-crate/x
+@src/a/x        -> <crate>/src/a/x.telora          -> my-crate/a/x
+@test/x         -> <crate>/tests/x.telora          -> my-crate/tests/x
 dependency/x    -> <dependency-crate>/src/x.telora -> dependency/x
 ```
 
-Main、Entry 和 test 只有被 Host 选中时才进入清单。只有被选中的 Entry 能 resolve
-Main；普通模块不能 import Entry 或 test。Main 和 test 根不能使用 `./` 或 `../`，
-必须以 `@src/` 导入本 crate 的可复用源码。依赖仅公开其普通 `src/` 模块。
+`src/` module 可使用 `./`、`../` 或 `@src/` 导入同 crate module。test 只有被 Host
+选中时才进入图，并以 `@src/` 导入 crate source。依赖公开其清单中的 public module。
 
 `@src/` 以 importing module 所属 crate 为准，因此依赖模块中的 `@src/` 仍指向该依赖
 自己的 source root。`./` 和 `../` 只表示 source module 或 dependency module 内部、
@@ -872,27 +864,36 @@ export record 定义，Host 再按所选协议校验或选择其中的值。
 模块的语义身份由 crate 和逻辑路径组成的 canonical cname 决定，不等于偶然的物理绝对路径。
 相同模块经不同相对边解析时应复用同一身份；resolver 拒绝词法或 symlink 越界。
 
-Path crate 的依赖由根目录 `telora-deps.json` 固定。dependency map key 声明被依赖
-crate 的 canonical name，也是 package import 的首段；crate 名与逻辑路径共同形成
-canonical cname。
-resolver 按顺序查询 vendor：builtin vendor 在先，当前发布 `std/*`；manifest 或
-standalone option 建立的 configured vendor 在后。vendor 以 crate 为选择颗粒；一旦
+workspace 根的 `telora-config.json` 为每个 crate name 选择唯一的 workspace member
+或远程 tarball source，并可为远程 source 设置 workspace 内的开发 override。每个
+crate 的 `telora-crate.json` 声明 canonical name、权威普通模块清单和直接依赖名称。
+`telora-lock.json` 固定 workspace 唯一精确包图。
+crate 名与逻辑路径共同形成 canonical cname，物理 workspace 与缓存路径不进入身份。
+
+`telora lock` 是唯一创建或改写 lock 的命令。其他 crate-mode 命令和 LSP 校验 lock，
+通过内嵌 `telora-ees` facade 向 IMOS component 提交 `InstallShared`，物化缺失的远程
+tarball，再把准备好的 immutable crate-root map 交给 resolver。resolver、module loader、
+求值器和 VM 均不执行网络 I/O，也不改写 lock。
+
+`telora-crate.json` 的 `modules` 只接受 `@src/...` selector，并且是 `src/` module 的
+权威集合。未声明文件不可 import；`telora check` 会为存在但未声明的 source 或静态
+数据文件产生 warning。`tests/*` 由 Host 选择，不进入该清单。
+
+resolver 按顺序查询 vendor：builtin vendor 在先，当前发布 `std/*`；prepared
+workspace 建立的 configured vendor 在后。vendor 以 crate 为选择颗粒；一旦
 builtin vendor 提供 `std`，全部 `std/*` selector 都只在该 crate 内解析，后序同名 crate
 整体被遮蔽，不能补充或覆盖 module。crate 清单在模块图发现前完成；注册采用 first-win，
 当前 crate 先于 dependencies，已登记的 crate name 及其 source 指向此后不可改变。
-当前没有通用 registry 获取、版本求解或运行时 package acquisition。
+当前没有 registry、语义版本求解或同名多版本能力；远程 source 是确定的 HTTP(S)
+tarball URL。
 
-普通 crate 模式的 resolver 配置只来自向上发现的最近一个 `telora-deps.json`；模块中
-不得声明 `crate.dependency` resolver option。`run -S` 的 standalone 模式不查找
-manifest；其 canonical owner 默认为 `standalone`，根文件可用
-`option "crate.name" "..."` 显式指定，并可用 `crate.dependency` 补充依赖图。依赖路径
-相对根文件的父目录解析，被导入的文件不能继续声明 resolver options。其他静态
-`option` 可声明模块或 Host 协议配置，必须位于 import 解析之前的有效位置，嵌套依赖
-不能借此修改根 Host 的策略。
+resolver 配置只来自 prepared workspace。runtime Context、EES 和执行工具契约由
+`std/entry` 的名义 wrapper 表达。Telora 源文件没有独立的 `option` 声明；`option`
+可以作为普通 identifier 使用。
 
 Telora selector 不写且不能写 `.telora`；resolver 在物理查找时补上后缀。静态数据
 selector 必须保留 `.json`、`.yaml`、`.yml` 或 `.toml`。除这一项已知后缀外，文件名
-不能含 `.`。文件 stem 以 `_` 开头表示 private；只有同 crate 模块和被选中的 Entry
+不能含 `.`。文件 stem 以 `_` 开头表示 private；只有同 crate 模块和内置工具 adapter
 可以访问。只有内置 `std` crate 可以声明 native symbol。
 
 ### 8.2 静态数据模块
@@ -918,6 +919,23 @@ type Value = enum {
     'LocalDateTime(String), 'OffsetDateTime(String),
 };
 ```
+
+`ScalarValue` 表达可直接穿过标量协议边界的闭合子集，并以 untagged codec 映射为
+JSON scalar：
+
+```telora
+type ScalarValue = enum {
+    'None,
+    'Bool(Bool),
+    'Int(Int),
+    'Float(Float),
+    'String(String),
+};
+```
+
+`'None`、`'Bool(true)`、数值和字符串分别编码为 JSON null、boolean、number 和 string。
+参数化查询使用 `Array(ScalarValue)` 表达 bindings；数据库 component 再把逻辑标量适配为
+后端的物理参数类型。
 
 每个递归子节点都携带同一个 canonical `Value` TypeId，因此可以用闭合 `match`
 穷尽处理。它是规范化后的语义数据，不是 lossless AST：不保留注释、anchor/alias
@@ -1246,14 +1264,14 @@ Host 负责所有开放世界行为：文件和 package 解析、环境捕获、
 持久化、重试、事务以及真实效果。典型调用顺序为：
 
 ```text
-Host 选择 Main 和 Entry
+Host 选择普通模块中的导出值
   -> 固定依赖与 source snapshot
-  -> 从 Main 顶层收集有序 SystemOptions，并构造含参数和平台事实的 Env
-  -> 在准备 WorkWorld 调用 Entry.config(options, env)，取得 SystemCaps 和 initializer
+  -> 按工具要求验证 Value、Eval、Run(State) 或 Serve(State) 名义类型
+  -> 解开 wrapper 中的 ContextConfig 与 Ees，并构造含参数和平台事实的 Env
+  -> 在准备 WorkWorld 调用内置 Entry.config(env, wrapper)，取得 SystemCaps 和 initializer
   -> Host 按 SystemCaps 配置事件源，并提供私有 resources native
-  -> 初始化 Main，并按 Entry.MainType 校验完整 export record
-  -> 冻结 MainWorld
-  -> 在新的运行 WorkWorld 内由 native 生成 SystemResources，并直接调用 initializer(resources, main)
+  -> 在新的运行 WorkWorld 内由 native 生成 SystemResources，并直接调用 initializer(resources, wrapper)
+  -> 构造具体 State，并在唯一工具边界擦除为 actor.Service
   -> 以 SystemEvent 驱动纯 reducer，解释返回的 SystemEffect
   -> 原子发布成功结果，或丢弃失败过程的候选结果
 ```
@@ -1269,28 +1287,40 @@ Plan 没有语言级权限。一个值即使静态类型为应用定义的 `Exec
 当前 `telora` 二进制提供：
 
 ```text
-telora check <module> [-C <context>]
-telora run <binary-name> [-C <context>] [--best-effort] [--source <name>=<source>]...
-telora run -S <file> [--best-effort] [--source <name>=<source>]...
-telora serve <binary-name> [-C <context>] [--source <name>=<source>]... --bind stdio://
-telora run-with <entry-module> <binary-name> [-C <context>] [--best-effort] [--source <name>=<source>]... [-- <entry-args>...]
-telora run-with <entry-module> -S <file> [--best-effort] [--source <name>=<source>]... [-- <entry-args>...]
-telora query|q modules [-C <context>] [-p <substring>]
-telora query|q exports <module> [-C <context>] [-p <substring>]
-telora query|q at <module>[:<line>[:<column>]] [-C <context>] [-p <substring>] [-k type,let,def,import]
+telora [-C <context>] check <module>
+telora [-C <context>] eval <module:export>
+telora [-C <context>] eval-with <module:export> [--source <name>=<source>]... [-- <arg>...]
+telora [-C <context>] run <module:export> [--best-effort] [--source <name>=<source>]... [--ees-var <name>=<value>]... [-- <arg>...]
+telora [-C <context>] serve <module:export> [--source <name>=<source>]... [--ees-var <name>=<value>]... --bind stdio:// [-- <arg>...]
+telora [-C <context>] query|q modules [-p <substring>]
+telora [-C <context>] query|q exports <module> [-p <substring>]
+telora [-C <context>] query|q at <module>[:<line>[:<column>]] [-p <substring>] [-k type,let,def,import]
+telora [-C <context>] lock
 telora lsp
 ```
 
-`run abc` 的 binary name 是一个不含路径分隔符和 `.telora` 后缀的 stem；Host 从 CWD
-向上发现最近的 manifest，并固定选择 `@bin/abc`。调用者写 `run abc`，不写
-`run @bin/abc`。`run`、`check` 和 `query` 的 `-C` 都指定 manifest discovery
-的起始目录，该目录不必就是 crate root。`run -S file` 是独立 standalone 模式：
-即使文件的祖先目录存在 manifest 也不查找。canonical owner 默认为 `standalone`；
-根文件可声明 `option "crate.name" "..."` 覆盖该名字，并可声明相对文件所在目录解析的
-`crate.dependency`。只有 standalone 根文件可以声明 resolver options。`-S` 与 binary
-name、`-C` 互斥。
+Clap 拥有 help、version 和命令行参数校验，其输出是面向人的文本。命令通过参数校验后，
+Telora Host 在 stdout 和 stderr 上只产生 JSON 或 JSONL。成功的 `eval` 输出一个 JSON
+Value；`dbg!` 和命令错误在 stderr 输出 JSONL record。`check`、`query`、`run` 和
+`serve` 输出各自的 JSONL 协议，`lock` 输出生成的 lock path JSON String。进程退出码
+独立表达命令是否成功。
 
-其他命令的 `<module>` 是 `@src/...`、`@bin/...`、`@test/...`、依赖模块 ID，或
+`eval @src/model:answer` 是选择普通 module 公开导出的一个示例。`eval` 要求导出类型是
+`Value`；`eval-with` 要求导出类型是 `entry.Eval`。该 wrapper 中的
+`entry.ContextConfig` 声明 source、环境变量和参数能力。前者只读取求值后的导出，
+后者只做一次普通函数调用；二者都不运行 reducer loop 或应用 EES。
+
+Context 声明中的名称必须唯一；CLI 提供的 source 必须与声明全集相等，环境变量必须
+存在并可表示为 String。
+`--` 后的参数保持顺序进入 `args`。source transport、格式验证、data limits 与
+run context 相同，但 canonical source path 使用 `@eval-ctx/<name>`。物理 locator 与
+未声明环境变量不进入 Telora World。
+
+`run` 和 `serve` 从 CWD 向上发现最近的 manifest，解析 `MODULE:EXPORT`，执行普通模块，
+再按 wrapper 的名义类型验收 export。`run` 要求 `entry.Run(State)`；`serve` 要求
+`entry.Serve(State)`。`-C` 指定 manifest discovery 的起始目录，该目录不必就是 crate root。
+
+其他命令的 `<module>` 是 `@src/...`、`@test/...`、依赖模块 ID，或
 公开 `std/...` 模块 ID，不是物理文件名。`query exports std/string` 与
 源码中的 `import "std/string"` 选择同一个内置模块身份；不存在的 `std/...` 得到
 明确的 built-in module-not-found 错误，不按 workspace dependency 解析。`query`（可见
@@ -1298,12 +1328,11 @@ alias `q`）以稳定 `telora.query/v1` JSONL 输出语义事实。`query at <mo
 模块的顶层 local definitions；追加 `:<line>` 或 `:<line>:<column>` 后改查整行或精确点
 相交的 definition、reference 和 expression facts。`query modules` 不加载、解析或求值
 模块，而是列出 `-C` 所确定
-crate 的模块视图：输出 canonical cname，包含本 crate 的普通 public/private source、
-dependency 的 public source，以及公开的内置 `std` 模块。未选中的 Main、Entry 和 test
-不进入 catalog。
+crate 的模块视图：输出 canonical cname，包含本 crate 的 public/private source、
+dependency 的 public source，以及公开的内置 `std` 模块。test 不进入 catalog。
 每条 module record 携带规范 module ID、`crate` / `dependency` / `builtin` origin、
-`public` / `private` visibility 和 resolver format，并按 module ID 稳定排序。Main、Entry、
-test 和 private built-in 都不属于未选择状态下的 catalog 视图。
+`public` / `private` visibility 和 resolver format，并按 module ID 稳定排序。test 和
+private built-in 不属于普通 catalog 视图。
 `query exports` 独立查询公开 Module interface。`-p` 执行大小写敏感的字面子串匹配，
 不解释 glob 或正则表达式：在 `modules` 下匹配规范 module ID，在 `exports` 下匹配公开
 名称，在无坐标的 `at` 下匹配本地符号名。`-k` 接受由逗号分隔的 `type`、`let`、
@@ -1343,30 +1372,87 @@ Module value，并以非零退出。普通 stderr 只用于 CLI/Host 故障，`d
 命令重新进入严格 Entry reducer 与 Host effect lifecycle，不进行 speculative recovery。
 最终验收必须使用省略该参数、保持 fail-fast 的普通 `run`。
 
-`run` 选择一个 Main application，并且完全等价于用内置 Entry 执行
-`run-with std/entry/default`。默认 Entry 要求 Main 导出
-`main: Fn(Dict(Value)) -> Value`，调用一次后把结果编码为 JSON。`serve --bind stdio://`
-选择 `std/entry/serve`，要求 Main 导出
-`serve: Fn(Dict(Value)) -> Fn(Value) -> Value`；初始化一次 handler 后，以 stdin/stdout
-上的 JSONL 逐项收发请求和响应。`run-with <entry-module>` 是 Host 的显式授权动作；
-selector 必须指向 `src/entry` 中的模块，例如 `@src/entry/tool`。该源码获得保留的
-Entry 身份，可以访问图内所有模块，包括其他 crate 的 private 模块和 `std/_...`
-内部模块。特权仅属于这个 requester，不传递给它导入的普通模块。Entry 不能作为
-普通模块根或被普通模块 import。
+普通 module 用 `std/entry` 构造工具 wrapper。应用以具体 State 类型编写：
 
-标准 Entry 从 Main 的 `option "run-ctx.sources" [name, ...]` 读取初始化 source 契约；
-`run` 与 `serve` 共享这个 option。声明名必须唯一，且 CLI 提供的 source 名与声明集合
-完全相等。没有该 option 时集合为空。`--source name=path.json` 按文件扩展名选择
+```telora
+import "std/ees" as ees;
+
+def config: entry.ContextConfig = {sources: [], envs: [], args: 'False};
+export def run = entry.run(config, ees.none, fn(ctx) {
+    let initial: State = ...;
+    let reduce: Fn(State, actor.Event) -> actor.Transition(State) = ...;
+    (initial, reduce)
+});
+```
+
+`entry.Run(State)` / `Serve(State)` 保留 State 类型到工具阶段。内置 Entry adapter 调用
+wrapper 中的初始化函数，再在 actor service 边界把 State 擦除为 Dyn；应用 reducer 内
+仍保留具体 State 类型。每个 transition 返回完整新 State 与 `Array(actor.Effect)`。
+Event 与 Effect 都是一阶数据，不包含 callback 或 continuation。
+
+```text
+Event  = Request {id, input}
+       | EesReply {id, request_id, result}
+
+Effect = EesCall {id, request_id, request}
+       | Reply {request_id, value}
+```
+
+`run` 产生唯一 `Request {id: "run", input: None}`，持续处理 EES reply，收到对应 Reply
+后输出其中的 Value 并退出。`serve` 为每个 stdin JSONL 输入分配 request ID；多个请求和
+EES call 可以同时 pending，reply 通过显式 ID 关联并可按完成顺序输出。重复的活动 call
+ID、未知 request、存在活动 call 时提前 Reply，以及同一请求重复 Reply 都是协议错误。
+
+`ees.Config` 声明完整 actor 集合。Host 据此构造 application EES service：
+
+```telora
+def ees_config: ees.Config = {
+    vars: {"tenant": "[a-z][a-z0-9-]{0,31}"},
+    models: [
+        ees.imos_model(
+            "materializer",
+            "user-cache:imos/{tenant}",
+            "user-data:materialized/{tenant}",
+        ),
+        ees.sqlite_model("catalog", "user-data:catalog/{tenant}/db.sqlite"),
+    ],
+};
+```
+
+actor name 在所有 component 间唯一。`ees.Config.vars` 的 Dict key 是变量名，value 是自动
+进行整串匹配的正则表达式。
+每个声明变量都必须被 locator 使用并通过 `--ees-var NAME=VALUE` 恰好绑定一次；未知、缺失、
+重复、格式不匹配以及含路径分隔符的值都失败。EES 声明不改变 reducer 接口；Host 校验
+model 名称、kind 和配置完全一致。
+
+`std/ees.Request` 是 `(model, operation, input)` 的 component-neutral 普通数据。
+应用用 `actor.ees_call(id, request_id, request)` 发出调用；Host 异步执行并把结果作为
+`actor.EesReply` 重新送入 reducer。多步调用所需的阶段与关联信息保存在显式 State 中。
+`std/ees.install_shared` 和 `std/ees.sqlite_query` 只构造 component-neutral request，
+不执行 I/O。资源 locator
+使用 `user-data:`、`user-cache:`、`user-config:` 或 `user-state:`，冒号后是规范化
+相对路径。component adapter 优先使用对应的 `XDG_DATA_HOME`、`XDG_CACHE_HOME`、
+`XDG_CONFIG_HOME`、`XDG_STATE_HOME`；缺失时分别回退到 `$HOME/.local/share`、
+`$HOME/.cache`、`$HOME/.config`、`$HOME/.local/state`。Entry 能看到 wrapper 声明的
+逻辑 locator，普通应用代码不能读取解析后的物理路径；物理路径不进入 Telora World，也不能由
+operation 改写。
+
+Package Host 使用单独的私有 Service，其中的 actor 名为 `telora-packages`。该 actor 不进入应用
+`Env`、`SystemCaps` 或 manifest；应用即使使用相同逻辑名字，也只能寻址自己 Service 中
+显式绑定的实例。
+
+`entry.ContextConfig.sources` 声明初始化 source 契约。声明名必须唯一，且 CLI 提供的
+source 名与声明集合完全相等。`--source name=path.json` 按文件扩展名选择
 JSON/YAML/TOML；`file+json://path` 等形式显式选择文件 transport 和格式；
 `stdin+json://` 等形式从 stdin 读取一次。一次运行最多有一个 stdin source。
 `serve --bind stdio://` 使用 stdin 作为 JSONL 请求通道，因此拒绝 stdin 初始化 source。
-外层 `Dict(Value)` 的 key 是 CLI 中的 `name`，value 是对应 source 解析出的数据。
+`Context.sources` 的 key 是 CLI 中的 `name`，value 是对应 source 解析出的数据。
 数据的 canonical source path 是由 key 确定的 `@run-ctx/<name>`；保留字符按 UTF-8 byte
 百分号编码。文件路径或 stdin URI 只是 Host 私有 locator，不进入 provenance 和普通
 诊断。`@run-ctx/<name>` 不是 module ID：它不进入模块图、不能被 import，也不出现在
 `query modules` 中。
 所有 source 先经过统一 CST admission，再作为带 provenance 的 `Value` 直接物化到
-Entry WorkWorld；标准 Entry 只把 `SrcItem.data` 投影为传给 Main 的 `Dict(Value)`。
+Entry WorkWorld；内置 adapter 只把 `SrcItem.data` 投影为 `Context.sources`。
 
 Entry 在纯 Telora 中实现以下 ABI：
 
@@ -1378,20 +1464,18 @@ export type State = ...;
 type Reducer = Fn(State, rt.SystemEvent) -> Tuple([State, Array(rt.SystemEffect)]);
 type Initializer = Fn(rt.SystemResources, MainType) -> Tuple([State, Reducer]);
 export def config:
-    Fn(rt.SystemOptions, rt.Env) -> Tuple([rt.SystemCaps, Initializer])
+    Fn(rt.Env, MainType) -> Tuple([rt.SystemCaps, Initializer])
     = ...;
 ```
 
-`SystemOptions` 是 Main 顶层 `option` action 的有序序列。`Env` 包含 `--` 后的 Entry
-参数、OS/arch 平台事实和 CLI 提供的具名 data sources。准备 WorkWorld 中的 `config` 返回经 Host
+`Env` 包含 `--` 后的 Entry 参数、OS/arch 平台事实和 CLI 提供的具名 data sources。
+准备 WorkWorld 中的 `config` 接收已验收的 wrapper，并返回经 Host
 校验的 `SystemCaps` 和 initializer；Host 根据 caps 配置事件源并提供私有 native，随后初始化
-Main、按 `MainType` 校验完整 export record。runtime 在同一个 Entry WorkWorld 中调用
+运行时服务。runtime 在同一个 Entry WorkWorld 中调用
 native 生成 `SystemResources`，并把结果直接传给 initializer；该值不返回 Rust Host，也不
 在 Host 侧解码或重建。所有环境上下文必须由
-initializer 显式传给 Main；CLI 不提供 `--input`。当前不进行分阶段或
-动态 Main 加载。运行阶段使用一系列 WorkWorld；
-`MainType` 没有系统统一形状，由所选 Entry 定义。两个标准 Entry 使用明确的
-`Dict(Value)` 与 `Value` 边界。
+initializer 显式传给 wrapper factory。运行阶段使用一系列 WorkWorld；
+`MainType` 是内置 Entry 验收的 `Run(State)` 或 `Serve(State)` wrapper family。
 `State` 对 Host 不透明，也不会物化为 Host-owned Value。每轮结束时，runtime 只把
 `SystemEffect` 导出给 Host；它从下一 State root 开始 trace，保留 MainWorld edge，借助
 同一个 forwarding table 把可达 Work object 直接复制到新的 WorkWorld，再释放旧
@@ -1406,11 +1490,14 @@ Entry reducer 接受单个
 ```text
 DataFormat = Json | Yaml | Toml
 DataSrc = { default: Option(Value), fmt: DataFormat, src: String }
-Env = { args: Array(String), platform: Platform, sources: Dict(DataSrc) }
+Env = {
+    args: Array(String), ees: Dict(String),
+    platform: Platform, sources: Dict(DataSrc),
+}
 TextSrc = { default: Option(String), src: String }
 SystemStdin = Text | Lined | Null
 SystemCaps = {
-    data_srcs: Dict(DataSrc), spawn_child: Bool,
+    data_srcs: Dict(DataSrc), ees: Dict(String),
     text_srcs: Dict(TextSrc), vars: Array(String), stdin: SystemStdin,
 }
 SrcItem(T) = { data: T, src: String }
@@ -1419,31 +1506,11 @@ SystemResources = {
     vars: Dict(String), stdin: Option(String),
 }
 
-ChildStdin = Piped | Inherit | Null
-Stdout = PipedLine | PipedToEnd | Inherit | Null
-Stdio  = { stdin: ChildStdin, stdout: Stdout, stderr: Stdout }
-
-ChildOpts = {
-    bin: String,
-    cwd: Option(String),
-    envs: Dict(Option(String)),
-    clear_env: Bool,
-}
-SpawnStdioChild = { key: String, opts: ChildOpts, stdio: Stdio }
-ChildText       = { key: String, data: Option(String) }
-ChildSpawnResult = { key: String, result: Result(Int, String) }
-ChildExited     = { key: String, exited: Result(Int, Option(Int)) }
-
 SystemEvent = Initialize
+            | EesReply({key: String, result: Result(Value, String)})
             | StdinLine(Option(String))
-            | ChildStdout(ChildText)
-            | ChildStderr(ChildText)
-            | ChildSpawnResult(ChildSpawnResult)
-            | ChildExited(ChildExited)
 
-SystemEffect = SpawnStdioChild(SpawnStdioChild)
-             | PostStdin(ChildText)
-             | Exec(ChildOpts)
+SystemEffect = EesCall({actor: String, input: Value, key: String, operation: String})
              | Output(String)
              | Exit(Int)
 ```
@@ -1486,39 +1553,18 @@ UTF-8 `string_len`，以及所有 String、对象键、时间字符串和 Bytes 
 `SourceId + range`，后续诊断可以稳定地把该节点作为 source 位置。MainWorld 和 Entry
 WorkWorld 仅是不同 target，CST、格式验证、location、data limits 和 `Value` 构造逻辑相同。
 
-`spawn_child` 是 `SpawnStdioChild` 与 `PostStdin` 的显式权限。Host 在执行一批 effect
-中的任何一项前先审计整批；未授权时整批拒绝。`Exec` 是独立权限语义，不由
-`spawn_child` 控制。
-
-`SpawnStdioChild` 使用 Entry 给出的稳定 `key` 启动进程，并始终产生对应的
-`ChildSpawnResult`：成功分支携带 pid，失败分支携带可由 reducer 处理的错误文本。stdin 可为
-`Piped | Inherit | Null`；stdout/stderr 可为
-`PipedLine | PipedToEnd | Inherit | Null`。`PostStdin` 的 `Some(text)` 写入 UTF-8
-文本，`None` 关闭管道。PipedLine 逐行产生不含行终止符的 `Some`，PipedToEnd 在 EOF
-后至多产生一个完整 `Some`，二者均再以 `None` 明确表示 EOF；`ChildExited` 在管道
-EOF 后产生。
-
-Host 在单个异步事件循环中并发执行 effect。每个 child 的监督、stdin 写入、stdout
-读取和 stderr 读取都是独立调度的任务；某个管道发生背压或等待数据时，不得阻塞其他
-effect 或 event。这里保证并发而不保证并行。reducer 调用始终串行：Host 每次只注入一个
-已排队的 `SystemEvent`，不会并发调用 reducer。
-
-每个成功 Spawn 的 child 都必须由 Host 回收。正常完成时，Host 取得并回收退出状态后
-才发送 `ChildExited`；Entry 发出 `Exit` 或 `Exec`、reducer 失败、协议失败或 Host
-管道处理失败时，Host 必须终止并 wait 所有仍活动的 child。Entry 不承担防止 zombie
-process 的责任。具体地，`Exit(code)` 的 terminal barrier 顺序是：停止剩余 child，
-wait/reap 所有 child，提交已缓冲 Output，最后才允许 CLI 调用
-`std::process::exit(code)`；任一 wait 失败都会阻止该 exit code 生效。
-Host 必须以结构化任务集合持有全部 effect 与 child supervisor；supervisor 同样持有其
-stdin/stdout/stderr 任务。terminal、reducer 失败、协议失败或 Host 失败时，Host 先发出
-取消信号并关闭输入邮箱，再 join 全部任务；这些任务不得脱离所有权树继续运行。
+Host 在单个异步事件循环中执行 EES effect 并回送 event；reducer 调用始终串行，每次只
+注入一个已排队的 `SystemEvent`。`Exit(code)` 是 terminal barrier：Host 完成活动 EES
+任务并提交已缓冲 Output 后，才向 CLI 交付退出状态。Host 以结构化任务集合持有异步
+EES 调用。terminal、reducer 失败、协议失败或 Host 失败时，Host 取消并 join 全部任务；
+这些任务不得脱离所有权树继续运行。
 
 `Output(String)` 是 Entry reducer 的输出效果，不是 Main 返回类型，也不要求 Host
 编码 Telora 值。Entry 可以用自己的 `MainType`、codec 和 formatter 生成任意多个
 String chunk。CLI 在 terminal effect 前缓冲它们；协议失败不暴露部分输出。
-`Exit(Int)` 和 `Exec(ChildOpts)` 是 terminal effect，必须位于 effects 尾部；Exec 在
-支持进程替换的 Host 上替换 Telora 进程。没有内部 Wake 或任意 turn 上限；无队列
-事件且无活动 child 时才判定无进展。每次 reducer 调用仍受普通 VM quota 约束。
+`Exit(Int)` 是 terminal effect，必须位于 effects 尾部。没有内部 Wake 或任意 turn
+上限；无队列事件且无活动 EES 调用时判定无进展。每次 reducer 调用仍受普通 VM quota
+约束。
 
 `check`、`query` 和 `lsp` 当前仍是 Host 固定命令路径，尚未通过 run Entry ABI。它们
 把目标当作 module。`check` 给出严格 module load/compile verdict，但不等价于一次
@@ -1565,7 +1611,7 @@ declarations。普通 definitions 实现 Option、Result、argv 等组合政策�
 declarations 提供需要高效 heap 观察或受控 runtime identity 的确定操作。
 
 当前通用能力包括 Array/Dict 组合、String、lexical path、SHA-256、regex、JSON codec
-与 schema、TypeMetadata attribute、Dyn observer、文本 parse/display 等。
+与 schema、typed property、Dyn observer、文本 parse/display 等。
 这些 API 不授予环境或文件系统访问权限。例如 path 操作是词法操作，hash 操作只
 处理显式输入。
 

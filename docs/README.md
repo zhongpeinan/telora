@@ -29,8 +29,11 @@ Host 和 tooling。专题文档细化 `LANGUAGE.md` 或 `IMPLEMENTATION.md`，�
 | `docs/MOTIVATION.md` | 稳定动机、价值主张与功能准入原则 | 是 |
 | `docs/design/` | 当前概念、语义、边界与专题设计 | 是，设计 SSOT |
 | `guide/TELORA.md` | 当前公开语言表面的使用方法 | 是，面向使用者 |
+| `guide/WORKSPACE.md` | workspace、crate、模块清单与依赖锁定 | 是，面向使用者 |
+| `guide/LIBSTD.md` | 当前公开标准库的模块定位与接口发现 | 是，面向使用者 |
+| `guide/EXEC-MODE.md` | eval、eval-with、run 与 serve 的执行契约 | 是，面向使用者 |
+| `guide/EES.md` | EES、Actor 协议与外部效果的使用方法 | 是，面向使用者 |
 | `guide/TELORA-CLI.md` | CLI、工作区解析和 JSONL 契约 | 是，面向使用者 |
-| `guide/EXPERIMENTS.md` | OpenCode 实验准备、调度、审核与总结流程 | 是，面向实验 Host |
 | `README.md` | 项目导览、快速开始与能力概述 | 仅作概述 |
 | `VISION.md` | 项目愿景与设计方向 | 不覆盖当前设计文档 |
 | `rfc/` | 单项决策的动机、方案、演进与验收证据 | 否，属于历史记录 |
@@ -75,9 +78,9 @@ RFC 不会仅凭编号较新就覆盖设计 SSOT。它必须完成相应的接�
 Proposed RFC 不改变设计 SSOT。尚未落地的设想不能写成已经存在的语言行为。纯粹的
 概念或文档决策可以直接更新 SSOT；涉及可执行语义的决策应在实现和验收完成时同步。
 
-### 增加应用或实验
+### 增加领域库或应用
 
-新增领域库、eDSL、应用或实验时，默认不修改语言设计。只有当它产生了中性、可
+新增领域库、eDSL 或应用时，默认不修改语言设计。只有当它产生了中性、可
 复现且现有层次无法忠实表达的问题，才进入语言或通用标准库 RFC。
 
 依赖方向始终是：
@@ -89,7 +92,7 @@ language core
   -> application model 与 authored intent
 ```
 
-实验提供证据，不能把领域 vocabulary 反向带入无关标准库或语言核心。
+应用证据不能把领域 vocabulary 反向带入无关标准库或语言核心。
 
 ## 编写规则
 

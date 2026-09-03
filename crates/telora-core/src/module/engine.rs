@@ -81,6 +81,26 @@ impl Engine {
         )
     }
 
+    pub fn load_module_id_in_workspace(
+        &self,
+        workspace: Arc<crate::package::ResolvedWorkspace>,
+        cwd: impl AsRef<Path>,
+        module_id: &str,
+        external_bindings: BTreeMap<String, crate::DataWorld>,
+    ) -> Result<LoadedModule, ModuleError> {
+        let resolver = ModuleResolver::from_workspace(workspace, cwd.as_ref(), module_id)
+            .map_err(|error| ModuleError::new(error.to_string()))?
+            .with_builtins(builtin_list());
+        load_module_with_resolver(
+            resolver,
+            external_bindings,
+            self.config.module_quota,
+            self.config.data_limits,
+            Arc::clone(&self.debug_sink),
+            ModuleSourcePolicy::ExplicitExports,
+        )
+    }
+
     pub fn load_standalone(
         &self,
         path: impl AsRef<Path>,
@@ -121,6 +141,17 @@ impl Engine {
         self.prepare_resolved_module(resolver)
     }
 
+    pub fn prepare_module_id_in_workspace(
+        &self,
+        workspace: Arc<crate::package::ResolvedWorkspace>,
+        cwd: impl AsRef<Path>,
+        module_id: &str,
+    ) -> Result<PendingModule, ModuleError> {
+        let resolver = ModuleResolver::from_workspace(workspace, cwd.as_ref(), module_id)
+            .map_err(|error| ModuleError::new(error.to_string()))?;
+        self.prepare_resolved_module(resolver)
+    }
+
     fn prepare_resolved_module(
         &self,
         resolver: ModuleResolver,
@@ -149,27 +180,10 @@ impl Engine {
                     .join("\n"),
             ));
         }
-        let options = parsed
-            .options
-            .iter()
-            .map(|option| {
-                immediate_value(&option.value)
-                    .map(|value| LoadedOptionAction {
-                        key: option.key.value.clone(),
-                        value,
-                    })
-                    .map_err(|error| {
-                        ModuleError::new(
-                            sources.render(&Diagnostic::error(error.to_string(), option.location)),
-                        )
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
         Ok(PendingModule {
             inner: Arc::new(PendingModuleInner {
                 path: physical.to_owned(),
                 resolver,
-                options,
                 config: self.config,
                 debug_sink: Arc::clone(&self.debug_sink),
                 state: Mutex::new(PendingModuleState::Pending {
@@ -246,9 +260,16 @@ impl Engine {
         &self,
         pending: PendingModule,
         entry_selector: &str,
+        export: &str,
         entry_args: &[String],
     ) -> Result<RunOutcome, ModuleError> {
-        self.run_pending_with_host(pending, entry_selector, entry_args, &mut NoProcessRunHost)
+        self.run_pending_with_host(
+            pending,
+            entry_selector,
+            export,
+            entry_args,
+            &mut NoProcessRunHost,
+        )
             .await
     }
 
@@ -256,12 +277,14 @@ impl Engine {
         &self,
         pending: PendingModule,
         entry_selector: &str,
+        export: &str,
         entry_args: &[String],
         host: &mut dyn RunHost,
     ) -> Result<RunOutcome, ModuleError> {
         self.run_pending_with_sources_and_host(
             pending,
             entry_selector,
+            export,
             entry_args,
             &EntryDataSources::new(),
             host,
@@ -273,6 +296,7 @@ impl Engine {
         &self,
         pending: PendingModule,
         entry_selector: &str,
+        export: &str,
         entry_args: &[String],
         entry_sources: &EntryDataSources,
         host: &mut dyn RunHost,
@@ -281,6 +305,7 @@ impl Engine {
             .run_pending_with_host_inner(
                 pending,
                 entry_selector,
+                export,
                 entry_args,
                 entry_sources,
                 host,
@@ -301,30 +326,26 @@ impl Engine {
         &self,
         pending: PendingModule,
         entry_selector: &str,
+        export: &str,
         entry_args: &[String],
         entry_sources: &EntryDataSources,
         host: &mut dyn RunHost,
     ) -> Result<RunOutcome, ModuleError> {
         let resolver = pending.inner.resolver.clone();
-        let (entry_id, entry_source) = if entry_selector == DEFAULT_ENTRY_MODULE {
+        let (entry_id, entry_source) = if entry_selector == RUN_ENTRY_MODE {
             (
-                ModuleCName::builtin("std/entry/default"),
-                default_entry_source().to_owned(),
+                ModuleCName::builtin(PRIVATE_ENTRY_MODULE),
+                run_entry_source().to_owned(),
             )
-        } else if entry_selector == SERVE_ENTRY_MODULE {
+        } else if entry_selector == SERVE_ENTRY_MODE {
             (
-                ModuleCName::builtin("std/entry/serve"),
+                ModuleCName::builtin(PRIVATE_ENTRY_MODULE),
                 serve_entry_source().to_owned(),
             )
         } else {
-            let entry = resolver
-                .resolve_entry(entry_selector)
-                .map_err(|error| ModuleError::new(error.to_string()))?;
-            let path = entry.path().map(Path::to_owned).ok_or_else(|| {
-                ModuleError::new(format!("Entry {entry_selector:?} has no physical source"))
-            })?;
-            let source_name = entry.id.to_string();
-            (entry.id, read(&path, &source_name)?)
+            return Err(ModuleError::new(format!(
+                "unknown tool Entry {entry_selector:?}"
+            )));
         };
         let SelectedEntryLoader {
             mut loader,
@@ -391,53 +412,7 @@ impl Engine {
         {
             return Err(ModuleError::new("Entry.config must accept 2 arguments"));
         }
-        let mut entry_world = entry_world;
-        let options = make_system_options(
-            entry_world.heap_mut(),
-            &loader.main.heap,
-            &pending.inner.options,
-        )?;
-        let env = make_entry_env(
-            entry_world.heap_mut(),
-            &loader.main.heap,
-            entry_args,
-            entry_sources,
-        );
-        let configured = invoke_world_member_in(
-            &loader.main.heap,
-            &entry_compiled.externals,
-            &loader.sources,
-            entry_world,
-            "config",
-            &[options, env],
-            false,
-            self.config.session_quota,
-            Arc::clone(&self.debug_sink),
-        )
-        .map_err(|error| ModuleError::new(format!("Entry.config failed: {error}")))?;
-        let (entry_world, initializer) = configured
-            .into_runtime_pair(
-                &loader.main.heap,
-                "Entry.config must return Tuple([SystemCaps, Initializer])",
-                "Entry.config must return exactly SystemCaps and Initializer",
-            )
-            .map_err(|error| ModuleError::new(error.to_string()))?;
-        let caps = parse_system_caps(entry_world.root_ref(&loader.main.heap))?;
-        let initializer_arity = entry_world
-            .runtime_function_arity(&loader.main.heap, initializer)
-            .map_err(|error| ModuleError::new(error.to_string()))?
-            .ok_or_else(|| ModuleError::new("Entry.config initializer must be a function"))?;
-        if initializer_arity != 2 {
-            return Err(ModuleError::new(format!(
-                "Entry.config initializer must accept 2 arguments, found {initializer_arity}"
-            )));
-        }
-        host.configure(caps.clone()).await.map_err(|error| {
-            ModuleError::new(format!("cannot satisfy Entry capabilities: {error}"))
-        })?;
         let bindings = pending.begin_initialization()?;
-
-        let main_source_name = main_module.id.to_string();
         let (compiled_main_path, main_compiled) = match loader.compile_root(main_module, bindings) {
             Ok(compiled) => compiled,
             Err(error) => {
@@ -446,19 +421,36 @@ impl Engine {
             }
         };
         debug_assert_eq!(compiled_main_path, main_path);
-        let actual_main_type =
-            concrete_module_descriptor(&main_compiled.analysis.module_interface)?;
-        if !matches!(main_type, TypeDescriptor::Dyn) {
-            if !crate::types::assignable(
-                &crate::types::erase_declared_identity(&actual_main_type),
-                &crate::types::erase_declared_identity(&main_type),
-            ) {
-                return Err(ModuleError::new(format!(
-                    "Main export record {} is not assignable to Entry.MainType {}",
-                    actual_main_type.display_name(),
-                    main_type.display_name()
-                )));
-            }
+        let selected = main_compiled
+            .analysis
+            .module_interface
+            .exports
+            .get(export)
+            .ok_or_else(|| ModuleError::new(format!("module has no export {export:?}")))?;
+        if !selected.parameters.is_empty() {
+            return Err(ModuleError::new(format!(
+                "application export {export:?} must not be polymorphic"
+            )));
+        }
+        let wrapper_name = if entry_selector == SERVE_ENTRY_MODE {
+            "Serve"
+        } else {
+            "Run"
+        };
+        let actual_main_type = entry_wrapper_body(
+            &loader.builtin_modules,
+            &selected.body,
+            wrapper_name,
+        )?;
+        if !crate::types::assignable(
+            &crate::types::erase_declared_identity(&actual_main_type),
+            &crate::types::erase_declared_identity(&main_type),
+        ) {
+            return Err(ModuleError::new(format!(
+                "application export {export:?} payload {} is not assignable to Entry.MainType {}",
+                actual_main_type.display_name(),
+                main_type.display_name()
+            )));
         }
 
         let workspace = WorkspaceSnapshot::build(
@@ -487,7 +479,7 @@ impl Engine {
         );
         let (main_world, _) =
             main.execute_world_observed(self.config.session_quota, Arc::clone(&self.debug_sink));
-        let mut main_world = match main_world {
+        let main_world = match main_world {
             Ok(world) => world,
             Err(error) => {
                 let error = ModuleError::new(error.to_string());
@@ -495,15 +487,25 @@ impl Engine {
                 return Err(error);
             }
         };
-        if matches!(main_type, TypeDescriptor::Dyn) {
-            main_world = main_world
-                .wrap_root_dyn(
-                    &shared_main.heap,
-                    &actual_main_type,
-                    main_source_name,
-                )
-                .map_err(|error| ModuleError::new(error.to_string()))?;
-        }
+        let mut main_world = select_world_member_in(
+            &main.runtime.main.heap,
+            &main.runtime.externals,
+            &main.sources,
+            main_world,
+            export,
+            self.config.session_quota,
+            Arc::clone(&self.debug_sink),
+        )?;
+        let payload = main_world
+            .root_ref(&shared_main.heap)
+            .declared_value_parts()
+            .map(|(_, payload)| payload.runtime())
+            .ok_or_else(|| {
+                ModuleError::new(format!(
+                    "application export {export:?} is not a nominal {wrapper_name} value"
+                ))
+            })?;
+        main_world.set_root(payload);
         let instantiated = InstantiatedModule {
             module: Arc::new(main),
             execution: Arc::new(main_world),
@@ -512,6 +514,51 @@ impl Engine {
         let (mut entry_world, main_argument) = entry_world
             .import_world_root(&shared_main.heap, &instantiated.execution)
             .map_err(|error| ModuleError::new(error.to_string()))?;
+        let host_ees = host.ees_actors();
+        let env = make_entry_env(
+            entry_world.heap_mut(),
+            &shared_main.heap,
+            entry_args,
+            entry_sources,
+            &host_ees,
+            if entry_selector == SERVE_ENTRY_MODE {
+                "Serve"
+            } else {
+                "Run"
+            },
+        );
+        let configured = invoke_world_member_in(
+            &entry.runtime.main.heap,
+            &entry.runtime.externals,
+            &entry.sources,
+            entry_world,
+            "config",
+            &[env, main_argument],
+            false,
+            self.config.session_quota,
+            Arc::clone(&self.debug_sink),
+        )
+        .map_err(|error| ModuleError::new(format!("Entry.config failed: {error}")))?;
+        let (mut entry_world, initializer) = configured
+            .into_runtime_pair(
+                &entry.runtime.main.heap,
+                "Entry.config must return Tuple([SystemCaps, Initializer])",
+                "Entry.config must return exactly SystemCaps and Initializer",
+            )
+            .map_err(|error| ModuleError::new(error.to_string()))?;
+        let caps = parse_system_caps(entry_world.root_ref(&entry.runtime.main.heap))?;
+        let initializer_arity = entry_world
+            .runtime_function_arity(&entry.runtime.main.heap, initializer)
+            .map_err(|error| ModuleError::new(error.to_string()))?
+            .ok_or_else(|| ModuleError::new("Entry.config initializer must be a function"))?;
+        if initializer_arity != 2 {
+            return Err(ModuleError::new(format!(
+                "Entry.config initializer must accept 2 arguments, found {initializer_arity}"
+            )));
+        }
+        host.configure(caps.clone()).await.map_err(|error| {
+            ModuleError::new(format!("cannot satisfy Entry capabilities: {error}"))
+        })?;
         let mut prepared_plans = Vec::new();
         for (key, request) in &caps.data_sources {
             let Some(source) = host
@@ -622,7 +669,12 @@ impl Engine {
                         ModuleError::new("Entry made no progress and the Host has no pending event")
                     })?,
             };
-            let event = runtime_system_event(state.heap_mut(), &entry.runtime.main.heap, event)?;
+            let event = runtime_system_event(
+                state.heap_mut(),
+                &entry.runtime.main.heap,
+                type_id,
+                event,
+            )?;
             let transition = entry
                 .invoke_reducer_in_work(
                     reducer,
@@ -641,14 +693,14 @@ impl Engine {
                 let (tag, _) = effect
                     .tagged_parts()
                     .ok_or_else(|| ModuleError::new("Entry returned an invalid SystemEffect"))?;
-                if matches!(
-                    tag.as_atom().as_deref(),
-                    Some("SpawnStdioChild" | "PostStdin")
-                ) && !caps.spawn_child
-                {
-                    return Err(ModuleError::new(
-                        "Entry emitted a child-process effect without spawn_child capability",
-                    ));
+                if tag.as_atom().as_deref() == Some("EesCall") {
+                    let call = parse_ees_call_ref(effect.tagged_parts().unwrap().1)?;
+                    if !caps.ees.contains_key(&call.actor) {
+                        return Err(ModuleError::new(format!(
+                            "Entry emitted an EES effect for undeclared actor {:?}",
+                            call.actor
+                        )));
+                    }
                 }
             }
             let mut terminal = None;
@@ -663,22 +715,11 @@ impl Engine {
                     .tagged_parts()
                     .ok_or_else(|| ModuleError::new("Entry returned an invalid SystemEffect"))?;
                 match tag.as_atom().as_deref() {
-                    Some("SpawnStdioChild") => {
-                        let child = parse_spawn_stdio_child_ref(payload)?;
-                        host.spawn_stdio_child(child).await.map_err(|error| {
-                            ModuleError::new(format!("cannot spawn stdio child: {error}"))
+                    Some("EesCall") => {
+                        let call = parse_ees_call_ref(payload)?;
+                        host.ees_call(call).await.map_err(|error| {
+                            ModuleError::new(format!("cannot dispatch EES call: {error}"))
                         })?;
-                    }
-                    Some("PostStdin") => {
-                        let text = parse_child_text_ref(payload, "PostStdin")?;
-                        host.post_stdin(text).await.map_err(|error| {
-                            ModuleError::new(format!("cannot post child stdin: {error}"))
-                        })?;
-                    }
-                    Some("Exec") => {
-                        terminal = Some(RunTermination::Exec(parse_child_options_ref(
-                            payload, "Exec",
-                        )?));
                     }
                     Some("Output") => {
                         let text = payload
@@ -762,11 +803,32 @@ impl Engine {
         self.recover_with_resolver(resolver)
     }
 
+    pub fn recover_workspace_id_in_workspace(
+        &self,
+        workspace: Arc<crate::package::ResolvedWorkspace>,
+        cwd: impl AsRef<Path>,
+        module_id: &str,
+    ) -> Result<WorkspaceSnapshot, ModuleError> {
+        let resolver = ModuleResolver::from_workspace(workspace, cwd.as_ref(), module_id)
+            .map_err(|error| ModuleError::new(error.to_string()))?
+            .with_builtins(builtin_list());
+        self.recover_with_resolver(resolver)
+    }
+
     pub fn module_catalog(
         &self,
         cwd: impl AsRef<Path>,
     ) -> Result<Vec<ModuleCatalogEntry>, ModuleError> {
         ModuleResolver::catalog_from_cwd(cwd.as_ref(), builtin_list())
+            .map_err(|error| ModuleError::new(error.to_string()))
+    }
+
+    pub fn module_catalog_in_workspace(
+        &self,
+        workspace: Arc<crate::package::ResolvedWorkspace>,
+        cwd: impl AsRef<Path>,
+    ) -> Result<Vec<ModuleCatalogEntry>, ModuleError> {
+        ModuleResolver::catalog_from_workspace(workspace, cwd.as_ref(), builtin_list())
             .map_err(|error| ModuleError::new(error.to_string()))
     }
 
@@ -871,8 +933,41 @@ impl Engine {
             )
             .map_err(|error| ModuleError::new(error.to_string()))?
             .with_builtins(builtin_list());
+        self.recover_with_resolver_async(resolver, overlays, context)
+            .await
+    }
+
+    pub async fn recover_workspace_async_in_workspace(
+        &self,
+        workspace: Arc<crate::package::ResolvedWorkspace>,
+        path: impl AsRef<Path>,
+        overlays: &BTreeMap<PathBuf, crate::document::DocumentText>,
+        context: &crate::query::QueryContext,
+    ) -> Result<WorkspaceSnapshot, ModuleError> {
+        context
+            .checkpoint()
+            .await
+            .map_err(|error| ModuleError::new(error.to_string()))?;
+        let root_path = path.as_ref();
+        let resolver = ModuleResolver::for_root_in_workspace(
+            workspace,
+            root_path,
+            overlays.get(root_path),
+        )
+        .map_err(|error| ModuleError::new(error.to_string()))?
+        .with_builtins(builtin_list());
+        self.recover_with_resolver_async(resolver, overlays, context)
+            .await
+    }
+
+    async fn recover_with_resolver_async(
+        &self,
+        resolver: ModuleResolver,
+        overlays: &BTreeMap<PathBuf, crate::document::DocumentText>,
+        context: &crate::query::QueryContext,
+    ) -> Result<WorkspaceSnapshot, ModuleError> {
         let root_module = resolver
-            .resolve_root(path.as_ref())
+            .selected_root()
             .map_err(|error| ModuleError::new(error.to_string()))?;
         let opaque_modules = builtin_list()
             .into_iter()

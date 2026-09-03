@@ -280,26 +280,6 @@
     }
 
     #[test]
-    fn recursive_metadata_remains_observable_without_a_legacy_value_boundary() {
-        let directory = fixture_dir();
-        let main = directory.join("main.telora");
-        fs::write(
-            &main,
-            r#"type CallExpr = struct { args: Array(Expr) };
-type Expr = enum { 'Call(CallExpr), 'Text(String) };
-export { CallExpr, Expr };"#,
-        )
-        .unwrap();
-
-        let engine = recovery_engine();
-        let module = engine.load_module(&main, BTreeMap::new()).unwrap();
-        engine.check(&module).unwrap();
-        let value = engine.execute(&module).unwrap();
-        assert_eq!(value.value().dict_fields(), Some(vec!["CallExpr", "Expr"]));
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
     fn recursive_type_metadata_keeps_typed_module_import_surfaces() {
         let directory = fixture_dir();
         fs::write(
@@ -410,71 +390,6 @@ export { CallExpr, Expr };"#,
     }
 
     #[test]
-    fn builtin_bool_option_and_result_are_normalized_enum_metadata() {
-        let directory = fixture_dir();
-        fs::write(
-            directory.join("main.telora"),
-            r#"import "std/attributes" as attributes;
-               type Maybe = Option(attributes.add(Int, { marker: "payload" }));
-               type Outcome = Result(String, Int);
-               let compared: Bool = 1 < 2;
-               let none: Maybe = 'None;
-               let some: Maybe = 'Some(42);
-               let ok: Outcome = 'Ok("done");
-               let err: Outcome = 'Err(7);
-               {
-                   bool: Bool,
-                   maybe: Maybe,
-                   outcome: Outcome,
-                   compared: validate(Bool, compared),
-                   none: validate(Maybe, none),
-                   some: validate(Maybe, some),
-                   ok: validate(Outcome, ok),
-                   err: validate(Outcome, err),
-                   wrong_bool: validate(Bool, 'Other),
-                   wrong_some: validate(Maybe, 'Some("forty-two")),
-               }"#,
-        )
-        .unwrap();
-        let module = load_module(directory.join("main.telora"), BTreeMap::new(), 100_000).unwrap();
-        let result_world = module.execute(100_000).unwrap();
-        let result = result_world.value();
-        for field in ["compared", "none", "some", "ok", "err"] {
-            assert!(result.get(field).unwrap().to_string().starts_with("'Ok("));
-        }
-        for field in ["wrong_bool", "wrong_some"] {
-            assert!(result.get(field).unwrap().to_string().starts_with("'Err("));
-        }
-
-        fn wrapper(value: crate::ValueRef<'_>) -> crate::ValueRef<'_> {
-            let wrapper = value;
-            assert_eq!(wrapper.get("kind").unwrap().to_string(), "'WithAttributes");
-            assert!(wrapper.get("attributes").unwrap().dict_fields().is_some());
-            wrapper
-        }
-        for field in ["bool", "maybe", "outcome"] {
-            let root = wrapper(result.get(field).unwrap());
-            let metadata = root.get("inner").unwrap();
-            assert_eq!(metadata.get("kind").unwrap().to_string(), "'Enum");
-            let variants = metadata.get("variants").unwrap();
-            for variant in variants.dict_values().unwrap() {
-                wrapper(variant);
-            }
-        }
-        let maybe = wrapper(result.get("maybe").unwrap());
-        let metadata = maybe.get("inner").unwrap();
-        let variants = metadata.get("variants").unwrap();
-        let some = wrapper(variants.get("Some").unwrap());
-        assert_eq!(
-            some.get("attributes").unwrap().to_string(),
-            "{marker: \"payload\"}"
-        );
-        let none = wrapper(variants.get("None").unwrap());
-        assert_eq!(none.get("inner").unwrap().to_string(), "'None");
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
     fn builtin_enum_type_constructors_validate_inputs_and_charge_quota() {
         let directory = fixture_dir();
         let invalid_path = directory.join("invalid.telora");
@@ -497,130 +412,6 @@ export { CallExpr, Expr };"#,
             .err()
             .expect("Result construction must exhaust allocation quota");
         assert_eq!(error.kind, crate::RuntimeErrorKind::AllocationQuotaExceeded);
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn removed_model_constructors_are_unavailable_and_union_remains_accounted() {
-        let directory = fixture_dir();
-        let run_error = |name: &str, expression: &str| {
-            let path = directory.join(name);
-            fs::write(&path, expression).unwrap();
-            let module = load_module(path, BTreeMap::new(), 100_000).unwrap();
-            module.execute(100_000).unwrap_err()
-        };
-        assert!(
-            run_error("empty-union.telora", "union('None, [])")
-                .message
-                .contains("at least one variant")
-        );
-        assert!(
-            run_error("union-variant.telora", "union('None, [1])")
-                .message
-                .contains("Type metadata")
-        );
-        assert!(
-            run_error(
-                "union-wrapper.telora",
-                "union('None, [{kind: 'WithAttributes, inner: Int, attributes: []}])",
-            )
-            .message
-            .contains("attributes must be a Dict")
-        );
-
-        for (name, source) in [
-            ("struct.telora", "struct('None, {x: Int})"),
-            ("enum.telora", "enum('None, {X: 'None})"),
-            ("uppercase-struct.telora", "Struct({x: Int})"),
-            ("uppercase-enum.telora", "Enum({X: 'None})"),
-            ("uppercase-union.telora", "Union([Int, String])"),
-        ] {
-            let path = directory.join(name);
-            fs::write(&path, source).unwrap();
-            let error = match load_module(path, BTreeMap::new(), 100_000) {
-                Ok(_) => panic!("removed constructor must be absent"),
-                Err(error) => error,
-            };
-            assert!(error.message.contains("unknown binding"));
-        }
-
-        let path = directory.join("quota.telora");
-        fs::write(&path, "union('None, [Int, String])").unwrap();
-        let module = load_module(path, BTreeMap::new(), 100_000).unwrap();
-        let mut account = QuotaAccount::new(Quota::new(10, 1_000, 0));
-        let error = Vm::new()
-            .execute_in_work(
-                &module.runtime.main.heap,
-                &module.runtime.externals,
-                &module.function,
-                &[],
-                &mut account,
-            )
-            .err()
-            .expect("model normalization must exhaust allocation quota");
-        assert_eq!(error.kind, crate::RuntimeErrorKind::AllocationQuotaExceeded);
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn core_attributes_rejects_malformed_wrappers_and_obeys_allocation_quota() {
-        let directory = fixture_dir();
-        let path = directory.join("main.telora");
-        fs::write(
-            &path,
-            r#"import "std/attributes" as attributes;
-               attributes.normalize({kind: 'WithAttributes, inner: 1, attributes: []})"#,
-        )
-        .unwrap();
-        let module = load_module(&path, BTreeMap::new(), 100_000).unwrap();
-        let error = module.execute(100_000).unwrap_err();
-        assert!(error.message.contains("attributes must be a Dict"));
-
-        fs::write(
-            &path,
-            r#"import "std/attributes" as attributes;
-               attributes.normalize(1)"#,
-        )
-        .unwrap();
-        let module = load_module(&path, BTreeMap::new(), 100_000).unwrap();
-        let mut account = QuotaAccount::new(Quota::new(10, 1_000, 0));
-        let error = Vm::new()
-            .execute_in_work(
-                &module.runtime.main.heap,
-                &module.runtime.externals,
-                &module.function,
-                &[],
-                &mut account,
-            )
-            .err()
-            .expect("normalization must exhaust allocation quota");
-        assert_eq!(error.kind, crate::RuntimeErrorKind::AllocationQuotaExceeded);
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-
-    #[test]
-    fn core_dict_rejects_invalid_arguments_pairs_and_duplicates() {
-        let directory = fixture_dir();
-        let run_error = |name: &str, expression: &str| {
-            let path = directory.join(name);
-            fs::write(&path, format!("import \"std/dict\" as dicts; {expression}")).unwrap();
-            match load_module(path, BTreeMap::new(), 100_000) {
-                Ok(module) => module.execute(100_000).unwrap_err().message,
-                Err(error) => error.to_string(),
-            }
-        };
-
-        assert!(run_error("keys.telora", "dicts.keys([])").contains("Dict"));
-        assert!(run_error("merge.telora", "dicts.merge({}, [])").contains("right Dict"));
-        assert!(run_error("pairs-array.telora", "dicts.from_pairs({})").contains("Array"));
-        assert!(!run_error("pair-shape.telora", "dicts.from_pairs([(\"a\", 1, 2)])").is_empty());
-        assert!(run_error("pair-key.telora", "dicts.from_pairs([('a, 1)])").contains("String"));
-        let duplicate = run_error(
-            "duplicate.telora",
-            "dicts.from_pairs([(\"a\", 1), (\"a\", 2)])",
-        );
-        assert!(duplicate.contains("duplicate field"));
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -673,96 +464,12 @@ export { CallExpr, Expr };"#,
     }
 
     #[test]
-    fn exported_closures_preserve_module_type_slots() {
-        let directory = fixture_dir();
-        let library = directory.join("library.telora");
-        let main = directory.join("main.telora");
-        fs::write(
-            &library,
-            r#"import "std/rt-types/exec" as exec_types;
-               import "std/hash" as hash;
-               type ExecSettings = exec_types.ExecSettings;
-               type ExecRequest = exec_types.ExecRequest;
-               type ExecEnv = exec_types.ExecEnv;
-               type Platform = exec_types.Platform;
-               type Config = struct {platform: Platform, offset: Int};
-               def helper = fn(value) { value + 1 };
-               def helper2 = fn(value) { helper(value) + 1 };
-               def select = fn(platform) {
-                   let host = `\{platform.os}-\{platform.arch}`;
-                   match host {
-                       "linux-x86_64" => 1,
-                       _ => 0,
-                   }
-               };
-               def even = fn(value: Int) {
-                   if value == 0 { 'True } else { odd(value - 1) }
-               };
-               def odd = fn(value: Int) {
-                   if value == 0 { 'False } else { even(value - 1) }
-               };
-               export { even };
-               export def direct = fn(value) { helper(value) };
-               export def factory:
-                   Fn(Config) -> Fn(Int) -> Int = fn(config) {
-                   fn(value) {
-                       let ignored = hash.sha256("gcc");
-                       helper2(value) + config.offset + select(config.platform) - 2
-                   }
-               };
-               export def command:
-                   Fn(String) -> Fn(ExecSettings, ExecRequest) -> ExecEnv = fn(tool) {
-                   fn(settings, request) {
-                       let selected = select(settings.platform);
-                       let suffix = helper(selected);
-                       {
-                           install: [],
-                           cwd: 'Some(request.cwd),
-                           bin: `\{settings.install_prefix}/\{tool}-\{suffix}`,
-                           args: request.args,
-                           env: {clear: 'False, update: {}},
-                       }
-                   }
-               };"#,
-        )
-        .unwrap();
-        fs::write(
-            &main,
-            r#"import "./library" as library;
-               export def output = (
-                   library.direct(40),
-                   library.factory({platform: {os: "linux", arch: "x86_64"}, offset: 2})(39),
-                   library.command("gcc")(
-                       {
-                           platform: {os: "linux", arch: "x86_64"},
-                           download_prefix: "/downloads",
-                           install_prefix: "/cache",
-                       },
-                       {args: ["-c", "x.c"], env: {TARGET: "aarch64"}, cwd: "/work"},
-                   ),
-                   library.even(10),
-               );"#,
-        )
-        .unwrap();
-
-        let engine = recovery_engine();
-        let loaded = engine.load_module(&main, BTreeMap::new()).unwrap();
-        assert_eq!(
-            named_output(&engine.execute(&loaded).unwrap()).to_string(),
-            "(41, 42, {args: [\"-c\", \"x.c\"], bin: \"/cache/gcc-2\", cwd: 'Some(\"/work\"), env: {clear: 'False, update: {}}, install: []}, 'True)"
-        );
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
     fn pending_modules_defer_imports_and_cache_initialization_outcomes() {
         let directory = fixture_dir();
         let main = directory.join("main.telora");
         fs::write(
             &main,
-            r#"option "test.action" 1;
-               option "test.action" 2;
-               import "./missing" as missing;
+            r#"import "./missing" as missing;
                export { missing as output };"#,
         )
         .unwrap();
@@ -772,7 +479,7 @@ export { CallExpr, Expr };"#,
         let first = pending.initialize().unwrap_err().to_string();
         let second = pending.initialize().unwrap_err().to_string();
         assert_eq!(first, second);
-        assert!(first.contains("fixture/missing"), "{first}");
+        assert!(first.contains("standalone/missing"), "{first}");
 
         fs::write(&main, "export def output = 42;").unwrap();
         let pending = engine.prepare_module(&main).unwrap();
@@ -871,10 +578,10 @@ export { CallExpr, Expr };"#,
         );
         assert!(main.imports.iter().any(|import| import.target == model.id));
         assert_ne!(main.source, model.source);
-        assert_eq!(model.name, "fixture/model");
+        assert_eq!(model.name, "standalone/model");
         assert_eq!(
             snapshot.sources().get(model.source.unwrap()).name.as_ref(),
-            "fixture/model"
+            "standalone/model"
         );
         fs::remove_dir_all(directory).unwrap();
     }

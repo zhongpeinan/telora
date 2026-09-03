@@ -11,57 +11,95 @@ fn fixture() -> PathBuf {
         .unwrap()
         .as_nanos();
     let path = std::env::temp_dir().join(format!("telora-cli-{unique}"));
-    fs::create_dir_all(path.join("src/bin")).unwrap();
-    fs::create_dir_all(path.join("src/entry")).unwrap();
+    fs::create_dir_all(path.join("src")).unwrap();
     fs::create_dir_all(path.join("tests")).unwrap();
-    fs::write(path.join("telora-deps.json"), r#"{"name":"fixture"}"#).unwrap();
+    fs::write(
+        path.join("telora-config.json"),
+        r#"{"version":1,"members":["."]}"#,
+    )
+    .unwrap();
+    refresh_fixture_workspace(&path);
     path
 }
 
 fn telora(cwd: &Path) -> Command {
+    if let Some(root) = cwd
+        .ancestors()
+        .find(|directory| directory.join("telora-config.json").is_file())
+    {
+        let managed = fs::read_to_string(root.join("telora-config.json"))
+            .ok()
+            .and_then(|source| serde_json::from_str::<Value>(&source).ok())
+            .is_some_and(|config| config["members"] == serde_json::json!(["."]));
+        if managed {
+            refresh_fixture_workspace(root);
+        }
+    }
     let mut command = Command::new(env!("CARGO_BIN_EXE_telora"));
     command.current_dir(cwd);
     command
 }
 
-fn write_entry(cwd: &Path, source: impl AsRef<str>) -> std::io::Result<()> {
-    let source = source
-        .as_ref()
-        .replace(
-            "def legacy_prepare: Fn(rt.SystemOptions) -> rt.SystemCaps = fn(options) { {input: 'False} };",
-            "",
-        )
-        .replace(
-            "def legacy_prepare: Fn(rt.SystemOptions) -> rt.SystemCaps = fn(options) { {input: 'True} };",
-            "",
-        );
-    let spawn_child = if source.contains("'SpawnStdioChild") || source.contains("'PostStdin") {
-        "'True"
-    } else {
-        "'False"
-    };
-    let source = format!(
-        r#"{source}
-type EntryInitializer = Fn(rt.SystemResources, MainType) -> Tuple([
-    State,
-    Fn(State, rt.SystemEvent) -> Tuple([State, Array(rt.SystemEffect)]),
-]);
-export def config:
-    Fn(rt.SystemOptions, rt.Env) -> Tuple([rt.SystemCaps, EntryInitializer])
-    = fn(options, env) {{
-    (
-        {{
-            data_srcs: {{}},
-            spawn_child: {spawn_child},
-            text_srcs: {{}},
-            vars: [],
-            stdin: 'Null,
-        }},
-        fn(resources, main) {{ legacy_initialize(main) }},
+fn refresh_fixture_workspace(root: &Path) {
+    fn modules(root: &Path, directory: &Path, found: &mut Vec<String>) {
+        let Ok(entries) = fs::read_dir(directory) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                modules(root, &path, found);
+                continue;
+            }
+            if !kind.is_file() {
+                continue;
+            }
+            let extension = path.extension().and_then(|value| value.to_str());
+            if !matches!(extension, Some("telora" | "json" | "yaml" | "yml" | "toml")) {
+                continue;
+            }
+            let mut relative = path.strip_prefix(root).unwrap().to_owned();
+            if extension == Some("telora") {
+                relative.set_extension("");
+            }
+            found.push(format!(
+                "@src/{}",
+                relative.to_string_lossy().replace('\\', "/")
+            ));
+        }
+    }
+
+    let mut declared = Vec::new();
+    modules(&root.join("src"), &root.join("src"), &mut declared);
+    declared.sort();
+    fs::write(
+        root.join("telora-crate.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "name": "fixture",
+            "modules": declared,
+            "dependencies": [],
+        }))
+        .unwrap(),
     )
-}};"#
-    );
-    fs::write(cwd.join("src/entry/test.telora"), source)
+    .unwrap();
+    fs::write(
+        root.join("telora-lock.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "packages": {
+                "fixture": {
+                    "source": {"workspace":""},
+                    "modules": declared,
+                    "dependencies": [],
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
 }
 
 fn jsonl(bytes: &[u8]) -> Vec<Value> {
@@ -73,3 +111,5 @@ fn jsonl(bytes: &[u8]) -> Vec<Value> {
 
 include!("cli/part-01.rs");
 include!("cli/part-02.rs");
+include!("cli/part-03.rs");
+include!("cli/part-04.rs");

@@ -7,8 +7,8 @@ use crate::compiler::{
     type_family_template_link_key,
 };
 use crate::core::{
-    DEFAULT_ENTRY_MODULE, FMT_CAPABILITY_BINDING, FMT_MODULE, PRELUDE_MODULE, SERVE_ENTRY_MODULE,
-    default_entry_source, module_specs, serve_entry_source,
+    FMT_CAPABILITY_BINDING, FMT_MODULE, PRELUDE_MODULE, PRIVATE_ENTRY_MODULE, RUN_ENTRY_MODE,
+    SERVE_ENTRY_MODE, module_specs, run_entry_source, serve_entry_source,
 };
 use crate::heap::{DecodedValue, Heap, Object, PersistentValue, Val, semantic_value_type_id};
 use crate::json::{
@@ -17,7 +17,7 @@ use crate::json::{
 };
 use crate::module_id::{
     ModuleCName, ModuleCatalogEntry, ModuleFormat, ModuleId, ModuleResolver, ModuleVendor,
-    ResolvedModule, immediate_value, is_public_builtin_name,
+    ResolvedModule, is_public_builtin_name,
 };
 use crate::parser::parse_registered;
 use crate::semantic::{
@@ -32,8 +32,6 @@ use crate::types::{
     TypeDescriptor, TypeFamilyTemplate, TypeScheme, analyze_partial_types_recovered_with_query,
     analyze_program_with_bindings_observed, program_references_name, recovered_reference_locations,
 };
-#[cfg(test)]
-use crate::vm::ValueRef;
 use crate::vm::WorkWorld;
 use crate::yaml::validate_yaml_registered;
 use crate::{
@@ -52,6 +50,7 @@ include!("module/graph.rs");
 include!("module/loaded.rs");
 include!("module/host.rs");
 include!("module/engine.rs");
+include!("module/eval.rs");
 include!("module/workspace.rs");
 include!("module/entry.rs");
 include!("module/loader.rs");

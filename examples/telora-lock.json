@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "packages": {
+    "app": {
+      "source": {
+        "workspace": "app"
+      },
+      "modules": [
+        "@src/main"
+      ],
+      "dependencies": [
+        "domain-method"
+      ]
+    },
+    "domain-method": {
+      "source": {
+        "workspace": "domain-method"
+      },
+      "modules": [
+        "@src/method"
+      ],
+      "dependencies": []
+    }
+  }
+}
