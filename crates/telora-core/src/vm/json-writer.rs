@@ -17,6 +17,7 @@ impl<'a> JsonWriter<'a> {
 
     fn value(&mut self, value: Val, depth: usize) -> Result<(), String> {
         match value.value() {
+            DecodedValue::SolvedType(_) => return Err("JSON cannot encode Type metadata".into()),
             DecodedValue::Failed(_) => {
                 return Err("JSON cannot encode a failed evaluation node".into());
             }
@@ -49,9 +50,6 @@ impl<'a> JsonWriter<'a> {
             DecodedValue::Bytes(_) => return Err("JSON cannot encode Bytes".into()),
             DecodedValue::Opaque(_) => return Err("JSON cannot encode Opaque values".into()),
             DecodedValue::NativeType(_) => return Err("JSON cannot encode Type values".into()),
-            DecodedValue::DeclaredType(_) | DecodedValue::SymbolicType(_) => {
-                return Err("JSON cannot encode Type values".into());
-            }
             DecodedValue::Tuple(_) => {
                 return Err("JSON cannot encode Tuple; use a codec first".into());
             }
@@ -59,12 +57,7 @@ impl<'a> JsonWriter<'a> {
                 return Err("JSON cannot encode Tagged; use a codec first".into());
             }
             DecodedValue::Func(_) => return Err("JSON cannot encode Func".into()),
-            DecodedValue::FuncRef(_) => return Err("JSON cannot encode Func".into()),
             DecodedValue::Dyn(_) => return Err("JSON cannot encode Dyn".into()),
-            DecodedValue::Module(_) => return Err("JSON cannot encode Module".into()),
-            DecodedValue::TypeSlot(_) => {
-                return Err("JSON cannot encode an internal up-link".into());
-            }
         }
         Ok(())
     }
@@ -166,67 +159,3 @@ fn values_len_hint(handle: Handle, view: &HeapView<'_>, tuple: bool) -> Result<u
 const DEBUG_MAX_DEPTH: usize = 8;
 const DEBUG_MAX_ITEMS: usize = 32;
 const DEBUG_MAX_BYTES: usize = 4_096;
-fn run_core_diagnostic(
-    arguments: &[Val],
-    return_target: ReturnTarget,
-    function: &Arc<BytecodeFunction>,
-    pc: usize,
-    current: &mut Heap,
-    background: &Heap,
-    account: &mut QuotaAccount,
-) -> Result<VmAction, RuntimeError> {
-    let view = HeapView {
-        current,
-        background: Some(background),
-    };
-    let message = view
-        .string_text(arguments[0])
-        .map_err(|heap_error| {
-            error(
-                RuntimeErrorKind::InvalidBytecode,
-                heap_error.to_string(),
-                function,
-                pc,
-            )
-        })?
-        .ok_or_else(|| runtime_type_error("String", &arguments[0], &view, function, pc))?;
-    let message = message.as_str().to_owned();
-    let subjects = match arguments[1].value() {
-        DecodedValue::Tuple(handle) => view
-            .sequence(handle, true)
-            .map_err(|heap_error| {
-                error(
-                    RuntimeErrorKind::InvalidBytecode,
-                    heap_error.to_string(),
-                    function,
-                    pc,
-                )
-            })?
-            .iter()
-            .filter_map(|value| value.loc())
-            .collect::<Vec<_>>(),
-        _ => arguments[1].loc().into_iter().collect(),
-    };
-    let fallback = instruction_location(function, pc);
-    let primary = fallback.or_else(|| subjects.first().copied());
-    let mut diagnostic = primary.map_or_else(
-        || Diagnostic {
-            severity: crate::source::Severity::Warning,
-            message: message.clone(),
-            labels: Vec::new(),
-            notes: Vec::new(),
-        },
-        |location| Diagnostic::new(crate::source::Severity::Warning, &message, location),
-    );
-    for related in subjects {
-        if primary != Some(related) {
-            diagnostic = diagnostic.with_secondary("related value", related);
-        }
-    }
-    account.diagnostics.push(diagnostic);
-    Ok(VmAction::Return {
-        value: Val::unknown(DecodedValue::BuiltinAtom(BuiltinAtom::None)),
-        return_target,
-    })
-}
-

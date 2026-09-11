@@ -20,6 +20,10 @@ fi
 rm -rf "$build_root"
 mkdir -p "$workspace/src/generated" "$actual_root"
 cp -R "$source_root/src/." "$workspace/src/"
+if [[ -d "$workspace/src/test" ]]; then
+    mkdir -p "$workspace/tests"
+    cp -R "$workspace/src/test/." "$workspace/tests/"
+fi
 
 mapfile -t testees < <(find "$workspace/src" -type f -name testee.telora | sort)
 if [[ ${#testees[@]} -eq 0 ]]; then
@@ -30,7 +34,6 @@ fi
 cases=()
 case_checks=()
 declare -A aggregate_success_cases
-declare -A aggregate_diagnostic_cases
 for testee in "${testees[@]}"; do
     relative=${testee#"$workspace/src/"}
     case_id=${relative%/testee.telora}
@@ -58,23 +61,8 @@ success_all="$workspace/src/generated/check-success-all.telora"
             success_index=$((success_index + 1))
         fi
     done
-    echo "export def all_loaded = 'True;"
+    echo "export def all_loaded: Bool = True;"
 } >"$success_all"
-
-diagnostics_all="$workspace/src/generated/check-diagnostics-all.telora"
-{
-    diagnostic_index=0
-    for index in "${!cases[@]}"; do
-        case_id=${cases[$index]}
-        mode=${case_id%%/*}
-        if [[ $mode == check && ${case_checks[$index]} -eq 2 ]]; then
-            printf 'import "@src/%s/testee" as diagnostic_%s;\n' "$case_id" "$diagnostic_index"
-            aggregate_diagnostic_cases["$case_id"]=1
-            diagnostic_index=$((diagnostic_index + 1))
-        fi
-    done
-    echo "export def all_loaded = 'True;"
-} >"$diagnostics_all"
 
 generated="$workspace/src/generated/check-all.telora"
 {
@@ -87,29 +75,29 @@ generated="$workspace/src/generated/check-all.telora"
             printf 'import "@src/%s/check" as case_%s;\n' "${cases[$index]}" "$index"
         fi
     done
-    echo 'def config: entry.ContextConfig = {sources: ["actual"], envs: [], args: '\''False};'
+    echo 'def config: entry.ContextConfig = {sources: ["actual"], envs: [], args: False};'
     echo 'def required: Fn(Dict(Value), String) -> Value = fn(values, name) {'
     echo '    match dict.get(values, name) {'
-    echo '        '\''Some(value) => value,'
-    echo '        '\''None => fail!("missing test observation", name),'
+    echo '        Some(value) => value,'
+    echo '        None => fail!("missing test observation", name),'
     echo '    }'
     echo '};'
     echo 'export def check = entry.main(config, fn(ctx) {'
     echo '    let actual = match dict.get(ctx.sources, "actual") {'
-    echo '        '\''Some('\''Object(values)) => values,'
+    echo '        Some(Value.Object(values)) => values,'
     echo '        _ => fail!("actual test observations must be an object"),'
     echo '    };'
-    echo '    '\''Object({'
+    echo '    Value.Object({'
     for index in "${!cases[@]}"; do
         if [[ ${case_checks[$index]} -eq 1 ]]; then
             printf '        "%s": case_%s.check(required(actual, "%s")),\n' \
                 "${cases[$index]}" "$index" "${cases[$index]}"
         elif [[ ${case_checks[$index]} -eq 2 ]]; then
             expected=$(jaq -Rs 'rtrimstr("\n")' "$workspace/src/${cases[$index]}/expected.txt")
-            printf '        "%s": if support.failed_with(required(actual, "%s"), %s) { '\''True } else { '\''False },\n' \
+            printf '        "%s": if support.failed_with(required(actual, "%s"), %s) { Value.True } else { Value.False },\n' \
                 "${cases[$index]}" "${cases[$index]}" "$expected"
         else
-            printf '        "%s": if support.succeeded(required(actual, "%s")) { '\''True } else { '\''False },\n' \
+            printf '        "%s": if support.succeeded(required(actual, "%s")) { Value.True } else { Value.False },\n' \
                 "${cases[$index]}" "${cases[$index]}"
         fi
     done
@@ -151,14 +139,9 @@ set +e
 success_exit=$?
 set -e
 
-diagnostics_stdout="$actual_root/check-diagnostics-all.stdout.jsonl"
-diagnostics_stderr="$actual_root/check-diagnostics-all.stderr.jsonl"
-set +e
-"$telora_bin" -C "$workspace" check "@src/generated/check-diagnostics-all" \
-    >"$diagnostics_stdout" 2>"$diagnostics_stderr"
-diagnostics_exit=$?
-set -e
-
+# Error fixtures need separate sessions: a static error prevents that session
+# from entering tool/runtime execution. Combining them would suppress unrelated
+# runtime diagnostics and share an exit status between independent assertions.
 for case_id in "${cases[@]}"; do
     mode=${case_id%%/*}
 
@@ -166,19 +149,16 @@ for case_id in "${cases[@]}"; do
         raw_stdout=$success_stdout
         raw_stderr=$success_stderr
         exit_code=$success_exit
-    elif [[ -n ${aggregate_diagnostic_cases[$case_id]+x} ]]; then
-        raw_stdout="$actual_root/${case_id//\//__}.stdout.jsonl"
-        raw_stderr=$diagnostics_stderr
-        exit_code=$diagnostics_exit
-        jaq -c --arg source "language-tests/$case_id/testee" \
-            'select(any(.labels[]?; .source == $source))' \
-            "$diagnostics_stdout" >"$raw_stdout"
     else
         raw_stdout="$actual_root/${case_id//\//__}.stdout.jsonl"
         raw_stderr="$actual_root/${case_id//\//__}.stderr.jsonl"
 
         set +e
         case "$mode" in
+            test)
+                "$telora_bin" -C "$workspace" test "${case_id#test/}/testee" \
+                    >"$raw_stdout" 2>"$raw_stderr"
+                ;;
             eval)
                 "$telora_bin" -C "$workspace" eval "@src/$case_id/testee:result" \
                     >"$raw_stdout" 2>"$raw_stderr"

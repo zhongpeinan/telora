@@ -1,5 +1,13 @@
 use crate::source::{Located, Location};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlameAction {
+    Build,
+    Raise,
+    Warn,
+    Fail,
+}
+
 pub type Identifier = Located<String>;
 pub type Program = Located<ProgramKind>;
 pub type Block = Located<BlockKind>;
@@ -42,9 +50,16 @@ pub struct BindingData {
     pub value: Expr,
 }
 
+impl BindingData {
+    pub fn is_member_import(&self) -> bool {
+        self.kind == BindingKind::Def && self.imported_name.is_some()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeclaredInitializerKind {
     Struct,
+    Newtype,
     Enum,
 }
 
@@ -82,6 +97,8 @@ pub enum ExprKind {
     Array(Vec<Expr>),
     Spread(Box<Expr>),
     Tuple(Vec<Expr>),
+    TypeSyntax(Box<Expr>),
+    TypeMetadata(Box<Expr>),
     Dict(Vec<DictField>),
     Block(Block),
     Unary {
@@ -98,7 +115,9 @@ pub enum ExprKind {
         message: Box<Expr>,
     },
     Raise {
-        error: Box<Expr>,
+        action: BlameAction,
+        message: Box<Expr>,
+        subjects: Vec<Expr>,
     },
     Debug {
         value: Box<Expr>,
@@ -113,11 +132,6 @@ pub enum ExprKind {
         value: Box<Expr>,
         target: Box<Expr>,
     },
-    DynProject {
-        namespace: Box<Expr>,
-        target: Box<Expr>,
-        value: Box<Expr>,
-    },
     Binary {
         operator: Located<BinaryOperator>,
         left: Box<Expr>,
@@ -126,6 +140,10 @@ pub enum ExprKind {
     Field {
         receiver: Box<Expr>,
         field: Identifier,
+    },
+    FieldProjection {
+        receiver: Box<Expr>,
+        fields: Vec<(Identifier, Identifier)>,
     },
     Index {
         receiver: Box<Expr>,
@@ -211,6 +229,7 @@ pub enum BinaryOperator {
     Equal,
     NotEqual,
     BitAnd,
+    StructUpdate,
     BitOr,
     BitXor,
     And,
@@ -247,6 +266,7 @@ pub enum PatternKind {
     String(String),
     Atom(String),
     Tagged { tag: String, payload: Box<Pattern> },
+    Constructor { constructor: Box<Expr>, payload: Option<Box<Pattern>> },
     Tuple(Vec<Pattern>),
     Struct(Vec<StructPatternField>),
 }

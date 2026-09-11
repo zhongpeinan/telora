@@ -1,12 +1,20 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{self, Read};
+use std::io;
 use telora_core::{EntryDataSources, EvalSource, SystemDataFormat, SystemDataSource};
 
 #[derive(Clone)]
 pub(crate) struct NamedSource {
     name: String,
     source: SystemDataSource,
+}
+
+pub(crate) fn parse_fixture_source(value: &str) -> Result<SystemDataSource, String> {
+    let source = parse_named_source(&format!("fixture={value}"))?.source;
+    if is_stdin_source(&source.src) {
+        return Err("fixtures require local file sources".into());
+    }
+    Ok(source)
 }
 
 pub(crate) struct CollectedEntrySources {
@@ -156,23 +164,7 @@ pub(crate) fn collect_eval_sources(
     Ok(collected)
 }
 
-fn read_limited(reader: impl Read, max_bytes: usize, description: &str) -> Result<Vec<u8>, String> {
-    let max_read = u64::try_from(max_bytes)
-        .unwrap_or(u64::MAX)
-        .saturating_add(1);
-    let mut bytes = Vec::with_capacity(max_bytes.min(64 * 1024));
-    reader
-        .take(max_read)
-        .read_to_end(&mut bytes)
-        .map_err(|error| format!("cannot read {description}: {error}"))?;
-    if bytes.len() > max_bytes {
-        return Err(format!(
-            "{description} exceeds file_size limit ({} > {max_bytes})",
-            bytes.len()
-        ));
-    }
-    Ok(bytes)
-}
+pub(crate) use telora::static_input::read_limited;
 
 pub(crate) fn eval_source_names(sources: &[NamedSource]) -> Result<Vec<String>, String> {
     let mut names = sources

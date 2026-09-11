@@ -15,6 +15,95 @@ pub struct CallContext<'vm, 'stack> {
 pub(crate) struct OpaqueAllocationReservation(());
 
 impl<'vm, 'stack> CallContext<'vm, 'stack> {
+    pub(crate) fn make_test(&mut self, kind: crate::test_protocol::TestKind) -> Result<(), NativeError> {
+        use crate::test_protocol::TestKind;
+        let native_type = self
+            .value(self.upvalue(0)?)?
+            .as_native_type()
+            .cloned()
+            .ok_or_else(|| NativeError::new("Test native type is not linked"))?;
+        let mut payload_bytes = 0usize;
+        let source_count = if kind == TestKind::Fixtures {
+            let values = self.value(self.argument(0)?)?;
+            let count = values
+                .sequence_len()
+                .ok_or_else(|| NativeError::new("expected Array(String)"))?;
+            for index in 0..count {
+                let length = values
+                    .sequence_get(index)
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| NativeError::new("expected fixture source String"))?
+                    .as_str()
+                    .len();
+                payload_bytes = payload_bytes.checked_add(length).ok_or_else(|| {
+                    NativeError::allocation_limit("fixture source list size overflowed")
+                })?;
+            }
+            count
+        } else {
+            0
+        };
+        if kind == TestKind::ShouldFailWith {
+            let length = self
+                .value(self.argument(1)?)?
+                .as_str()
+                .ok_or_else(|| NativeError::new("expected String"))?
+                .as_str()
+                .len();
+            if length == 0 {
+                return Err(NativeError::new(
+                    "should_fail_with requires a nonempty expectation",
+                ));
+            }
+            payload_bytes = length;
+        }
+        self.charge_allocation(payload_bytes)?;
+        self.charge_sequence(source_count.saturating_add(2))?;
+        let mut sources = Vec::with_capacity(source_count);
+        let expected = if kind == TestKind::ShouldFailWith {
+            let value = self
+                .value(self.argument(1)?)?
+                .as_str()
+                .ok_or_else(|| NativeError::new("expected String"))?
+                .as_str()
+                .to_owned();
+            Some(value)
+        } else {
+            None
+        };
+        if kind == TestKind::Fixtures {
+            let values = self.value(self.argument(0)?)?;
+            let length = values
+                .sequence_len()
+                .ok_or_else(|| NativeError::new("expected Array(String)"))?;
+            for index in 0..length {
+                sources.push(
+                    values
+                        .sequence_get(index)
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| NativeError::new("expected fixture source String"))?
+                        .as_str()
+                        .to_owned(),
+                );
+            }
+        }
+        let callable =
+            self.owned(self.argument(if kind == TestKind::Fixtures { 1 } else { 0 })?)?;
+        let description = crate::test_protocol::TestDescription {
+            kind,
+            expected,
+            sources,
+            origin: self.call_site,
+        };
+        let mut value = crate::OpaqueValue::new_identity(native_type, description);
+        value.traced = vec![callable].into_boxed_slice();
+        let handle = self.current.allocate(Object::Opaque(value));
+        self.set(
+            self.result(),
+            Val::unknown(DecodedValue::Opaque(handle)).with_loc(self.call_site),
+        )
+    }
+
     fn new(
         current: &'vm mut Heap,
         background: Option<&'vm Heap>,
@@ -90,6 +179,24 @@ impl<'vm, 'stack> CallContext<'vm, 'stack> {
             u32::try_from(self.upvalue_base + index)
                 .map_err(|_| NativeError::stack_limit("upvalue register exceeds u32"))?,
         ))
+    }
+
+    /// The full function type selected by the static call instance. Native
+    /// consumers must use this evidence rather than inspect payloads for types.
+    pub fn solved_signature(&self) -> Result<Option<crate::mir::TypeId>, NativeError> {
+        if self.background.is_none_or(|heap| heap.solved_types.is_none()) {
+            return Ok(None);
+        }
+        let index = self.upvalue_count.checked_sub(1)
+            .ok_or_else(|| NativeError::new("solved native closure has no signature"))?;
+        self.value(self.upvalue(index)?)?.represented_type_id()
+            .map(Some)
+            .ok_or_else(|| NativeError::new("solved native closure has invalid signature metadata"))
+    }
+
+    pub(crate) fn solved_image(&self) -> Option<(&crate::type_image::TypeImage, &crate::execution_graph::ExecutionGraph)> {
+        let heap = self.background?;
+        Some((heap.solved_types.as_ref()?, heap.solved_graph.as_ref()?))
     }
 
     pub fn value(&self, register: RegisterId) -> Result<ValueRef<'_>, NativeError> {
@@ -276,231 +383,9 @@ impl<'vm, 'stack> CallContext<'vm, 'stack> {
         self.set(destination, DecodedValue::Opaque(handle).into())
     }
 
-    pub(crate) fn mark_at_call_site(&mut self, register: RegisterId) -> Result<(), NativeError> {
-        let value = self.owned(register)?.with_loc(self.call_site);
-        self.set(register, value)
-    }
-
-    pub(crate) fn instantiate_type_family(
-        &mut self,
-        destination: RegisterId,
-        template: RegisterId,
-        arguments: &[RegisterId],
-        argument_descriptors: &[crate::types::TypeDescriptor],
-    ) -> Result<(), NativeError> {
-        let template = self.owned(template)?;
-        let arguments = arguments
-            .iter()
-            .map(|argument| self.owned(*argument))
-            .collect::<Result<Vec<_>, _>>()?;
-        let (value, allocations) = crate::heap::instantiate_type_family(
-            self.current,
-            self.background,
-            template,
-            &arguments,
-            argument_descriptors,
-        )
-        .map_err(|error| NativeError::new(error.to_string()))?;
-        self.charge_sequence(allocations)?;
-        self.set(destination, value)
-    }
-
-    pub(crate) fn set_value_type(
-        &mut self,
-        destination: RegisterId,
-        source: RegisterId,
-    ) -> Result<(), NativeError> {
-        let value = self.owned(source)?;
-        let value_ref = self.background.map_or_else(
-            || crate::ValueRef::local(value, self.current),
-            |background| crate::ValueRef::work(value, self.current, background),
-        );
-        let descriptor = crate::types::infer_value_ref(value_ref);
-        let value = self
-            .current
-            .type_descriptor_value(self.background, &descriptor)
-            .map_err(|error| NativeError::new(error.to_string()))?;
-        self.set(destination, value)
-    }
-
-    pub(crate) fn make_declared_type_application(
-        &mut self,
-        destination: RegisterId,
-        id: crate::value::DeclaredTypeId,
-        name: impl Into<Arc<str>>,
-        body: RegisterId,
-        arguments: &[RegisterId],
-    ) -> Result<(), NativeError> {
-        let body = self.owned(body)?;
-        let arguments = arguments
-            .iter()
-            .map(|argument| self.owned(*argument))
-            .collect::<Result<Box<[_]>, _>>()?;
-        self.charge_sequence(arguments.len().saturating_add(1))?;
-        let name = name.into();
-        let value = if id
-            .arguments()
-            .iter()
-            .any(crate::types::type_identity_is_symbolic)
-        {
-            let handle = self.current.allocate(Object::SymbolicType {
-                id,
-                name,
-                body,
-                sealed: true,
-                application_arguments: Some(arguments),
-            });
-            DecodedValue::SymbolicType(handle)
-        } else {
-            let type_id = self
-                .current
-                .canonical_declared_type_id(&id)
-                .map_err(|error| NativeError::new(error.to_string()))?;
-            let handle = self.current.allocate_declared_type(Object::DeclaredType {
-                type_id,
-                id,
-                name,
-                body,
-                sealed: true,
-                application_arguments: Some(arguments),
-            });
-            DecodedValue::DeclaredType(handle)
-        };
-        self.set(destination, Val::unknown(value))
-    }
-
-    pub(crate) fn make_declared_value(
-        &mut self,
-        destination: RegisterId,
-        owner: RegisterId,
-        payload: RegisterId,
-    ) -> Result<(), NativeError> {
-        let owner = self.owned(owner)?;
-        if matches!(owner.value(), DecodedValue::SymbolicType(_)) {
-            return Err(NativeError::new(
-                "symbolic type metadata cannot own a runtime value",
-            ));
-        }
-        if !matches!(owner.value(), DecodedValue::DeclaredType(_)) {
-            return Err(NativeError::new(
-                "declared value owner is not a declared Type",
-            ));
-        }
-        let payload = self.owned(payload)?;
-        let type_id = HeapView {
-            current: self.current,
-            background: self.background,
-        }
-        .declared_type_id(owner)
-        .map_err(|error| NativeError::new(error.to_string()))?;
-        self.set(destination, payload.with_type_id(type_id))
-    }
-
     pub fn copy(&mut self, destination: RegisterId, source: RegisterId) -> Result<(), NativeError> {
         let value = self.owned(source)?;
         self.set(destination, value)
-    }
-
-    pub(crate) fn set_type_property_option(
-        &mut self,
-        destination: RegisterId,
-        target: RegisterId,
-        property: RegisterId,
-    ) -> Result<(), NativeError> {
-        let (target, property) = self.property_type_ids(target, property)?;
-        self.set_property_option(
-            destination,
-            PropertyKey::Ty {
-                ty: target,
-                property_ty: property,
-            },
-        )
-    }
-
-    pub(crate) fn set_field_property_option(
-        &mut self,
-        destination: RegisterId,
-        target: RegisterId,
-        index: RegisterId,
-        property: RegisterId,
-    ) -> Result<(), NativeError> {
-        let (target, property) = self.property_type_ids(target, property)?;
-        let member_index = self.member_index(index)?;
-        self.set_property_option(
-            destination,
-            PropertyKey::Field {
-                ty: target,
-                member_index,
-                property_ty: property,
-            },
-        )
-    }
-
-    pub(crate) fn set_variant_property_option(
-        &mut self,
-        destination: RegisterId,
-        target: RegisterId,
-        index: RegisterId,
-        property: RegisterId,
-    ) -> Result<(), NativeError> {
-        let (target, property) = self.property_type_ids(target, property)?;
-        let member_index = self.member_index(index)?;
-        self.set_property_option(
-            destination,
-            PropertyKey::Variant {
-                ty: target,
-                member_index,
-                property_ty: property,
-            },
-        )
-    }
-
-    fn property_type_ids(
-        &self,
-        target: RegisterId,
-        property: RegisterId,
-    ) -> Result<(crate::TypeId, crate::TypeId), NativeError> {
-        let target = self.owned(target)?;
-        let property = self.owned(property)?;
-        let view = HeapView {
-            current: self.current,
-            background: self.background,
-        };
-        let target = view
-            .declared_type_id(target)
-            .map_err(|error| NativeError::new(error.to_string()))?;
-        let property = view
-            .declared_type_id(property)
-            .map_err(|error| NativeError::new(error.to_string()))?;
-        Ok((target, property))
-    }
-
-    fn member_index(&self, index: RegisterId) -> Result<u32, NativeError> {
-        let value = self.owned(index)?;
-        let DecodedValue::Int(index) = value.value() else {
-            return Err(NativeError::new("property member index must be an Int"));
-        };
-        u32::try_from(index)
-            .map_err(|_| NativeError::new("property member index must fit an unsigned 32-bit Int"))
-    }
-
-    fn set_property_option(
-        &mut self,
-        destination: RegisterId,
-        key: PropertyKey,
-    ) -> Result<(), NativeError> {
-        let view = HeapView {
-            current: self.current,
-            background: self.background,
-        };
-        let Some(value) = view.property(key) else {
-            return self.set_none(destination);
-        };
-        let tag = self.scratch()?;
-        self.set_atom(tag, "Some")?;
-        let payload = self.scratch()?;
-        self.set(payload, value)?;
-        self.make_tagged(destination, tag, payload)
     }
 
     pub fn copy_field(
@@ -561,31 +446,6 @@ impl<'vm, 'stack> CallContext<'vm, 'stack> {
         .tagged(handle)
         .map_err(|error| NativeError::new(error.to_string()))?;
         self.set(destination, payload)
-    }
-
-    pub fn set_semantic_value(
-        &mut self,
-        destination: RegisterId,
-        source: &DataWorld,
-        owner: RegisterId,
-        allocation_hint: usize,
-    ) -> Result<(), NativeError> {
-        let background = self
-            .background
-            .ok_or_else(|| NativeError::new("semantic Value requires a Main world"))?;
-        let owner = self.owned(owner)?;
-        self.charge_allocation(allocation_hint)?;
-        let raw = source
-            .relocate_into(self.current, background)
-            .map_err(|error| NativeError::new(error.to_string()))?;
-        let wrapper_bytes = semantic_value_wrapper_bytes(self.current, Some(background), raw)
-            .map_err(|error| NativeError::new(error.to_string()))?;
-        self.account
-            .charge_allocation(wrapper_bytes)
-            .map_err(|()| NativeError::allocation_limit("native allocation quota exceeded"))?;
-        let value = wrap_semantic_value(self.current, Some(background), raw, owner)
-            .map_err(|error| NativeError::new(error.to_string()))?;
-        self.set(destination, value)
     }
 
     pub fn make_array(

@@ -1,3 +1,0 @@
-@property('Type)
-type Prop(T) = struct {value: T};
-export {Prop};

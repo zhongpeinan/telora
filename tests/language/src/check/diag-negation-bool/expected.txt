@@ -1,1 +1,1 @@
-Bool
+! requires Int or Bool, found Dyn

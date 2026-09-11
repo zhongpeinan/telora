@@ -113,3 +113,5 @@ include!("cli/part-01.rs");
 include!("cli/part-02.rs");
 include!("cli/part-03.rs");
 include!("cli/part-04.rs");
+include!("cli/test_command.rs");
+include!("cli/static_mir.rs");

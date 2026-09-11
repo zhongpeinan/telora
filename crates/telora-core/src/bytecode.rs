@@ -15,6 +15,7 @@ pub struct ProtoLinkId(pub usize);
 
 #[derive(Clone, Debug)]
 pub enum Constant {
+    SolvedType(crate::mir::TypeId),
     Placeholder,
     Int(i64),
     Float(f64),
@@ -22,10 +23,31 @@ pub enum Constant {
     Bytes(Arc<[u8]>),
     Atom(Atom),
     Native(NativeFunction),
+    SolvedNative {
+        function: NativeFunction,
+        signature: crate::mir::TypeId,
+        native_type: Option<crate::NativeType>,
+    },
 }
 
 #[derive(Clone, Debug)]
 pub enum Instruction {
+    StampType { dst: Register, src: Register, ty: crate::mir::TypeId },
+    CheckedCast { dst: Register, src: Register, source: crate::mir::TypeId, target: crate::mir::TypeId },
+    MakeNewtype { dst: Register, ty: crate::mir::TypeId, payload: Register },
+    HasTypeProp { dst: Register, owner: Register, property: Register },
+    HasMemberProp { dst: Register, owner: Register, index: Register, property: Register, variant: bool },
+    GetMemberProp { dst: Register, owner: Register, index: Register, property: Register, variant: bool },
+    GetTypeProp { dst: Register, owner: Register, property: Register },
+    MakeSome { dst: Register, value: Register },
+    Demand { dst: Register, node: crate::execution_graph::NodeId },
+    InstallTask { node: crate::execution_graph::NodeId, src: Register },
+    MakeVariant {
+        dst: Register,
+        ty: crate::mir::TypeId,
+        variant: u32,
+        payload: Option<Register>,
+    },
     LoadConst {
         dst: Register,
         constant: usize,
@@ -34,32 +56,12 @@ pub enum Instruction {
         dst: Register,
         src: Register,
     },
-    OwnDeclared {
-        dst: Register,
-        owner: Register,
-        value: Register,
-    },
     AllocFunc {
         dst: Register,
-        static_id: Option<crate::FuncId>,
     },
     SealFunc {
         target: Register,
         source: Register,
-    },
-    AllocTypeSlot {
-        dst: Register,
-    },
-    ReadTypeSlot {
-        dst: Register,
-        link: Register,
-    },
-    SealTypeSlot {
-        link: Register,
-        src: Register,
-    },
-    AssertTypeSlotReady {
-        link: Register,
     },
     Add {
         dst: Register,
@@ -107,6 +109,11 @@ pub enum Instruction {
         left: Register,
         right: Register,
     },
+    StructUpdate {
+        dst: Register,
+        left: Register,
+        right: Register,
+    },
     BitOr {
         dst: Register,
         left: Register,
@@ -144,6 +151,10 @@ pub enum Instruction {
     ConcatArrays {
         dst: Register,
         arrays: Vec<Register>,
+    },
+    ConcatTuples {
+        dst: Register,
+        tuples: Vec<Register>,
     },
     MakeTuple {
         dst: Register,
@@ -204,6 +215,16 @@ pub enum Instruction {
         dst: Register,
         value: Register,
     },
+    MakeFunctionFamily {
+        dst: Register,
+        identity: Option<Register>,
+        variants: Vec<(Vec<crate::mir::TypeId>, Register)>,
+    },
+    SpecializeFunction {
+        dst: Register,
+        family: Register,
+        arguments: Vec<crate::mir::TypeId>,
+    },
     MakeClosure {
         dst: Register,
         function: Arc<BytecodeFunction>,
@@ -234,7 +255,10 @@ pub enum Instruction {
         message: Register,
     },
     Raise {
-        error: Register,
+        action: crate::ast::BlameAction,
+        dst: Register,
+        message: Register,
+        subjects: Vec<Register>,
     },
     Debug {
         value: Register,
@@ -247,6 +271,22 @@ pub enum Instruction {
 
 #[derive(Clone, Debug)]
 pub enum Opcode {
+    StampType { dst: Register, src: Register, ty: crate::mir::TypeId },
+    CheckedCast { dst: Register, src: Register, source: crate::mir::TypeId, target: crate::mir::TypeId },
+    MakeNewtype { dst: Register, ty: crate::mir::TypeId, payload: Register },
+    HasTypeProp { dst: Register, owner: Register, property: Register },
+    HasMemberProp { dst: Register, owner: Register, index: Register, property: Register, variant: bool },
+    GetMemberProp { dst: Register, owner: Register, index: Register, property: Register, variant: bool },
+    GetTypeProp { dst: Register, owner: Register, property: Register },
+    MakeSome { dst: Register, value: Register },
+    Demand { dst: Register, node: crate::execution_graph::NodeId },
+    InstallTask { node: crate::execution_graph::NodeId, src: Register },
+    MakeVariant {
+        dst: Register,
+        ty: crate::mir::TypeId,
+        variant: u32,
+        payload: Option<Register>,
+    },
     LoadConst {
         dst: Register,
         value: ValueLinkId,
@@ -255,32 +295,12 @@ pub enum Opcode {
         dst: Register,
         src: Register,
     },
-    OwnDeclared {
-        dst: Register,
-        owner: Register,
-        value: Register,
-    },
     AllocFunc {
         dst: Register,
-        static_id: Option<crate::FuncId>,
     },
     SealFunc {
         target: Register,
         source: Register,
-    },
-    AllocTypeSlot {
-        dst: Register,
-    },
-    ReadTypeSlot {
-        dst: Register,
-        link: Register,
-    },
-    SealTypeSlot {
-        link: Register,
-        src: Register,
-    },
-    AssertTypeSlotReady {
-        link: Register,
     },
     Add {
         dst: Register,
@@ -328,6 +348,11 @@ pub enum Opcode {
         left: Register,
         right: Register,
     },
+    StructUpdate {
+        dst: Register,
+        left: Register,
+        right: Register,
+    },
     BitOr {
         dst: Register,
         left: Register,
@@ -365,6 +390,10 @@ pub enum Opcode {
     ConcatArrays {
         dst: Register,
         arrays: Vec<Register>,
+    },
+    ConcatTuples {
+        dst: Register,
+        tuples: Vec<Register>,
     },
     MakeTuple {
         dst: Register,
@@ -425,6 +454,16 @@ pub enum Opcode {
         dst: Register,
         value: Register,
     },
+    MakeFunctionFamily {
+        dst: Register,
+        identity: Option<Register>,
+        variants: Vec<(Vec<crate::mir::TypeId>, Register)>,
+    },
+    SpecializeFunction {
+        dst: Register,
+        family: Register,
+        arguments: Vec<crate::mir::TypeId>,
+    },
     MakeClosure {
         dst: Register,
         prototype: ProtoLinkId,
@@ -455,7 +494,10 @@ pub enum Opcode {
         message: Register,
     },
     Raise {
-        error: Register,
+        action: crate::ast::BlameAction,
+        dst: Register,
+        message: Register,
+        subjects: Vec<Register>,
     },
     Debug {
         value: Register,
@@ -708,13 +750,19 @@ fn link_instruction(instruction: Instruction, links: &mut LinkingTable) -> Opcod
             value: ValueLinkId(constant),
         },
         Instruction::Move { dst, src } => Opcode::Move { dst, src },
-        Instruction::OwnDeclared { dst, owner, value } => Opcode::OwnDeclared { dst, owner, value },
-        Instruction::AllocFunc { dst, static_id } => Opcode::AllocFunc { dst, static_id },
+        Instruction::HasTypeProp { dst, owner, property } => Opcode::HasTypeProp { dst, owner, property },
+        Instruction::HasMemberProp { dst, owner, index, property, variant } => Opcode::HasMemberProp { dst, owner, index, property, variant },
+        Instruction::GetMemberProp { dst, owner, index, property, variant } => Opcode::GetMemberProp { dst, owner, index, property, variant },
+        Instruction::GetTypeProp { dst, owner, property } => Opcode::GetTypeProp { dst, owner, property },
+        Instruction::MakeSome { dst, value } => Opcode::MakeSome { dst, value },
+        Instruction::MakeNewtype { dst, ty, payload } => Opcode::MakeNewtype { dst, ty, payload },
+        Instruction::StampType { dst, src, ty } => Opcode::StampType { dst, src, ty },
+        Instruction::CheckedCast { dst, src, source, target } => Opcode::CheckedCast { dst, src, source, target },
+        Instruction::Demand { dst, node } => Opcode::Demand { dst, node },
+        Instruction::InstallTask { node, src } => Opcode::InstallTask { node, src },
+        Instruction::MakeVariant { dst, ty, variant, payload } => Opcode::MakeVariant { dst, ty, variant, payload },
+        Instruction::AllocFunc { dst } => Opcode::AllocFunc { dst },
         Instruction::SealFunc { target, source } => Opcode::SealFunc { target, source },
-        Instruction::AllocTypeSlot { dst } => Opcode::AllocTypeSlot { dst },
-        Instruction::ReadTypeSlot { dst, link } => Opcode::ReadTypeSlot { dst, link },
-        Instruction::SealTypeSlot { link, src } => Opcode::SealTypeSlot { link, src },
-        Instruction::AssertTypeSlotReady { link } => Opcode::AssertTypeSlotReady { link },
         Instruction::Add { dst, left, right } => Opcode::Add { dst, left, right },
         Instruction::Subtract { dst, left, right } => Opcode::Subtract { dst, left, right },
         Instruction::Multiply { dst, left, right } => Opcode::Multiply { dst, left, right },
@@ -725,6 +773,7 @@ fn link_instruction(instruction: Instruction, links: &mut LinkingTable) -> Opcod
         Instruction::LogicalNot { dst, src } => Opcode::LogicalNot { dst, src },
         Instruction::BitNot { dst, src } => Opcode::BitNot { dst, src },
         Instruction::BitAnd { dst, left, right } => Opcode::BitAnd { dst, left, right },
+        Instruction::StructUpdate { dst, left, right } => Opcode::StructUpdate { dst, left, right },
         Instruction::BitOr { dst, left, right } => Opcode::BitOr { dst, left, right },
         Instruction::BitXor { dst, left, right } => Opcode::BitXor { dst, left, right },
         Instruction::Equal { dst, left, right } => Opcode::Equal { dst, left, right },
@@ -735,6 +784,7 @@ fn link_instruction(instruction: Instruction, links: &mut LinkingTable) -> Opcod
         }
         Instruction::MakeArray { dst, items } => Opcode::MakeArray { dst, items },
         Instruction::ConcatArrays { dst, arrays } => Opcode::ConcatArrays { dst, arrays },
+        Instruction::ConcatTuples { dst, tuples } => Opcode::ConcatTuples { dst, tuples },
         Instruction::MakeTuple { dst, items } => Opcode::MakeTuple { dst, items },
         Instruction::InterpolateString { dst, parts } => Opcode::InterpolateString { dst, parts },
         Instruction::MakeDict { dst, fields } => Opcode::MakeDict {
@@ -768,6 +818,8 @@ fn link_instruction(instruction: Instruction, links: &mut LinkingTable) -> Opcod
             Opcode::TaggedTagEquals { dst, value, tag }
         }
         Instruction::GetTaggedPayload { dst, value } => Opcode::GetTaggedPayload { dst, value },
+        Instruction::MakeFunctionFamily { dst, identity, variants } => Opcode::MakeFunctionFamily { dst, identity, variants },
+        Instruction::SpecializeFunction { dst, family, arguments } => Opcode::SpecializeFunction { dst, family, arguments },
         Instruction::MakeClosure {
             dst,
             function,
@@ -800,7 +852,7 @@ fn link_instruction(instruction: Instruction, links: &mut LinkingTable) -> Opcod
         Instruction::Return { src } => Opcode::Return { src },
         Instruction::Fail { message } => Opcode::Fail { message },
         Instruction::Panic { message } => Opcode::Panic { message },
-        Instruction::Raise { error } => Opcode::Raise { error },
+        Instruction::Raise { action, dst, message, subjects } => Opcode::Raise { action, dst, message, subjects },
         Instruction::Debug {
             value,
             module,

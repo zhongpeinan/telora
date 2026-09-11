@@ -68,95 +68,6 @@ pub struct NativeType {
     qualified_name: Arc<str>,
 }
 
-#[derive(Clone, Debug)]
-pub struct DeclaredTypeId {
-    module: crate::ModuleId,
-    declaration: u32,
-    arguments: Arc<[crate::types::TypeDescriptor]>,
-    argument_ids: Arc<[crate::types::TypeExprId]>,
-}
-
-impl DeclaredTypeId {
-    pub(crate) fn concrete(module: crate::ModuleId, declaration: u32) -> Self {
-        Self {
-            module,
-            declaration,
-            arguments: Arc::new([]),
-            argument_ids: Arc::new([]),
-        }
-    }
-
-    pub(crate) fn applied(
-        module: crate::ModuleId,
-        declaration: u32,
-        arguments: &[crate::types::TypeDescriptor],
-    ) -> Self {
-        Self {
-            module,
-            declaration,
-            arguments: arguments.into(),
-            argument_ids: arguments
-                .iter()
-                .map(crate::types::TypeExprId::from_descriptor)
-                .collect::<Vec<_>>()
-                .into(),
-        }
-    }
-
-    pub(crate) fn reapply(&self, arguments: &[crate::types::TypeDescriptor]) -> Self {
-        Self::applied(self.module, self.declaration, arguments)
-    }
-
-    pub(crate) fn arguments(&self) -> &[crate::types::TypeDescriptor] {
-        &self.arguments
-    }
-
-    pub(crate) fn constructor(&self) -> crate::TypeConstructorId {
-        crate::TypeConstructorId {
-            module: self.module,
-            local: self.declaration,
-        }
-    }
-
-    pub(crate) fn has_same_head(&self, other: &Self) -> bool {
-        self.module == other.module && self.declaration == other.declaration
-    }
-}
-
-impl PartialEq for DeclaredTypeId {
-    fn eq(&self, other: &Self) -> bool {
-        self.module == other.module
-            && self.declaration == other.declaration
-            && self.argument_ids == other.argument_ids
-    }
-}
-
-impl Eq for DeclaredTypeId {}
-
-impl std::hash::Hash for DeclaredTypeId {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.module.hash(state);
-        self.declaration.hash(state);
-        self.argument_ids.hash(state);
-    }
-}
-
-impl PartialOrd for DeclaredTypeId {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for DeclaredTypeId {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        (&self.module, self.declaration, &self.argument_ids).cmp(&(
-            &other.module,
-            other.declaration,
-            &other.argument_ids,
-        ))
-    }
-}
-
 impl NativeType {
     pub(crate) fn bind(id: NativeTypeId, qualified_name: impl Into<Arc<str>>) -> Self {
         Self {
@@ -193,6 +104,8 @@ pub struct OpaqueValue {
     native_type: NativeType,
     payload: Arc<OpaquePayload>,
     equal: fn(&OpaquePayload, &OpaquePayload) -> bool,
+    // Runtime references must live here, never inside the untraced Any payload.
+    pub(crate) traced: Box<[crate::heap::Val]>,
 }
 
 impl OpaqueValue {
@@ -203,6 +116,7 @@ impl OpaqueValue {
         Self {
             native_type,
             payload: Arc::new(payload),
+            traced: Box::new([]),
             equal: |left, right| {
                 left.downcast_ref::<T>()
                     .zip(right.downcast_ref::<T>())
@@ -218,6 +132,7 @@ impl OpaqueValue {
         Self {
             native_type,
             payload: Arc::new(payload),
+            traced: Box::new([]),
             equal: |left, right| std::ptr::eq(left, right),
         }
     }
@@ -334,6 +249,7 @@ pub(crate) enum CoreDictFunction {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CoreStringFunction {
+    Parse,
     Length,
     Join,
     JoinLines,
@@ -357,56 +273,6 @@ pub(crate) enum CorePathFunction {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CoreModelFunction {
-    Struct,
-    Enum,
-    Union,
-}
-
-impl CoreModelFunction {
-    pub(crate) const fn name(self) -> &'static str {
-        match self {
-            Self::Struct => "\0telora_struct",
-            Self::Enum => "\0telora_enum",
-            Self::Union => "union",
-        }
-    }
-
-    pub(crate) const fn arity(self) -> usize {
-        2
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CoreBuiltinTypeFunction {
-    FoldControl,
-    Option,
-    Result,
-}
-
-impl CoreBuiltinTypeFunction {
-    pub(crate) const fn name(self) -> &'static str {
-        match self {
-            Self::FoldControl => "FoldControl",
-            Self::Option => "Option",
-            Self::Result => "Result",
-        }
-    }
-
-    pub(crate) const fn arity(self) -> usize {
-        match self {
-            Self::Option => 1,
-            Self::FoldControl | Self::Result => 2,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CoreDiagnosticFunction {
-    Warn,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CoreRuntimeFunction {
     CallWithDiagnostics,
 }
@@ -417,17 +283,7 @@ impl CoreRuntimeFunction {
     }
 
     pub(crate) const fn arity(self) -> usize {
-        2
-    }
-}
-
-impl CoreDiagnosticFunction {
-    pub(crate) const fn name(self) -> &'static str {
-        "\0telora_warn"
-    }
-
-    pub(crate) const fn arity(self) -> usize {
-        2
+        6
     }
 }
 
@@ -559,22 +415,10 @@ impl CoreCodecFunction {
     }
 
     pub(crate) const fn arity(self) -> usize {
-        3
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CoreResultFunction {
-    Unwrap,
-}
-
-impl CoreResultFunction {
-    pub(crate) const fn name(self) -> &'static str {
-        "std/result.unwrap"
-    }
-
-    pub(crate) const fn arity(self) -> usize {
-        1
+        match self {
+            Self::Decode => 3,
+            Self::Encode => 3,
+        }
     }
 }
 
@@ -583,7 +427,6 @@ pub(crate) enum CoreJsonFunction {
     Parse,
     ParseYaml,
     ParseToml,
-    Decode,
     Stringify,
     StringifyPretty,
     StringifyPrettyValue,
@@ -596,7 +439,6 @@ impl CoreJsonFunction {
             Self::Parse => "std/json.parse",
             Self::ParseYaml => "std/yaml.parse",
             Self::ParseToml => "std/toml.parse",
-            Self::Decode => "std/json.decode_with",
             Self::Stringify => "std/json.stringify",
             Self::StringifyPretty => "std/json.stringify_pretty",
             Self::StringifyPrettyValue => "std/json.stringify_pretty.configured",
@@ -607,8 +449,7 @@ impl CoreJsonFunction {
     pub(crate) const fn arity(self) -> usize {
         match self {
             Self::Parse | Self::ParseYaml | Self::ParseToml => 2,
-            Self::Decode => 3,
-            Self::Schema => 2,
+            Self::Schema => 3,
             _ => 1,
         }
     }
@@ -642,6 +483,7 @@ impl CoreDictFunction {
 impl CoreStringFunction {
     pub(crate) const fn name(self) -> &'static str {
         match self {
+            Self::Parse => "std/string.parse_with",
             Self::Length => "std/string.length",
             Self::Join => "std/string.join",
             Self::JoinLines => "std/string.join_lines",
@@ -667,7 +509,7 @@ impl CoreStringFunction {
             | Self::Contains
             | Self::Indent
             | Self::TrimMargin => 2,
-            Self::Replace => 3,
+            Self::Replace | Self::Parse => 3,
         }
     }
 }
@@ -721,19 +563,15 @@ impl CoreArrayFunction {
 pub(crate) enum NativeKind {
     Synchronous,
     CoreArray(CoreArrayFunction),
-    CoreModel(CoreModelFunction),
-    CoreBuiltinType(CoreBuiltinTypeFunction),
     CoreDict(CoreDictFunction),
     CoreString(CoreStringFunction),
     CorePath(CorePathFunction),
-    CoreDiagnostic(CoreDiagnosticFunction),
     CoreRuntime(CoreRuntimeFunction),
     CoreHash(CoreHashFunction),
     CoreCodec(CoreCodecFunction),
     CoreTypeDesc(CoreTypeDescFunction),
     CoreDyn(CoreDynFunction),
     CoreEq(CoreEqFunction),
-    CoreResult(CoreResultFunction),
     CoreJson(CoreJsonFunction),
 }
 
@@ -782,26 +620,6 @@ impl NativeFunction {
         }
     }
 
-    pub(crate) const fn core_model(function: CoreModelFunction) -> Self {
-        Self {
-            name: function.name(),
-            arity: function.arity(),
-            callback: unavailable_core_callback,
-            kind: NativeKind::CoreModel(function),
-            native_type_local: None,
-        }
-    }
-
-    pub(crate) const fn core_builtin_type(function: CoreBuiltinTypeFunction) -> Self {
-        Self {
-            name: function.name(),
-            arity: function.arity(),
-            callback: unavailable_core_callback,
-            kind: NativeKind::CoreBuiltinType(function),
-            native_type_local: None,
-        }
-    }
-
     pub(crate) const fn core_dict(function: CoreDictFunction) -> Self {
         Self {
             name: function.name(),
@@ -828,16 +646,6 @@ impl NativeFunction {
             arity: function.arity(),
             callback: unavailable_core_callback,
             kind: NativeKind::CorePath(function),
-            native_type_local: None,
-        }
-    }
-
-    pub(crate) const fn core_diagnostic(function: CoreDiagnosticFunction) -> Self {
-        Self {
-            name: function.name(),
-            arity: function.arity(),
-            callback: unavailable_core_callback,
-            kind: NativeKind::CoreDiagnostic(function),
             native_type_local: None,
         }
     }
@@ -898,16 +706,6 @@ impl NativeFunction {
             arity: function.arity(),
             callback: unavailable_core_callback,
             kind: NativeKind::CoreEq(function),
-            native_type_local: None,
-        }
-    }
-
-    pub(crate) const fn core_result(function: CoreResultFunction) -> Self {
-        Self {
-            name: function.name(),
-            arity: function.arity(),
-            callback: unavailable_core_callback,
-            kind: NativeKind::CoreResult(function),
             native_type_local: None,
         }
     }

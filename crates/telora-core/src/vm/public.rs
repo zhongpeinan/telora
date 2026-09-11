@@ -45,10 +45,12 @@ impl Quota {
 #[derive(Debug)]
 pub struct QuotaAccount {
     quota: Quota,
+    data_limits: crate::DataLimits,
     remaining_fuel: usize,
     requested_allocation_bytes: u64,
     query: Option<crate::query::QueryContext>,
     diagnostics: Vec<Diagnostic>,
+    source_names: std::collections::BTreeMap<crate::SourceId, Arc<str>>,
 }
 
 impl QuotaAccount {
@@ -56,15 +58,33 @@ impl QuotaAccount {
         Self {
             remaining_fuel: quota.fuel,
             quota,
+            data_limits: crate::DataLimits::default(),
             requested_allocation_bytes: 0,
             query: None,
             diagnostics: Vec::new(),
+            source_names: std::collections::BTreeMap::new(),
         }
     }
 
     pub fn with_query(mut self, query: crate::query::QueryContext) -> Self {
         self.query = Some(query);
         self
+    }
+
+    pub fn with_data_limits(mut self, limits: crate::DataLimits) -> Self {
+        self.data_limits = limits;
+        self
+    }
+
+    pub fn with_sources(mut self, sources: &SourceDatabase) -> Self {
+        self.register_sources(sources);
+        self
+    }
+
+    pub(crate) fn register_sources(&mut self, sources: &SourceDatabase) {
+        self.source_names.extend(
+            sources.files().map(|file| (file.id(), Arc::clone(&file.name))),
+        );
     }
 
     pub const fn quota(&self) -> Quota {
@@ -95,7 +115,7 @@ impl QuotaAccount {
         self.quota.stack_slots.min(MAX_STACK_SLOTS)
     }
 
-    fn charge_allocation(&mut self, bytes: u64) -> Result<(), ()> {
+    pub(crate) fn charge_allocation(&mut self, bytes: u64) -> Result<(), ()> {
         let requested = self
             .requested_allocation_bytes
             .checked_add(bytes)
@@ -123,7 +143,6 @@ pub enum ValueKind {
     Tuple,
     Func,
     Dyn,
-    Module,
 }
 
 #[derive(Clone, Copy)]
@@ -139,14 +158,18 @@ pub struct ExecutionWorld {
 
 #[derive(Clone)]
 pub struct DataWorld {
-    heap: Arc<Heap>,
+    data: Arc<HostData>,
     root: Val,
+}
+
+struct HostData {
+    heap: Heap,
 }
 
 impl DataWorld {
     pub(crate) fn new(heap: Heap, root: Val) -> Self {
         Self {
-            heap: Arc::new(heap),
+            data: Arc::new(HostData { heap }),
             root,
         }
     }
@@ -172,7 +195,7 @@ impl DataWorld {
         ValueRef {
             value: self.root,
             view: HeapView {
-                current: &self.heap,
+                current: &self.data.heap,
                 background: None,
             },
         }
@@ -182,7 +205,7 @@ impl DataWorld {
         &self,
         main: &mut Heap,
     ) -> Result<PersistentValue, crate::heap::HeapError> {
-        publish_root(main, &self.heap, self.root)
+        publish_root(main, &self.data.heap, self.root)
     }
 
     pub(crate) fn relocate_into(
@@ -190,7 +213,7 @@ impl DataWorld {
         target: &mut Heap,
         main: &Heap,
     ) -> Result<Val, crate::heap::HeapError> {
-        relocate_work_roots(target, main, &self.heap, &[self.root]).map(|roots| roots[0])
+        relocate_work_roots(target, main, &self.data.heap, &[self.root]).map(|roots| roots[0])
     }
 }
 
@@ -210,6 +233,11 @@ impl fmt::Display for DataWorld {
 }
 
 impl ExecutionWorld {
+    /// Static type data imported by the solved execution path, with its original
+    /// TypeIds. Metadata generation must read this arena, not infer from values.
+    pub fn solved_types(&self) -> Option<&crate::type_image::TypeImage> {
+        self.main.solved_types.as_ref()
+    }
     pub(crate) fn new(main: Arc<Heap>, work: WorkWorld) -> Self {
         Self { main, work }
     }
@@ -222,7 +250,6 @@ impl ExecutionWorld {
         let selected = self
             .value()
             .dict_get(field)
-            .or_else(|| self.value().module_get(field))
             .ok_or_else(|| format!("value has no field {field:?}"))?
             .value;
         self.work.root = selected;
@@ -242,29 +269,6 @@ impl ExecutionWorld {
         .map_err(|error| error.to_string())
     }
 
-    pub fn into_semantic_json(mut self) -> Result<String, String> {
-        let owner = HeapView {
-            current: &self.work.heap,
-            background: Some(&self.main),
-        }
-            .type_witness(self.work.root)
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| "eval result must be std/value.Value".to_owned())?;
-        let raw = unwrap_semantic_value(
-            &mut self.work.heap,
-            Some(&self.main),
-            self.work.root,
-            owner,
-        )
-        .map_err(|error| error.to_string())?;
-        let view = HeapView {
-            current: &self.work.heap,
-            background: Some(&self.main),
-        };
-        let mut writer = JsonWriter::new(view, None);
-        writer.value(raw, 0)?;
-        Ok(writer.output)
-    }
 }
 
 impl fmt::Debug for ExecutionWorld {
@@ -286,18 +290,31 @@ impl fmt::Display for ExecutionWorld {
 }
 
 impl<'a> ValueRef<'a> {
-    pub(crate) fn runtime(self) -> Val {
-        self.value
+    /// Identity stamped by bytecode from the sealed type image, not inferred
+    /// from the runtime representation.
+    pub fn solved_type_id(&self) -> Option<crate::mir::TypeId> {
+        let id = self.value.type_id()?.solved_id()?;
+        self.view.background?.solved_types.as_ref()?.types.get(id.index())?;
+        Some(id)
+    }
+    pub(crate) fn test_description(self) -> Option<(&'a crate::test_protocol::TestDescription, Val)> {
+        let DecodedValue::Opaque(handle) = self.value.value() else {
+            return None;
+        };
+        let Object::Opaque(value) = self.view.object(handle).ok()? else {
+            return None;
+        };
+        if value.native_type().id() != crate::test_protocol::TEST_NATIVE_TYPE {
+            return None;
+        }
+        Some((
+            value.downcast_ref(value.native_type())?,
+            *value.traced.first()?,
+        ))
     }
 
-    pub(crate) fn persistent(value: PersistentValue, heap: &'a Heap) -> Self {
-        Self {
-            value: value.runtime(),
-            view: HeapView {
-                current: heap,
-                background: None,
-            },
-        }
+    pub(crate) fn runtime(self) -> Val {
+        self.value
     }
 
     pub(crate) fn work(value: Val, work: &'a Heap, main: &'a Heap) -> Self {
@@ -310,29 +327,10 @@ impl<'a> ValueRef<'a> {
         }
     }
 
-    pub(crate) fn local(value: Val, heap: &'a Heap) -> Self {
-        Self {
-            value,
-            view: HeapView {
-                current: heap,
-                background: None,
-            },
-        }
-    }
-
-    pub(crate) fn hidden_type_slot_handle(self) -> Option<Handle> {
-        let DecodedValue::TypeSlot(handle) = self.value.value() else {
-            return None;
-        };
-        Some(handle)
-    }
-
     pub(crate) fn object_handle(self) -> Option<Handle> {
         match self.value.value() {
             DecodedValue::Bytes(handle)
             | DecodedValue::Opaque(handle)
-            | DecodedValue::DeclaredType(handle)
-            | DecodedValue::SymbolicType(handle)
             | DecodedValue::Array(handle)
             | DecodedValue::Tagged(handle)
             | DecodedValue::Tuple(handle)
@@ -341,25 +339,6 @@ impl<'a> ValueRef<'a> {
             | DecodedValue::Dyn(handle) => Some(handle),
             _ => None,
         }
-    }
-
-    pub(crate) fn is_hidden_type_slot(self) -> bool {
-        matches!(self.value.value(), DecodedValue::TypeSlot(_))
-    }
-
-    pub(crate) fn resolve_hidden_type_slot(self) -> Result<Self, String> {
-        let DecodedValue::TypeSlot(handle) = self.value.value() else {
-            return Ok(self);
-        };
-        let value = self
-            .view
-            .type_slot(handle)
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| "recursive type link is not initialized".to_owned())?;
-        Ok(Self {
-            value,
-            view: self.view,
-        })
     }
 
     pub fn kind(self) -> ValueKind {
@@ -371,8 +350,7 @@ impl<'a> ValueRef<'a> {
             DecodedValue::Float(_) => ValueKind::Float,
             DecodedValue::InlineString(_) | DecodedValue::ShortString(_) => ValueKind::String,
             DecodedValue::Bytes(_) => ValueKind::Bytes,
-            DecodedValue::NativeType(_) => ValueKind::Type,
-            DecodedValue::DeclaredType(_) | DecodedValue::SymbolicType(_) => ValueKind::Type,
+            DecodedValue::NativeType(_) | DecodedValue::SolvedType(_) => ValueKind::Type,
             DecodedValue::Opaque(_) => ValueKind::Opaque,
             DecodedValue::Dict(_) => ValueKind::Dict,
             DecodedValue::Array(_) => ValueKind::Array,
@@ -382,12 +360,7 @@ impl<'a> ValueRef<'a> {
             DecodedValue::Tagged(_) => ValueKind::Tagged,
             DecodedValue::Tuple(_) => ValueKind::Tuple,
             DecodedValue::Func(_) => ValueKind::Func,
-            DecodedValue::FuncRef(_) => ValueKind::Func,
             DecodedValue::Dyn(_) => ValueKind::Dyn,
-            DecodedValue::Module(_) => ValueKind::Module,
-            DecodedValue::TypeSlot(_) => {
-                unreachable!("up-links are private VM values")
-            }
         }
     }
 
@@ -403,6 +376,14 @@ impl<'a> ValueRef<'a> {
     pub fn as_int(self) -> Option<i64> {
         match self.value.value() {
             DecodedValue::Int(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    /// Type represented by a metadata value, distinct from the value's own type.
+    pub fn represented_type_id(self) -> Option<crate::mir::TypeId> {
+        match self.value.value() {
+            DecodedValue::SolvedType(id) => Some(id),
             _ => None,
         }
     }
@@ -441,66 +422,12 @@ impl<'a> ValueRef<'a> {
         self.view.native_type(id).ok()
     }
 
-    pub(crate) fn declared_type_parts(
-        self,
-    ) -> Option<(&'a crate::value::DeclaredTypeId, &'a str, ValueRef<'a>)> {
-        let handle = match self.value.value() {
-            DecodedValue::DeclaredType(handle) | DecodedValue::SymbolicType(handle) => handle,
-            _ => return None,
-        };
-        let (id, name, body) = match self.view.object(handle).ok()? {
-            Object::DeclaredType { id, name, body, .. } => (id, name, *body),
-            Object::SymbolicType { id, name, body, .. } => (id, name, *body),
-            _ => return None,
-        };
-        Some((
-            id,
-            name,
-            ValueRef {
-                value: body,
-                view: self.view,
-            },
-        ))
-    }
-
-    pub(crate) fn declared_type_body(self) -> Option<ValueRef<'a>> {
-        self.declared_type_parts().map(|(_, _, body)| body)
-    }
-
-    pub(crate) fn declared_type_id(self) -> Option<crate::TypeId> {
-        self.view.declared_type_id(self.value).ok()
-    }
-
-    pub(crate) fn type_property(self, property: crate::TypeId) -> Option<ValueRef<'a>> {
-        let target = self.declared_type_id()?;
-        self.view
-            .type_property(target, property)
-            .map(|value| ValueRef {
-                value,
-                view: self.view,
-            })
-    }
-
     pub(crate) fn unwrap_declared(self) -> Option<ValueRef<'a>> {
         let value = self.view.unwrap_declared(self.value).ok()?;
         Some(ValueRef {
             value,
             view: self.view,
         })
-    }
-
-    pub(crate) fn declared_value_parts(self) -> Option<(ValueRef<'a>, ValueRef<'a>)> {
-        let owner = self.view.type_witness(self.value).ok()??;
-        Some((
-            ValueRef {
-                value: owner,
-                view: self.view,
-            },
-            ValueRef {
-                value: self.value.without_type_id(),
-                view: self.view,
-            },
-        ))
     }
 
     pub fn as_opaque<T: std::any::Any>(self, expected_type: &crate::NativeType) -> Option<&'a T> {
@@ -600,37 +527,6 @@ impl<'a> ValueRef<'a> {
                 })
                 .collect(),
         )
-    }
-
-    pub fn is_declared(self) -> bool {
-        self.view
-            .type_witness(self.value)
-            .is_ok_and(|owner| owner.is_some())
-    }
-
-    pub fn declared_body(self) -> Option<ValueRef<'a>> {
-        self.declared_type_body()
-    }
-
-    pub(crate) fn module_fields(self) -> Option<Vec<&'a str>> {
-        let DecodedValue::Module(handle) = self.value.value() else {
-            return None;
-        };
-        self.view.module_fields(handle).ok()
-    }
-
-    pub(crate) fn module_get(self, field: &str) -> Option<ValueRef<'a>> {
-        let DecodedValue::Module(handle) = self.value.value() else {
-            return None;
-        };
-        self.view
-            .module_get_text(handle, field)
-            .ok()
-            .flatten()
-            .map(|value| ValueRef {
-                value,
-                view: self.view,
-            })
     }
 
     pub fn function_arity(self) -> Option<usize> {

@@ -18,7 +18,7 @@ impl<'a> Lowerer<'a> {
                     .children(argument)
                     .find(|child| self.is_expression(*child))
                     .ok_or_else(|| self.error(argument, "type argument has no expression"))?;
-                let expression = self.expression(expression)?;
+                let expression = self.type_expression(expression)?;
                 let location = expression.location;
                 Ok(located(TypeArgumentKind::Explicit(expression), location))
             })
@@ -72,7 +72,7 @@ impl<'a> Lowerer<'a> {
         matches!(
             self.cst.get(node),
             Node::Token(
-                Token::Int | Token::Float | Token::Bytes | Token::Atom | Token::Identifier,
+                Token::Int | Token::Float | Token::Bytes | Token::Identifier,
                 _
             )
         ) || matches!(
@@ -82,7 +82,6 @@ impl<'a> Lowerer<'a> {
                     | Rule::Primary
                     | Rule::Braced
                     | Rule::ArrayExpr
-                    | Rule::AtomExpr
                     | Rule::BinaryExpr
                     | Rule::Block
                     | Rule::BytesExpr
@@ -118,19 +117,18 @@ impl<'a> Lowerer<'a> {
         matches!(
             self.cst.get(node),
             Node::Token(
-                Token::Identifier | Token::Placeholder | Token::Int | Token::Float | Token::Atom,
+                Token::Identifier | Token::Placeholder | Token::Int | Token::Float,
                 _
             )
         ) || matches!(
             self.rule(node),
             Some(
                 Rule::Pattern
-                    | Rule::AtomPattern
                     | Rule::FloatPattern
                     | Rule::IdentifierPattern
                     | Rule::IntPattern
                     | Rule::StringPattern
-                    | Rule::TaggedPattern
+                    | Rule::ConstructorPattern
                     | Rule::TuplePattern
                     | Rule::StructPattern
             )
@@ -348,4 +346,3 @@ impl<'a> Lowerer<'a> {
         Ok(output)
     }
 }
-

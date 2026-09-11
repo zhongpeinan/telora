@@ -1,4 +1,13 @@
 impl<'a> Lowerer<'a> {
+    fn recovered_expression_prefix(&self, node: NodeRef) -> Option<Expr> {
+        if let Ok(expression) = self.expression(node) { return Some(expression); }
+        if matches!(self.rule(node), Some(Rule::Expression | Rule::Primary | Rule::DotPostfixExpr)) {
+            let receiver = self.children(node).find(|&child| self.is_expression(child))?;
+            return self.recovered_expression_prefix(receiver);
+        }
+        None
+    }
+
     fn expression(&self, node: NodeRef) -> Result<Expr, Diagnostic> {
         if let Node::Token(token, _) = self.cst.get(node) {
             let location = self.location(node);
@@ -13,7 +22,6 @@ impl<'a> Lowerer<'a> {
                         .map_err(|message| self.error(node, message))?,
                 ),
                 Token::Bytes => ExprKind::Bytes(self.decode_telora_string(node)?.into_bytes()),
-                Token::Atom => ExprKind::Atom(self.text(node).trim_start_matches('\'').to_owned()),
                 Token::Identifier => ExprKind::Variable(self.identifier(node)),
                 _ => return Err(self.error(node, "expected expression token")),
             };
@@ -48,11 +56,6 @@ impl<'a> Lowerer<'a> {
                 self.decode_telora_string(self.first_token(node, Token::Bytes)?)?
                     .into_bytes(),
             ),
-            Rule::AtomExpr => ExprKind::Atom(
-                self.text(self.first_token(node, Token::Atom)?)
-                    .trim_start_matches('\'')
-                    .to_owned(),
-            ),
             Rule::VariableExpr => {
                 ExprKind::Variable(self.identifier(self.first_token(node, Token::Identifier)?))
             }
@@ -66,7 +69,10 @@ impl<'a> Lowerer<'a> {
             }
             Rule::ParenExpr => {
                 let items = self.expression_children(node)?;
-                if items.len() == 1 && self.token_children(node, Token::Comma).next().is_none() {
+                if items.len() == 1
+                    && !matches!(items[0].value, ExprKind::Spread(_))
+                    && self.token_children(node, Token::Comma).next().is_none()
+                {
                     return Ok(items.into_iter().next().unwrap());
                 }
                 ExprKind::Tuple(items)
@@ -169,7 +175,7 @@ impl<'a> Lowerer<'a> {
                 ExprKind::Closure {
                     parameters: self.parameters(parameters)?,
                     result_annotation: result_annotation
-                        .map(|annotation| self.expression(annotation).map(Box::new))
+                        .map(|annotation| self.type_expression(annotation).map(Box::new))
                         .transpose()?,
                     body: self.block_body(block)?,
                 }
@@ -277,6 +283,8 @@ impl<'a> Lowerer<'a> {
                     (BinaryOperator::GreaterThanOrEqual, operator)
                 } else if let Some(operator) = self.token_children(node, Token::BangEqual).next() {
                     (BinaryOperator::NotEqual, operator)
+                } else if let Some(operator) = self.token_children(node, Token::StructUpdate).next() {
+                    (BinaryOperator::StructUpdate, operator)
                 } else if let Some(operator) = self.token_children(node, Token::BitAnd).next() {
                     (BinaryOperator::BitAnd, operator)
                 } else if let Some(operator) = self.token_children(node, Token::BitOr).next() {
@@ -310,7 +318,7 @@ impl<'a> Lowerer<'a> {
                     .find(|child| {
                         matches!(
                             self.rule(*child),
-                            Some(Rule::PostfixIntrinsicSuffix | Rule::ProjectionSuffix)
+                            Some(Rule::PostfixIntrinsicSuffix | Rule::ProjectionSuffix | Rule::FieldProjectionSuffix | Rule::MetadataSuffix)
                         )
                     })
                     .ok_or_else(|| self.error(node, "dot postfix expression has no suffix"))?;
@@ -323,7 +331,20 @@ impl<'a> Lowerer<'a> {
                     );
                 }
                 let receiver = Box::new(receiver_expression);
-                if let Some(field) = self.token_children(suffix, Token::Identifier).last() {
+                if self.rule(suffix) == Some(Rule::MetadataSuffix) {
+                    ExprKind::TypeMetadata(Box::new(self.normalize_type_expression(*receiver)?))
+                } else if self.rule(suffix) == Some(Rule::FieldProjectionSuffix) {
+                    let mut fields = Vec::new();
+                    for entry in self.rule_children(suffix)
+                        .filter(|child| self.rule(*child) == Some(Rule::FieldProjectionEntry))
+                    {
+                        let mut names = self.token_children(entry, Token::Identifier);
+                        let source = names.next().ok_or_else(|| self.error(entry, "projection requires a field"))?;
+                        let destination = names.next().unwrap_or(source);
+                        fields.push((self.identifier(source), self.identifier(destination)));
+                    }
+                    ExprKind::FieldProjection { receiver, fields }
+                } else if let Some(field) = self.token_children(suffix, Token::Identifier).last() {
                     ExprKind::Field {
                         receiver,
                         field: self.identifier(field),
@@ -361,26 +382,9 @@ impl<'a> Lowerer<'a> {
                     .iter()
                     .find(|child| self.rule(**child) == Some(Rule::Arguments))
                     .map_or(Ok(Vec::new()), |args| self.expression_children(*args))?;
-                if let ExprKind::TypeApply {
-                    callee: applied,
-                    arguments: type_arguments,
-                } = &callee.value
-                    && let ExprKind::Field { receiver, field } = &applied.value
-                    && field.value == "project"
-                    && let [type_argument] = type_arguments.as_slice()
-                    && let TypeArgumentKind::Explicit(target) = &type_argument.value
-                    && let [value] = arguments.as_slice()
-                {
-                    ExprKind::DynProject {
-                        namespace: receiver.clone(),
-                        target: Box::new(target.clone()),
-                        value: Box::new(value.clone()),
-                    }
-                } else {
-                    ExprKind::Call {
-                        callee: Box::new(callee),
-                        arguments,
-                    }
+                ExprKind::Call {
+                    callee: Box::new(callee),
+                    arguments,
                 }
             }
             Rule::TypeApplyExpr => {
@@ -595,11 +599,12 @@ impl<'a> Lowerer<'a> {
                 | "dbg"
                 | "ty"
                 | "cast"
-                | "should_ok"
-                | "must_ok"
-                | "try_unwrap"
+                | "ok_or_warn"
                 | "unwrap"
                 | "fail"
+                | "blame"
+                | "raise"
+                | "warn"
         ) {
             return if matches!(name, "file" | "line") {
                 Err(self.error(
@@ -635,7 +640,7 @@ impl<'a> Lowerer<'a> {
             }
             let mut arguments = arguments.into_iter();
             let value = arguments.next().expect("two arguments");
-            let target = arguments.next().expect("two arguments");
+            let target = self.normalize_type_expression(arguments.next().expect("two arguments"))?;
             Ok(located(
                 ExprKind::TypeAscription {
                     value: Box::new(value),
@@ -655,7 +660,7 @@ impl<'a> Lowerer<'a> {
             }
             let mut arguments = arguments.into_iter();
             let value = arguments.next().expect("two arguments");
-            let target = arguments.next().expect("two arguments");
+            let target = self.normalize_type_expression(arguments.next().expect("two arguments"))?;
             Ok(located(
                 ExprKind::CheckedCast {
                     value: Box::new(value),
@@ -663,12 +668,10 @@ impl<'a> Lowerer<'a> {
                 },
                 self.location(invocation),
             ))
-        } else if matches!(name, "should_ok" | "must_ok") {
-            self.lower_check(name, arguments, invocation)
-        } else if matches!(name, "try_unwrap" | "unwrap") {
-            self.lower_unwrap(name, arguments, invocation)
-        } else if name == "fail" {
-            self.lower_fail(arguments, invocation)
+        } else if matches!(name, "ok_or_warn" | "unwrap") {
+            self.lower_unwrap(name, arguments, invocation, self.location(name_node))
+        } else if matches!(name, "fail" | "blame" | "raise" | "warn") {
+            self.lower_blame(name, arguments, invocation)
         } else {
             if arguments.len() != 1 {
                 return Err(self.error(
@@ -740,198 +743,22 @@ impl<'a> Lowerer<'a> {
         let location = self.location(node);
         let mut arguments = arguments.into_iter();
         let message = arguments.next().expect("blame message was checked");
-        // Keep the explicit subject boundary in the internal envelope. The VM
-        // uses this tuple to retain one ordered provenance location per subject.
-        let data = located(ExprKind::Tuple(arguments.collect()), location);
-        let rule = located(ExprKind::String(format!("{name}!")), location);
-        let fields = [("data", data), ("message", message), ("rule", rule)]
-            .into_iter()
-            .map(|(name, value)| {
-                located(
-                    DictFieldKind {
-                        decorators: Vec::new(),
-                        name: Some(located(name.into(), location)),
-                        value,
-                    },
-                    location,
-                )
-            })
-            .collect();
-        Ok(located(ExprKind::Dict(fields), location))
-    }
-
-    fn lower_fail(&self, arguments: Vec<Expr>, node: NodeRef) -> Result<Expr, Diagnostic> {
-        if arguments.is_empty() {
-            return Err(self.error(
-                node,
-                "fail! expects a message followed by zero or more subjects",
-            ));
+        let action = match name {
+            "blame" => crate::ast::BlameAction::Build,
+            "raise" => crate::ast::BlameAction::Raise,
+            "warn" => crate::ast::BlameAction::Warn,
+            _ => crate::ast::BlameAction::Fail,
+        };
+        if matches!(action, crate::ast::BlameAction::Raise | crate::ast::BlameAction::Warn)
+            && arguments.len() != 0
+        {
+            return Err(self.error(node, format!("{name}! expects exactly one String or BlameError")));
         }
-        let location = self.location(node);
-        let blame = self.lower_blame("fail", arguments, node)?;
-        Ok(located(
-            ExprKind::Raise {
-                error: Box::new(blame),
-            },
-            location,
-        ))
-    }
-
-    fn lower_check(
-        &self,
-        name: &str,
-        arguments: Vec<Expr>,
-        node: NodeRef,
-    ) -> Result<Expr, Diagnostic> {
-        if arguments.is_empty() {
-            return Err(self.error(
-                node,
-                format!("{name}! expects a checker followed by zero or more arguments"),
-            ));
-        }
-        let location = self.location(node);
-        let prefix = format!("${name}:{}", location.range().start);
-        let identifier = |suffix: &str| located(format!("{prefix}:{suffix}"), location);
-        let variable = |suffix: &str| located(ExprKind::Variable(identifier(suffix)), location);
-        let binding = |suffix: &str, value| {
-            located(
-                BindingData {
-                    decorators: Vec::new(),
-                    kind: BindingKind::Let,
-                    declared_initializer: None,
-                    imported_name: None,
-                    name: identifier(suffix),
-                    type_parameters: Vec::new(),
-                    type_parameter_bounds: Vec::new(),
-                    annotation: None,
-                    value,
-                },
-                location,
-            )
-        };
-        let mut arguments = arguments.into_iter();
-        let checker = arguments.next().expect("check checker was checked");
-        let values = arguments.collect::<Vec<_>>();
-        let mut bindings = vec![binding("checker", checker)];
-        bindings.extend(
-            values
-                .into_iter()
-                .enumerate()
-                .map(|(index, value)| binding(&format!("argument:{index}"), value)),
-        );
-        let call_arguments = (0..bindings.len() - 1)
-            .map(|index| variable(&format!("argument:{index}")))
-            .collect::<Vec<_>>();
-        let evidence = located(ExprKind::Tuple(call_arguments.clone()), location);
-        let call = located(
-            ExprKind::Call {
-                callee: Box::new(variable("checker")),
-                arguments: call_arguments,
-            },
-            location,
-        );
-        let payload = identifier("payload");
-        let message = identifier("message");
-        let tagged_pattern = |tag: &str, payload: Identifier| {
-            located(
-                PatternKind::Tagged {
-                    tag: tag.into(),
-                    payload: Box::new(located(PatternKind::Binding(payload), location)),
-                },
-                location,
-            )
-        };
-        let tagged_value = |tag: &str, value: Expr| {
-            located(
-                ExprKind::Call {
-                    callee: Box::new(located(ExprKind::Atom(tag.into()), location)),
-                    arguments: vec![value],
-                },
-                location,
-            )
-        };
-        let diagnostic = located(
-            ExprKind::Call {
-                callee: Box::new(located(
-                    ExprKind::Variable(located("\0telora_warn".into(), location)),
-                    location,
-                )),
-                arguments: vec![
-                    located(ExprKind::Variable(message.clone()), location),
-                    evidence,
-                ],
-            },
-            location,
-        );
-        let rejected = if name == "should_ok" {
-            located(
-                ExprKind::Block(located(
-                    BlockKind {
-                        bindings: vec![binding("warning", diagnostic)],
-                        result: Box::new(located(ExprKind::Atom("None".into()), location)),
-                    },
-                    location,
-                )),
-                location,
-            )
-        } else {
-            let message_value = located(ExprKind::Variable(message.clone()), location);
-            let envelope = self.lower_blame(
-                "must_ok",
-                std::iter::once(message_value)
-                    .chain(
-                        (0..bindings.len() - 1).map(|index| variable(&format!("argument:{index}"))),
-                    )
-                    .collect(),
-                node,
-            )?;
-            located(
-                ExprKind::Raise {
-                    error: Box::new(envelope),
-                },
-                location,
-            )
-        };
-        let result = located(
-            ExprKind::Match {
-                value: Box::new(call),
-                arms: vec![
-                    located(
-                        MatchArmKind {
-                            pattern: tagged_pattern("Ok", payload.clone()),
-                            guard: None,
-                            value: if name == "should_ok" {
-                                tagged_value("Some", located(ExprKind::Variable(payload), location))
-                            } else {
-                                located(ExprKind::Variable(payload), location)
-                            },
-                            irrefutable_required: false,
-                        },
-                        location,
-                    ),
-                    located(
-                        MatchArmKind {
-                            pattern: tagged_pattern("Err", message),
-                            guard: None,
-                            value: rejected,
-                            irrefutable_required: false,
-                        },
-                        location,
-                    ),
-                ],
-            },
-            location,
-        );
-        Ok(located(
-            ExprKind::Block(located(
-                BlockKind {
-                    bindings,
-                    result: Box::new(result),
-                },
-                location,
-            )),
-            location,
-        ))
+        Ok(located(ExprKind::Raise {
+            action,
+            message: Box::new(message),
+            subjects: arguments.collect(),
+        }, location))
     }
 
     fn lower_unwrap(
@@ -939,6 +766,7 @@ impl<'a> Lowerer<'a> {
         name: &str,
         arguments: Vec<Expr>,
         node: NodeRef,
+        name_location: Location,
     ) -> Result<Expr, Diagnostic> {
         if arguments.len() != 1 {
             return Err(self.error(
@@ -951,8 +779,22 @@ impl<'a> Lowerer<'a> {
         }
         let location = self.location(node);
         let prefix = format!("${name}:{}", location.range().start);
-        let identifier = |suffix: &str| located(format!("{prefix}:{suffix}"), location);
-        let variable = |suffix: &str| located(ExprKind::Variable(identifier(suffix)), location);
+        // Distinct internal spans prevent the temporary Result and its payload
+        // from sharing location-keyed type evidence. Emission keeps the full call span.
+        let internal = |offset| Location {
+            source: name_location.source,
+            start: name_location.start + offset,
+            end: name_location.start + offset,
+        };
+        let identifier = |suffix: &str| {
+            let offset = match suffix { "result" => 0, "payload" => 1, _ => 2 };
+            located(format!("{prefix}:{suffix}"), internal(offset))
+        };
+        let variable = |suffix: &str| {
+            let name = identifier(suffix);
+            let location = name.location;
+            located(ExprKind::Variable(name), location)
+        };
         let binding = |suffix: &str, value| {
             located(
                 BindingData {
@@ -966,7 +808,7 @@ impl<'a> Lowerer<'a> {
                     annotation: None,
                     value,
                 },
-                location,
+                identifier(suffix).location,
             )
         };
         let result = arguments
@@ -979,62 +821,27 @@ impl<'a> Lowerer<'a> {
             located(
                 PatternKind::Tagged {
                     tag: tag.into(),
-                    payload: Box::new(located(PatternKind::Binding(payload), location)),
+                    payload: Box::new(located(PatternKind::Binding(payload.clone()), payload.location)),
                 },
                 location,
             )
         };
-        let success = if name == "try_unwrap" {
+        let success = if name == "ok_or_warn" {
             located(
                 ExprKind::Call {
-                    callee: Box::new(located(ExprKind::Atom("Some".into()), location)),
-                    arguments: vec![located(ExprKind::Variable(payload.clone()), location)],
+                    callee: Box::new(located(ExprKind::Atom("Some".into()), internal(3))),
+                    arguments: vec![variable("payload")],
                 },
                 location,
             )
         } else {
-            located(ExprKind::Variable(payload.clone()), location)
+            variable("payload")
         };
-        let rejected = if name == "try_unwrap" {
-            let warning = located(
-                ExprKind::Call {
-                    callee: Box::new(located(
-                        ExprKind::Variable(located("\0telora_warn".into(), location)),
-                        location,
-                    )),
-                    arguments: vec![
-                        located(ExprKind::Variable(message.clone()), location),
-                        variable("result"),
-                    ],
-                },
-                location,
-            );
-            located(
-                ExprKind::Block(located(
-                    BlockKind {
-                        bindings: vec![binding("warning", warning)],
-                        result: Box::new(located(ExprKind::Atom("None".into()), location)),
-                    },
-                    location,
-                )),
-                location,
-            )
-        } else {
-            let envelope = self.lower_blame(
-                "unwrap",
-                vec![
-                    located(ExprKind::Variable(message.clone()), location),
-                    variable("result"),
-                ],
-                node,
-            )?;
-            located(
-                ExprKind::Raise {
-                    error: Box::new(envelope),
-                },
-                location,
-            )
-        };
+        let rejected = self.lower_blame(
+            if name == "ok_or_warn" { "warn" } else { "raise" },
+            vec![variable("message")],
+            node,
+        )?;
         let matched = located(
             ExprKind::Match {
                 value: Box::new(variable("result")),

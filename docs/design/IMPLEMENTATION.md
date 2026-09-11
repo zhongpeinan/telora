@@ -77,13 +77,37 @@ Incomputable(QuotaExceeded | RuntimeOnly | UnsupportedOperation |
              CyclicEvaluation | Cancelled)
 ```
 
-显式 `Any` 是一个已知静态类型，不是 `Unknown`。Recovery 也不制造“部分成功”的语言
-值或特殊 Module 类型：Module 只有源码层面的 `Available` / `Unavailable`，细粒度状态
+`Unknown` 表示尚未取得类型依据的分析状态。Module 只有源码层面的 `Available` / `Unavailable`，细粒度状态
 属于 definition、expression 和 type fact。
+
+编译器借用推导生成的构造器与名义 owner 证据表；所有子闭包共用同一份只读事实，
+不在每次闭包编译时克隆整表。局部寄存器、捕获、定义及类型槽的可变状态仍独立维护。
+工具表达式编译同样借用本次操作拥有的证据；借用不会进入生成的 LIR 或 bytecode。
+每次编译入口一次性建立按 SourceId/位置排序的 owner 证据借用数组，闭包捕获分析
+二分定位后只扫描自身源码范围内的记录，避免逐闭包遍历模块全表。重叠但越界的
+记录和其他源码的同偏移记录不进入该闭包的隐藏捕获。
 
 严格 AST 经类型分析后先 elaboration，再降低为寄存器 LIR，并组装为 bytecode。静态
 annotation 和仅用于元数据计算的 helper 可以在 program bytecode 中擦除；被普通运行时
 值引用的 TypeMetadata、函数和 closure 则必须保留。
+
+Module body 与普通 block body 使用独立语法规则，只有后者接受表达式语句。CST
+保留分号和后续 body；lowering 迭代展开为顺序绑定，表达式语句使用源码不可命名的
+局部 `let`，复用现有检查和执行机制，不引入新 VM 指令。无尾表达式时合成空 Tuple。
+前置投影和严格推导跟踪不正常完成的初始化表达式，block 仍推导为 `Never`，而非
+将隐式 Unit 当作可达返回值。后续表达式仍接受静态检查。
+
+显式类型槽位的空 `()` 降低为内部空 Tuple 元数据绑定，不受公开 `Unit` 名称遮蔽
+影响。Prelude 的静态投影与工具值环境同时提供 `Unit` 别名；两者复用现有 Tuple
+descriptor、TypeId 和值表示，不增加 Unit runtime kind。普通调用实参不做该转换。
+
+RFC 0277 第二阶段增加 `TypeSyntax` / `TypeMetadata` AST 边界。显式类型位置的
+非空 Tuple 降低到内部结构构造器，Fn 也使用内部绑定，均不受公开 Tuple/Func 名称
+遮蔽影响。HIR 保留边界并解析其引用；静态/数据检查使用声明身份、泛型参数和模块接口，
+而非名称大小写或 TypeOf 值内容。类型角色在导入和再导出时保留。
+普通函数和元数据数据不能进入静态类型表达式。`.type` 的结果保留精确 TypeOf 见证；
+不增加运行时 kind、VM 指令或推导环境副本。恢复分析将非法类型表达式标记为冲突，
+阻止执行其 helper，同时继续独立定义的分析。Property 仍是独立的带外查询。
 
 ## 3. 模块图、骨架和静态身份
 
@@ -107,9 +131,98 @@ Package preparation 构造私有 `telora-packages` IMOS Service。`run/serve` �
 把终态转为一个关联 `EesReply` event。Engine 与 RunHost 都按 `SystemCaps.ees` 校验 actor name。
 
 `telora-crate.json` 的 `modules` 是 `src/` module 的权威清单。清单项在准备阶段映射并
-canonicalize 到物理文件；未列出的文件不会进入 catalog。`tests/*` 只在 Host 选择测试
-根时加入当前图。`telora check` 在准备后扫描 `src/`，为未声明文件输出 warning，但不
-改变 resolver 输入。
+canonicalize 到物理文件；未列出的文件不会进入 catalog。`telora check` 在准备后扫描
+`src/`，为未声明文件输出 warning，但不改变 resolver 输入。
+
+选择测试根时，`ModuleResolver` 在图发现前通过 `module_id/test_catalog.rs` 递归建立
+当前 crate 的 `tests/**` 清单，以 `Arc` 在本次 resolver 的副本间共享。清单包含所有
+合法的 Telora/静态数据文件，拒绝 symlink，但不解析源码内容。顶层和嵌套测试都使用
+`ModuleCName::Test`，relative、`@test/` 和 canonical import 统一查该清单，并检查
+importer 必须是当前 crate 的测试模块。选中根的回边也交给统一 cycle 检测。
+
+CLI 的 `test`、`check` 与显式 query 将已准备的 resolver 直接交给
+`Engine::recover_with_resolver`，避免一个调用重复扫描测试清单。graph discovery
+仍只预扫描选中根的可达依赖，并在求值前完成 import/export 和 slot 分配。
+未引用测试的语法或运行时失败不进入本次结果。测试清单不扩展 source manifest、lock
+或普通 module catalog，也不会在求值时接纳新增文件。
+
+图发现与后续加载使用同一个 session 的 SourceDatabase。已发现的 Telora 源码保留
+共享的 PreparedModule（SourceId、AST、恢复语法和诊断），严格加载和恢复分析复用
+该记录，不再次读取文件或解析；不额外保留模块加载不使用的 CST。语法错误也是
+可登记的内部状态。图发现后的磁盘变更由下一 session 读取，本 session 持续使用
+已捕获的源码快照。当前 HIR 和类型推导仍有独立构建路径，尚未完成 RFC 0280 的
+全局类型世界与无 Telora 执行的类型阶段。
+
+显式 import 在 session 图中先登记稳定 ImportId，数组节点从 Pending 填充为
+目标 ModuleId 或名称解析诊断 ID；源码位置只是入口索引。目标描述保存在按 ModuleId
+索引的表里。严格/恢复加载读取同一节点，
+不再次解析已发现的 import；未经过 discovery 的直接入口仍可调用 resolver。
+目标 ID 不代表源码已成功读取、类型已求解或值已初始化，失败解析也不撤销其他记录。
+
+模块骨架记录其 SourceId；严格加载同一源码节点时直接携带 ModuleId，不再克隆骨架
+并重新扫描声明、exports/imports 来比较两份副本。未经过 discovery 的旧入口仍保留
+原有一致性检查。正式/恢复分析各自拥有 HIR，工具推导上下文借用同一 HIR，结束时
+直接转交给现有公开 Analysis；该转交不复制 HIR，也不使用引用计数。跨阶段的 HIR 预先解析与跨模块声明边
+尚未统一，因此这里不宣称已完成全局 HIR 求解。
+
+已发现模块的 PreparedModule 现在归属于 ModuleId 索引的节点；未发现入口保留独立
+兼容存储。恢复分析借用该节点中的 AST，语义快照输入只携带所需的结果位置，不再
+持有整份 AST 副本。PreparedModule 由节点直接拥有，不再使用 Arc；ModuleGraph 和
+ModuleSkeleton 不实现 Clone。严格 loader 将依赖准备与编译分开，递归期间只保留
+import 操作数和 binding 游标，结束后重新借用 session 语法。恢复路径同样在递归前
+结束借用，在分析时重新借用；语法记录始终留在图中。依赖准备仍可能执行旧模块值，
+AST/HIR 内部节点扁平化和下游统一 ID 消费仍待迁移。
+
+语义快照构建只借用输入分析事实，排序时保留输入引用；严格加载、run/eval 和 test
+交接不再先克隆整份 SemanticModuleInput（包含 HIR/类型图）。最终快照仍拥有投影后的
+记录。类型图按源数组顺序投影到连续区间，边通过区间起点加原 ID 换算，使用每模块
+一个区间记录替代逐类型映射数组；不递归遍历，也不预填 Pending 再回填。定义 ID
+重映射仍存在。严格 loader 的语义输入表独占 Analysis；编译产物仅保留该表的模块键，
+执行与契约检查借用分析结果。完成快照投影后，选中模块的 Analysis 才移入 LoadedModule，
+不克隆整份 HIR/类型图。依赖产物仍复制所需的 ModuleInterface/result scheme，模块键
+仍沿用现有语义表的字符串键；这尚不是统一 session arena 的最终 ID 消费形式。
+
+类型名称发布复用已有名义类型 ID；确需预留的前向名称槽保留 Ref 边，名称表最终
+指向求解所得根，不再把构造器和子节点列表克隆到名称槽中。类型图仍可能保留前向
+引用的代理槽，尚未完成全局归一化。
+
+声明契约的静态展开入口只读取 AST、HIR 名称解析、模块接口、类型环境和符号参数，不接收 VM
+或 heap。已知类型引用、函数、元组、Unit、Array/Dict/TypeOf 直接进入同一个最终
+Analysis 类型图；普通内建名称受遮蔽检查约束。现有 TypeScheme 边界仍会物化描述符。
+限定类型引用（如 pkg.inner.Item）从嵌套模块接口的具体类型声明取得类型，尊重局部与
+泛型参数遮蔽，不将普通元数据值作为类型声明；接口的构建仍依赖现有模块加载流程。
+已完成符号模板的本地／导入类型族，可在声明契约中按图节点 ID 替换参数；递归应用先
+登记名义身份再填充类型体，幽灵参数仍进入身份。同一次应用只记录访问到的节点映射，
+不复制类型环境；名义身份参数仍通过描述符适配。
+非循环声明调度现在也尝试直接展开类型本体，支持编译器生成的 struct/enum/newtype，
+并立即登记可用的类型族模板。元数据仍在旧消费者的适配边界生成；该边界从 AST 和
+已有模板投射使用位置，保留 codec 的字段规则位置，不把来源混入共享类型身份。
+已知类型引用复用元数据对象，只在引用值上附加本次位置；符号参数不会复用同名外部类型。
+已支持的静态声明不消耗 VM 执行 fuel；工具代码和 property provider 仍遵守执行配额。
+静态声明和契约展开前不再准备整份模块的 construction／`@check` 值依赖；该准备延后到
+值阶段，仍需执行的旧类型路径则在执行前准备。检查注册和实际构造验证仍然保留，
+静态声明错误可先于 checker 依赖执行报告；这尚未分离整个值推导与工具执行阶段。
+声明和类型族签名中的 trait／Property(T) 约束现在也尝试直接读取身份和类型图，
+不求值 property provider；可静态求解时无需创建临时参数元数据。调用时的约束验证仍保留。
+带约束类型族的可展开结构也进入类型图；原 TypeScheme 保留完整约束，最终推导检查
+类型定义体中的应用，并单独收集声明签名中的带约束应用，使用该声明的词法 evidence
+验证义务。普通签名结构不作为值表达式重新推导。未解析名称等形式仍有旧路径，
+类型声明本体、约束和 property 阶段尚未全部静态化，不能据此声称整个推导已零执行。
+
+类型图接收到名义引用占位后，后来的完整定义可填充原类型行，已有引用保留 ID。
+具体名义类型的递归分量现在先登记全部身份，再静态展开各类型体，并直接以节点 ID
+填充名义类型行。支持的自递归／互递归声明无需 VM fuel；形状验证和类型签名发布
+直接读取已求解图，不再解码刚生成的元数据。旧值消费者仍需要预留、封闭运行时
+类型引用。无约束的自递归名义类型族也先登记带符号参数的 owner，再填充类型体；
+自引用只能原样、按声明顺序传入参数。其模板签名读取已求解图，运行时 family 闭包
+仍在适配边界创建。带约束递归类型族、恢复分析和未支持表达式仍保留旧求值路径。
+描述符转换按名义边界识别递归：跨过名义边界后再次遇到共享结构不构成非法结构环，
+直到名义身份重现才生成递归引用；不经过名义身份的纯结构环仍被拒绝。
+
+恢复加载先尝试正式分析；已有正式 Analysis 时，编译或运行失败也继续使用其中的
+类型事实，不另外执行 partial 分析。只有未能取得正式分析结果（包括语法错误、
+类型错误、缺失导出或循环依赖）时才执行恢复分析。失败路径仍可能重复部分工作，
+尚不等同于统一的全局求解器。
 
 `ModuleResolver` 消费已经准备好的 crate source 清单。`builtin_list()` 先登记 builtin
 vendor 的 crate，resolver 随后登记当前 crate 和 manifest dependencies；
@@ -147,6 +260,20 @@ builtin ABI source 同样使用 `std/...` canonical name，不通过 synthetic s
 
 ## 4. 分析期类型与运行时类型
 
+Tool expression inference 共享模块的 scheme 与 declared body 输入，只解码表达式
+实际引用的外部值；每次查询的 substitution 与诊断仍独立。普通函数体由模块推导
+检查，只有类型计算、注解等 tool root 的传递依赖才提前求值。
+严格推导与前置类型投影的局部环境借用父环境，以 `Vec` 保存局部覆盖并反向查找，
+不复制模块绑定。未知局部类型用显式遮蔽记录表示，避免意外回退到同名外部绑定。
+模块级环境仍使用 HashMap；match 分支需要 freshen 推导变量时保留独立的变换环境。
+工具值环境也借用模块绑定，以局部覆盖注入泛型参数和 provider 参数；编译器结合
+runtime HIR、自由变量和 constructor owner 链接收集实际依赖，只将这些值传入 VM。
+HIR 保存表达式子节点索引，依赖查询只遍历目标子树。类型依赖图一次计算 SCC，
+完整分析按分组的依赖计数与就绪队列调度；partial 分析复用同样的分组和依赖顺序。
+Property provider 的返回 contract 在模块推导前登记静态 evidence 和未来的 runtime
+binding，不依赖 payload 求值；模块静态检查通过后才物化 property records，失败则
+阻止发布。Decorator 引用不构成类型骨架的调度依赖。
+
 实现有三个必须区分的层次：
 
 | 层次 | 用途 | 身份范围 |
@@ -162,8 +289,8 @@ Bound parameter、inference variable 和 unresolved named type 不能直接 cano
 内建 canonical `TypeId` 当前固定为：
 
 ```text
-Any = 1, Never = 2, Type = 3, Dyn = 4,
-Int = 5, Float = 6, String = 7, Bytes = 8
+Never = 2, Type = 3, Dyn = 4,
+Int = 5, Float = 6, String = 7, Bytes = 8, Atom = 9
 ```
 
 动态 `TypeId` 从 1024 开始。名义实例的 intern key 是
@@ -200,6 +327,62 @@ handle 的 work bit 让复制器无需间接查询即可区分 Main 与 Work 引
 
 Heap 是按 storage scope 管理的对象、text、shape、静态函数、类型 witness 和 typed
 property 集合。
+
+Newtype 在类型描述符、分析图和 canonical type store 中具有独立的 Newtype 节点。
+其值使用单元素 Tuple 容器保存载荷 Val，外层容器携带具名 TypeId；`.0` 复制内部
+Val，所以嵌套具名载荷的身份和位置不被外层构造覆盖。codec 对外使用载荷表示，
+decode 分别建立载荷容器与外层身份，encode 先验证外层身份再读取载荷。
+
+严格推断依据 HIR 声明和模块接口的 `type_declarations` 识别 newtype 名称，
+根据 Type 上下文选择类型用途或构造器用途。构造器表达式记录位置与构造器种类，
+编译为单参数闭包，使用 `MakeTuple` 和可用的 `OwnDeclared` 类型证据。
+导出记录保留声明本身；普通函数的 TypeOf 返回契约不提供声明身份。
+构造器模式在 HIR 中保留声明引用，严格推断先统一具名目标类型，再递归分析载荷
+模式。newtype 解构编译为 `GetTuple(0)`，直接读取原始载荷 Val。
+
+工具阶段根据当前已经建立的声明、模块接口与泛型契约复用严格推断，向表达式
+编译器传递构造器位置与具名类型证据。工具函数、类型计算和 decorator 参数中的
+构造器使用相同的单元素 Tuple 表示。推断期间的注解求值使用静默观察，正式的
+元数据初始化负责输出诊断。错误恢复分析同步维护声明与泛型构造器的类型证据。
+带类型描述符的工具表达式要求构造器推断成功，推断错误在求值前作为源码诊断
+返回；普通增量类型初始化可以推迟尚未完成的推断，由最终检查确认声明是否合法。
+
+工具表达式 evidence 拥有独立的 `TypeGraph`，表达式位置和运行时类型证据通过
+该图内的 `AnalysisTypeId` 引用类型。同一次发布复用 slot 到图节点的映射，求解器
+销毁后不保留指向它的 ID；函数 arity 与候选名义 owner 的筛选直接读取图节点。
+尚未解决或不满足正式类型发布条件的中间记录暂时保留显式 descriptor 兼容分支，
+以保留开放函数的 arity 和既有错误行为。工具运行时类型参数的无来源元数据构建
+直接消费图 ID，按节点记录已生成值，先预留名义 owner 再遍历 body；跨名义边界的
+结构回边有效，无名义边界的结构环仍拒绝。同一工具表达式的全部类型根批量构建，
+共享一份节点到元数据的临时表，避免多个根重复展开相同节点；临时表不跨 heap、
+图或求值操作保留，纯 descriptor 分支不创建图构建临时表。类型参数 arity 直接扫描图，同时计入
+名义身份参数中的 phantom bound。带来源构建、owner 泛型替换及名义参数身份仍有
+descriptor 适配；当前并非所有工具消费者都已直接读图。
+
+enum 成员解析使用同一份值构造器证据。限定成员读取先解析所属类型声明，再得到
+成员的完整泛型契约；带载荷成员编译为单参数闭包，无载荷成员编译为 Atom 值。
+具名 enum 使用同样的 `OwnDeclared` 证据保留身份，底层 Atom/Tagged 表示保持一致。
+限定 enum 模式先通过同一份证据验证声明归属与载荷数量，再转换为内部的
+Atom/Tagged 模式进行嵌套类型检查和穷尽性分析。编译器使用已验证的成员证据
+生成匹配指令；普通函数别名不提供模式构造器身份。
+
+模块接口用 `value_binding` 区分命名空间与被选择的值。选择性导入、开放导入的
+值以及独立文件的直接结果记录绑定名，模块命名空间保留完整导出表。类型方案
+与构造器身份依据这个来源读取，限定链不依赖模块别名是否恰好出现在导出表中。
+选择性 enum 成员导入降为携带 `imported_name` 的定义绑定，HIR 保留原声明选择
+表达式。严格推断使用成员原有的泛型契约，模块接口的 `member_constructors`
+记录公开成员的 tag 与载荷形式；所属具名类型和类型参数由公开契约保持。模块的
+选择性导入、开放导入和 reexport 同步传播这份证据。普通定义不继承该证据。
+HIR 根据本地成员导入和外部接口，将模式中的裸成员名称记录为声明引用，其他
+名称记录为模式绑定。严格推断沿用限定构造器的类型与穷尽性检查。编译前根据
+已验证的证据将裸成员模式规范化为构造器模式，使运行时与工具阶段的闭包捕获
+一致。开放导入在名称仅出现在模式中时同样检查成员候选的歧义。
+
+`std/prelude` 显式导出 Bool、Option 和 Result 成员。标准库启动安装预设名称时，
+同时传递值与所选成员的 ModuleInterface，保留泛型契约和构造器来源。普通模块
+将隐式 prelude 作为名称 fallback，显式模块导入的候选优先；多个显式来源仍须
+消除歧义。
+
 String/Atom 与 Dict shape 分别 intern；复合值不可变。Host 对值的观察通过借用式
 `ValueRef` 和受控转换完成，不存在一份与 VM 图竞争的 legacy/owned Host value model。
 
@@ -222,6 +405,42 @@ member snapshot。整个声明的 effective heads 在失败检查后一次复制
 运行时相等先服从 [`LANGUAGE.md`](LANGUAGE.md#33-相等性和顺序) 的 typed equality：
 名义值需要 canonical `TypeId` 一致，再按表示递归比较；循环图使用 visited pair 防止
 无限递归；函数和 opaque value 使用各自的不透明身份规则。来源位置不参与相等。
+
+具名 enum 构造器通过名称解析获得声明来源、variant 名称和完整泛型契约；
+`value_constructors` 按源码位置把构造器证据传递给编译阶段。调用上下文补全泛型
+参数，并把 payload 上下文传入直接构造的嵌套值。同一类型族的分支、返回值和
+集合元素共享参数证据合并，具体证据迭代传播至没有新增解，支持 enum 参数补全后
+继续确定空集合的元素类型。不同声明及冲突的具体参数保持类型错误。VM 使用
+Atom/Tagged 表示，复制 payload 的 Val 来源位置不变。
+
+底层表示描述符及工具阶段的 provisional constructor evidence 可以保留内部
+Atom/Tagged 标记；它们不能成为完成后的表达式类型、binding scheme 或模块接口。
+公开 Type 元数据解析、静态反射和 codec 只接受 enum 契约。`std/dyn.kind` 继续
+报告底层值类别，`std/dyn.desc` 返回装箱时的静态契约。
+
+Struct 合并更新复用 Dict 的运行时字段表示。严格推断根据 `<~` 左侧具名 Struct
+确定结果类型；更新字面量先收集 spread 的静态字段集合和覆盖关系，再为最终
+生效的显式字段传递 expected type，并检查字段子集与类型兼容性。初步类型证据
+同样保留左侧具名身份，供后续推断与语义查询使用。
+
+编译器按源码顺序求值操作数，更新字面量复用 `MakeDict` / `MergeDicts`。
+`StructUpdate` 指令复用字段合并逻辑，`BitAnd` 指令执行整数按位与。更新指令
+创建新容器并复制 base 的 `TypeId`。字段直接复制 `Val`，保留嵌套身份及来源
+位置，新容器使用指令位置，分配纳入当前 quota account。
+
+字段投影以 `FieldProjection` AST 节点保存 receiver 与有位置的源名/目标名。
+严格推断从源具名 Struct 读取字段类型；普通构造检查 exact nominal target，
+更新右侧检查字段子集。初步推断只遍历 receiver，不从投影形状猜测目标身份。
+编译器把 receiver 求值到一个寄存器，再发出各字段的 `GetField` 和一次
+`MakeDict`；普通构造沿用 `OwnDeclared` 附加目标身份。字段值直接复制，
+保持来源位置，投影无需额外 VM 指令。
+
+Tuple spread 复用 `Spread` AST 项。初步推断按静态 Tuple 形状展开位置类型；
+严格推断和上下文字面量检查按展开后的下标分配 expected type。编译器将普通
+元素构造成单元素 Tuple，将 spread 操作数作为完整 Tuple 片段，最终发出
+`ConcatTuples`。VM 与 `ConcatArrays` 共享有序复制及配额核算逻辑，分别检查
+Tuple/Array 表示并创建对应容器；元素直接复制 Val。无 spread 的 Tuple 仍
+通过 `MakeTuple` 构造。
 
 `Dyn.project_with` 对目标 witness 和 package descriptor 直接执行
 `TypeGraph::decode_persistent + canonicalize`。它先为 declared node 建立 canonical
@@ -270,14 +489,15 @@ Fail child，以保留形状并继续健康的独立分支；Fail 不是用户�
 `RuntimeError` 为 contextual failure 保存一个 rule location、有序去重的 data source
 locations，以及可选的 intrinsic implementation location。执行帧同时携带最外层
 authored rule boundary；普通调用继承该边界，第一次调用建立边界，tail call 显式搬运
-边界，native continuation 回调使用其 authored call site。`Raise` 读取 opaque
-`BlameError` carrier 后一次建立 root diagnostic。failure arena 的传播节点只保存 root
+边界，native continuation 回调使用其 authored call site。`Raise` 读取
+消息和 subject 寄存器后一次建立 root diagnostic。failure arena 的传播节点只保存 root
 failure id，因此 strict 与 best-effort 不会产生两套归因路径。
 
 Entry runtime 的 `with_diagnostics` 使用 native continuation 在同一 WorkWorld 中调用
 目标 closure。continuation 记录 `QuotaAccount.diagnostics` 的起点；成功或可恢复失败
-时只取出并消费该区间。可恢复 `Raise` 尽量沿用原 `BlameError` carrier，其他可恢复
-runtime error 按相同的 `rule + data_sources` 结构重建。terminal failure 不进入该
+时只取出并消费该区间。可恢复 failure 通过运行时统一的诊断转换得到 severity、
+labels 和 notes，再物化为 `std/_rt.Diagnostic`；标签保留源码名称和字节范围。
+快照与嵌套字段使用显式类型见证，分配计入当前 account。terminal failure 不进入该
 continuation 的 catch 路径。
 
 Best-effort 不是另一套成功语义。没有 error 时，它与严格执行同属成功并产生相同
@@ -321,13 +541,13 @@ Entry 属于 `std` crate，可以访问 `std/_...` 协议模块。只有内置 `
 3. 解析 `SystemCaps`，由 `RunHost.configure` 一次性确认 data/env/stdin 与 EES 诉求；
 4. Host 按 caps 读取并校验资源，由私有 runtime bridge 在 Entry WorkWorld 中构造
    `SystemResources`，再与 wrapper payload 一起传给 Initializer；
-5. 发送 `'Initialize` 及后续 stdin/EES event，每次调用 reducer；
+5. 发送 `Initialize` 及后续 stdin/EES event，每次调用 reducer；
 6. Host 先完整解析和审计一批 SystemEffect，再执行第一个 effect。
 
 应用不直接读取 open world。wrapper 声明 capabilities；实际文件、环境、stdin 和 EES
 调用由 CLI `RunHost` 执行。module graph 在应用求值前封闭。
 
-CLI 的公开命令有 `eval`、`eval-with`、`run`、`serve`、`lock`、`check`、`query`（别名
+CLI 的公开命令有 `eval`、`eval-with`、`run`、`serve`、`lock`、`check`、`test`、`query`（别名
 `q`）和 `lsp`。`eval` 选择一个 module 的 `Value` 导出；`eval-with` 选择一个
 `entry.Eval`。两条 pure eval 路径直接执行 module 与普通调用，不初始化 reducer loop、
 RunHost 或应用 EES。
@@ -338,14 +558,27 @@ wrapper 的初始化函数返回具体 State 和 reducer；标准 Entry 边界�
 并保存一个接受 `(Dyn, Event)` 的 reducer wrapper。Entry 将 application
 `EesCall` 映射成 component-neutral SystemEffect，将相关 Host reply 映射回 `EesReply`；
 是否声明 EES model 不改变 reducer 接口。
-`check`、`query` 和 `lsp` 当前是
+`test NAME` 复用 WorkspaceBuilder 检查和初始化图，再从根接口选择精确 Test 导出，
+以 `telora.test/v2` 报告独立用例。`check @test/NAME` 保留 `telora.check/v1`，
+不执行 Test。Test 的 opaque 载荷保存描述和构造位置，闭包引用放在受 World collector
+追踪的槽中；复制和类型元数据图遍历均包含这些槽。native 类型在签名求值前进入
+工具环境，保持 Test 等 native 类型的精确签名。
+每次 thunk/factory 调用使用严格 VM 和独立 WorkWorld，共享一个 QuotaAccount。
+调用结束后提取局部诊断，可恢复的预期失败不进入外层错误集合；终止错误中止 runner。
+动态子 Test 保留活跃 WorkWorld；兄弟 factory 从父 Test 根复制引用图。
+Host 负责 fixture 文件定位和限量读取，core 复用数据计划验证、DataLimits 和 sourced
+Value 物化。每组先准备全部直接输入，缓存同一路径的读取，随后深度优先执行。
+默认展开节点上限 10,000、嵌套深度 64、累计 fixture 保留预算 256 MiB；预算计入
+源码、每个逻辑节点 64 字节及 payload，数据物化也扣除共享 session allocation。
+fixture 来源为 `@test-ctx/`，没有 ModuleId 或 import 边，物理定位只经过 Host 边界。
+`check`、`test`、`query` 和 `lsp` 当前是
 Host 固定工具路径，不通过用户 Entry ABI。
 
 ## 10. 维护不变量与验证入口
 
 修改当前实现时至少保持以下不变量：
 
-- CST recovery 不得把未知或冲突伪装成 `Any` 或成功值；
+- CST recovery 必须保留未知或冲突的 fact state；
 - module identity 和静态 slot 不依赖文件发现、HashMap 或求值顺序；
 - concrete nominal identity 只由 constructor identity 与 type arguments 决定；
 - Main 中的持久对象不能引用已释放的 Work storage；

@@ -5,6 +5,9 @@ use std::sync::Arc;
 
 use crate::package::{ModuleDeclarationKind, ResolvedWorkspace, WorkspaceSpec};
 
+mod test_catalog;
+use test_catalog::TestCatalog;
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ModuleFormat {
     Telora,
@@ -131,12 +134,6 @@ impl ModuleId {
 }
 
 pub const FIRST_DYNAMIC_MODULE_LOCAL: u32 = 1024;
-
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct FuncId {
-    pub module: ModuleId,
-    pub local: u32,
-}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct TypeConstructorId {
@@ -302,9 +299,26 @@ pub struct ModuleResolver {
     builtins: BTreeMap<String, u32>,
     selected_entry: Option<ModuleCName>,
     workspace: Option<Arc<ResolvedWorkspace>>,
+    tests: Option<Arc<TestCatalog>>,
 }
 
 impl ModuleResolver {
+    pub(crate) fn builtin_inventory(builtins: impl IntoIterator<Item = (String, u32)>) -> Self {
+        Self {
+            crate_name: "std".into(),
+            standalone: false,
+            workspace_root: PathBuf::new(),
+            source_root: PathBuf::new(),
+            root_path: PathBuf::new(),
+            root_id: ModuleCName::builtin("std/prelude"),
+            dependencies: BTreeMap::new(),
+            builtins: builtins.into_iter().collect(),
+            selected_entry: None,
+            workspace: None,
+            tests: None,
+        }
+    }
+
     pub fn standalone(root_module: &Path) -> Result<Self, ResolveModuleError> {
         Self::standalone_with_source(root_module, None)
     }
@@ -341,6 +355,7 @@ impl ModuleResolver {
             builtins: BTreeMap::new(),
             selected_entry: None,
             workspace: None,
+            tests: None,
         })
     }
 
@@ -367,6 +382,10 @@ impl ModuleResolver {
             .expect("selected crate has a root")
             .to_owned();
         let source_root = resolve_physical(&crate_root.join("src"))?;
+        let tests = root_id
+            .starts_with("@test/")
+            .then(|| TestCatalog::discover(&crate_root, &crate_name, &workspace).map(Arc::new))
+            .transpose()?;
         let (id, path) = logical_root(&crate_root, &source_root, &crate_name, root_id)?;
         let root_path = resolve_physical(&path)?;
         let expected_root = match &id {
@@ -397,6 +416,7 @@ impl ModuleResolver {
             builtins: BTreeMap::new(),
             selected_entry: None,
             workspace: Some(workspace),
+            tests,
         };
         // Resolve dependency IDs after loading aliases.
         if !root_id.starts_with('@') {
@@ -415,6 +435,7 @@ impl ModuleResolver {
             ));
         }
         resolver.ensure_root_is_declared()?;
+        resolver.ensure_test_root_is_cataloged()?;
         Ok(resolver)
     }
 
@@ -573,6 +594,10 @@ impl ModuleResolver {
             .expect("selected crate has a root")
             .to_owned();
         let source_root = resolve_physical(&crate_root.join("src"))?;
+        let tests = root
+            .starts_with(crate_root.join("tests"))
+            .then(|| TestCatalog::discover(&crate_root, &crate_name, &workspace).map(Arc::new))
+            .transpose()?;
         let resolved_root = if root_source.is_some() {
             root
         } else {
@@ -596,8 +621,10 @@ impl ModuleResolver {
             builtins: BTreeMap::new(),
             selected_entry: None,
             workspace: Some(workspace),
+            tests,
         };
         resolver.ensure_root_is_declared()?;
+        resolver.ensure_test_root_is_cataloged()?;
         Ok(resolver)
     }
 
@@ -618,6 +645,7 @@ impl ModuleResolver {
     }
 
     pub fn resolve_root(&self, path: &Path) -> Result<ResolvedModule, ResolveModuleError> {
+        self.ensure_test_root_is_cataloged()?;
         let path = if path.is_file() {
             resolve_physical(path)?
         } else {
@@ -657,6 +685,18 @@ impl ModuleResolver {
             return Err(ResolveModuleError::EmptyPath);
         }
         let privileged = self.selected_entry.as_ref() == Some(importer);
+        if let Some(path) = target.strip_prefix("@test/") {
+            return self.resolve_test(importer, Path::new(path), target);
+        }
+        if !target.starts_with(['.', '@'])
+            && let Some((owner, rest)) = target.split_once('/')
+            && let Some(path) = rest.strip_prefix("tests/")
+        {
+            if owner != self.crate_name {
+                return Err(ResolveModuleError::InvalidImport(target.into()));
+            }
+            return self.resolve_test(importer, Path::new(path), target);
+        }
         if !target.starts_with(['.', '@']) && self.builtins.contains_key(target) {
             if special_root_of_logical_name(target).is_some() {
                 return Err(ResolveModuleError::InvalidImport(target.into()));
@@ -692,9 +732,6 @@ impl ModuleResolver {
                 physical_path: Some(self.root_path.clone()),
             });
         }
-        if target.starts_with("@test/") {
-            return Err(ResolveModuleError::InvalidImport(target.into()));
-        }
         if let Some(path) = target.strip_prefix("@src/") {
             return self.resolve_in_owner(importer, Path::new(path), target);
         }
@@ -705,9 +742,14 @@ impl ModuleResolver {
                         .ok_or_else(|| ResolveModuleError::CrateEscape(target.into()))?;
                     self.resolve_source(logical, target)
                 }
-                ModuleCName::Standalone { .. } | ModuleCName::Test { .. } => {
+                ModuleCName::Test { path, .. } => self.resolve_test(
+                    importer,
+                    &path.parent().unwrap_or_else(|| Path::new("")).join(target),
+                    target,
+                ),
+                ModuleCName::Standalone { .. } => {
                     return Err(ResolveModuleError::InvalidImport(format!(
-                        "{target}; standalone and test roots must import crate sources with @src/..."
+                        "{target}; standalone roots must import crate sources with @src/..."
                     )));
                 }
                 ModuleCName::Source { path, .. } => {
@@ -814,6 +856,34 @@ impl ModuleResolver {
             vendor: ModuleVendor::Configured,
             physical_path: Some(physical),
         })
+    }
+
+    fn resolve_test(
+        &self,
+        importer: &ModuleCName,
+        path: &Path,
+        original: &str,
+    ) -> Result<ResolvedModule, ResolveModuleError> {
+        if !matches!(importer, ModuleCName::Test { owner, .. } if owner == &self.crate_name) {
+            return Err(ResolveModuleError::InvalidImport(original.into()));
+        }
+        let tests = self
+            .tests
+            .as_ref()
+            .ok_or_else(|| ResolveModuleError::InvalidImport(original.into()))?;
+        let path = lexical_normalize_relative(path)
+            .ok_or_else(|| ResolveModuleError::CrateEscape(original.into()))?;
+        tests.resolve(&path, original)
+    }
+
+    fn ensure_test_root_is_cataloged(&self) -> Result<(), ResolveModuleError> {
+        if let ModuleCName::Test { path, .. } = &self.root_id {
+            let module = self.resolve_test(&self.root_id, path, &self.root_id.to_string())?;
+            if module.path() != Some(self.root_path.as_path()) {
+                return Err(ResolveModuleError::CrateEscape(self.root_id.to_string()));
+            }
+        }
+        Ok(())
     }
 
     fn resolve_dependency_parts(
@@ -1030,11 +1100,6 @@ fn logical_root(
     }
     if value.starts_with("@test/") {
         let selector = parse("@test/")?;
-        if selector.components().count() != 1 {
-            return Err(ResolveModuleError::InvalidImport(
-                "test roots support files only".into(),
-            ));
-        }
         let tests_root = workspace_root.join("tests");
         let (path, physical) = resolve_selector(&tests_root, selector, value)?;
         return Ok((
@@ -1094,7 +1159,7 @@ fn module_id_for_physical_root(
 ) -> Result<(ModuleCName, bool), ResolveModuleError> {
     let tests_root = resolve_physical(&workspace_root.join("tests"))?;
     if let Ok(path) = root.strip_prefix(&tests_root) {
-        let path = validate_special_root_relative(path, root, "test")?;
+        let path = validate_root_relative(path, root)?;
         return Ok((
             ModuleCName::Test {
                 owner: crate_name.to_owned(),
@@ -1126,20 +1191,6 @@ fn validate_root_relative(path: &Path, original: &Path) -> Result<PathBuf, Resol
     }
     lexical_normalize_relative(path)
         .ok_or_else(|| ResolveModuleError::CrateEscape(original.display().to_string()))
-}
-
-fn validate_special_root_relative(
-    path: &Path,
-    original: &Path,
-    kind: &str,
-) -> Result<PathBuf, ResolveModuleError> {
-    let path = validate_root_relative(path, original)?;
-    if path.components().count() != 1 {
-        return Err(ResolveModuleError::InvalidImport(format!(
-            "{kind} roots support files only"
-        )));
-    }
-    Ok(path)
 }
 
 fn is_private_file_name(path: &Path) -> bool {

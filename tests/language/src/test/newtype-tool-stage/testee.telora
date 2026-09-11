@@ -1,0 +1,63 @@
+import "std/test" as test;
+import "std/codec" as codec;
+import "std/value" { Value };
+import "std/type-property" as props;
+import "@src/test-support" { expect };
+import "@src/test/newtype-tool-stage/generic" as generic;
+import "@src/test/newtype-tool-stage/generic" { Box as ImportedBox };
+
+type Wrapped = struct(Type);
+type Box(T) = struct(T);
+def wrap: Fn(Type) -> Wrapped = fn(value) { Wrapped(value) };
+def unbox: for(T) Fn(Box(T)) -> T = fn(value) {
+    let Box(payload) = value;
+    payload
+};
+def apply: Fn(Fn(Type) -> Wrapped, Type) -> Wrapped = fn(make, value) { make(value) };
+def make = Wrapped;
+def make_generic: for(T) Fn(T) -> Box(T) = Box;
+def metadata_factory: Fn(Type) -> TypeOf(Wrapped) = fn(value) { Wrapped.type };
+def typed_make = do {
+    let make: Fn(Type) -> Wrapped = Wrapped;
+    make
+};
+
+type Count = struct(Int);
+@property(PropertyTarget.Type)
+type Stamp = struct { value: Int };
+def stamp: Fn(Count) -> Fn(Type, Option(Stamp)) -> Stamp = fn(count) {
+    fn(target, previous) {
+        let result: Stamp = { value: count.0 };
+        result
+    }
+};
+@stamp(Count(45))
+type Annotated = struct { value: Int };
+
+export def decorator_argument = test.should_ok(fn() {
+    expect(match props.get_type_prop(Annotated.type, Stamp.type) {
+        Some(stamp) => stamp.value == 45,
+        None => False,
+    })
+});
+
+export def metadata_helpers = test.should_ok(fn() {
+    let direct = Wrapped(Int.type).0;
+    let from_helper = wrap(Int.type).0;
+    let from_generic = unbox(Box@[Type](String.type));
+    let from_first_class = apply(Wrapped, String.type).0;
+    let from_import = generic.Box@[Type](Int.type).0;
+    let from_selective = ImportedBox@[Type](String.type).0;
+    let from_alias = make(Int.type).0;
+    let from_generic_alias = make_generic@[Type](String.type).0;
+    let from_codec = if codec.encode(Value.type, Box@[Int](42)) == Value.Int(42) {
+        Int.type
+    } else { String.type };
+    let from_typed = typed_make(Int.type).0;
+    let witness: TypeOf(Wrapped) = metadata_factory(Int.type);
+    expect(direct == Int.type && from_helper == direct && from_import == direct
+        && from_alias == direct && from_codec == direct && from_typed == direct
+        && from_generic == String.type && from_first_class == from_generic
+        && from_selective == from_generic && from_generic_alias == from_generic
+        && witness == Wrapped.type && generic.value == 7)
+});

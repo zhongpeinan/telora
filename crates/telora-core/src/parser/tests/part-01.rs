@@ -18,10 +18,41 @@
             }
         ));
     }
+
+    #[test]
+    fn statement_bodies_keep_bindings_and_tail_syntax_visible() {
+        use crate::syntax::telora::ast::{AstNode, Body};
+
+        for (source, has_tail) in [
+            ("do { 1; # first\n let a = 2; a; }", false),
+            ("do { 1; let a = 2; a }", true),
+        ] {
+            let mut sources = SourceDatabase::default();
+            let id = sources.add("statements.telora", source);
+            let parsed = parse_registered(&sources, id);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let program = parsed.program.unwrap();
+            let ExprKind::Block(block) = &program.value.body.value.result.value else { panic!("expected block"); };
+            assert_eq!(block.value.bindings.len(), if has_tail { 2 } else { 3 });
+            assert!(block.value.bindings[0].value.name.value.starts_with('\0'));
+            let mut pending = vec![NodeRef::ROOT];
+            let body = loop {
+                let node = pending.pop().expect("local body exists");
+                if matches!(parsed.cst.get(node), Node::Rule(Rule::Body, _)) {
+                    break Body::cast(&parsed.cst, node).unwrap();
+                }
+                if matches!(parsed.cst.get(node), Node::Rule(..)) {
+                    pending.extend(parsed.cst.children(node));
+                }
+            };
+            assert_eq!(body.bindings().count(), 1);
+            assert_eq!(body.result().is_some(), has_tail);
+        }
+    }
     #[test]
     fn malformed_else_if_chain_recovers_without_panicking() {
         let mut sources = SourceDatabase::default();
-        let id = sources.add("test.telora", "if 'True { 1 } else if { 2 } else { 3 }");
+        let id = sources.add("test.telora", "if True { 1 } else if { 2 } else { 3 }");
         let parsed = parse_registered(&sources, id);
         assert!(!parsed.diagnostics.is_empty());
         assert!(parsed.program.is_none());
@@ -44,21 +75,21 @@
                 &["invalid syntax, expected one of: ',', ')'"],
             ),
             (
-                "export def broken = match 'A { 'A 1, _ => 2 };",
+                "export def broken = match A { A 1, _ => 2 };",
                 &["missing FatArrow"],
             ),
             (
                 "type Broken = enum { @bad(\"name\") }; export {Broken};",
-                &["missing Atom"],
+                &["missing Identifier"],
             ),
             (
-                "type Broken = enum { @bad(\"name\", 'Bad }; export {Broken};",
+                "type Broken = enum { @bad(\"name\", Bad }; export {Broken};",
                 &["invalid syntax, expected one of: ',', ')'"],
             ),
             (
-                "export def broken = match 'A { @ => 1, _ => 2 };",
+                "export def broken = match A { @ => 1, _ => 2 };",
                 &[
-                    "invalid syntax, expected one of: <atom>, '\"', <float>, <identifier>, <integer>, '{', '(', '_', <raw string>",
+                    "invalid syntax, expected one of: '\"', <float>, <identifier>, <integer>, '{', '(', '_', <raw string>",
                 ],
             ),
         ];
@@ -80,14 +111,14 @@
     fn keeps_separate_syntax_roots_independently_actionable() {
         let cases: &[(&str, &[&str])] = &[
             (
-                "export def first = (1 + 2; export def second = match 'A { 'A 1, _ => 2 };",
+                "export def first = (1 + 2; export def second = match A { A 1, _ => 2 };",
                 &[
                     "invalid syntax, expected one of: ',', ')'",
                     "missing FatArrow",
                 ],
             ),
             (
-                "export def broken = match 'A { 'A 1, 'B 2, _ => 3 };",
+                "export def broken = match A { A 1, B 2, _ => 3 };",
                 &[
                     "missing FatArrow",
                     "invalid syntax, expected one of: '=>', 'if'",

@@ -27,10 +27,15 @@ import "std/value" {Value, ScalarValue};
 - `std/array`：不可变 Array 的读取、组合、映射、过滤、折叠和查找。
 - `std/dict`：不可变 Dict 的读取、键值枚举、构造、合并、映射、过滤和折叠。
 - `std/option`：Option 的变换、默认值和状态判断。
-- `std/result`：Result 的变换、错误映射、默认值、状态判断和解包。
+- `std/result`：Result 的变换、错误映射、默认值和状态判断。显式解包使用 `unwrap!`。
 
 集合函数不修改输入值。可能缺失的读取返回 Option；可能失败的计算返回 Result 或带
 blame 的 failure，具体契约可通过 `telora query exports` 查看。
+
+具名 struct 的局部更新使用语言运算符 `base <~ patch`，结果保持 base 的类型；
+更新字面量支持 `base <~ {field: value, ...patch}`。用法见
+[`Struct 合并更新`](TELORA.md#struct-合并更新)。`std/dict.merge` 则按 `Dict(A)`
+契约合并两个字典，同名键取右侧值。
 
 ## 文本与格式
 
@@ -39,6 +44,10 @@ blame 的 failure，具体契约可通过 `telora query exports` 查看。
 - `std/fmt`：`Display` trait、`Fmt` 值、基础格式项和 `@fmt.display_by` 模板。
 - `std/path`：纯字符串的路径连接、规范化、父路径和文件名操作，不访问文件系统。
 - `std/hash`：SHA-256 一次性摘要和增量摘要状态。
+- `std/test`：延迟 Test、正常/预期失败断言与 Host fixture 分组，由 `telora test` 执行。
+
+`should_ok` 只要求正常返回，返回 False 或 Err 也会通过；业务断言必须显式检查结果。
+测试组织、错误语义和 fixtures 示例见 [测试最佳实践](TESTING.md)。
 
 名义 struct 可以用 Display 模板获得统一的格式与插值能力：
 
@@ -51,6 +60,11 @@ type Endpoint = struct {host: String, port: Int};
 
 ## 数据边界
 
+- `std/blame`：提供不透明 native 类型 `BlameError`。`blame!(message, values...)`
+  保存消息和原值来源；`raise!(error)` 产生失败并返回 Never，`warn!(error)` 记录警告并返回
+  `Option(T)` 的 `None`。两者也接受 String，但只取消息，不将其来源作为数据引用。
+  `unwrap!` 和 `ok_or_warn!` 分别将 Result 的 Err 交给 raise!/warn!。
+  构造或传递错误值本身不产生诊断。
 - `std/value`：定义递归的 `Value`，以及数据库绑定等边界使用的 `ScalarValue`。
 - `std/codec`：在名义类型与 Value 之间编码、解码，并统一消费 codec property。
 - `std/json`：JSON 解析、类型化解码、编码、schema 与 JSON codec decorator。
@@ -58,11 +72,14 @@ type Endpoint = struct {host: String, port: Int};
 - `std/toml`：把 TOML 文本解析为 Value。
 
 `Value` 是 source、Entry、EES 和 JSON 共享的数据边界。`ScalarValue` 的 untagged codec
-把 `'None`、`'Bool(...)`、`'Int(...)`、`'Float(...)`、`'String(...)` 分别编码为普通
+把 `ScalarValue.None`、`ScalarValue.Bool(...)`、`ScalarValue.Int(...)`、
+`ScalarValue.Float(...)`、`ScalarValue.String(...)` 分别编码为普通
 JSON null、boolean、number 和 string。
 
-通常先在格式模块中得到 Value，再用 `codec.decode(Target, value)` 进入业务名义类型；
-输出时用 `codec.encode(codec.Value, value)` 回到数据边界。
+通常先在格式模块中得到 Value，再用 `codec.decode(Target.type, value)` 进入业务名义类型；
+输出时用 `codec.encode(codec.Value.type, value)` 回到数据边界。
+解析和解码返回 `Result(A, BlameError)`，调用方可以通过 match 恢复，或用
+`raise!(error)` 发出保留原始值来源的诊断。
 
 ## 反射
 
@@ -74,6 +91,14 @@ JSON null、boolean、number 和 string。
 
 反射中的 member index 来自 `std/type-desc` 的 `FieldDesc` 或 `VariantDesc`。程序应传递
 这些已验证的 index，而不是根据布局自行猜测。
+
+`type-desc.kind` 描述静态类型；enum 使用 Enum 或具名引用 Ref，并通过 `variants`
+查询其分支。`dyn.kind` 描述底层值表示，所以 enum 值可以返回 Atom 或 Tagged。
+`dyn.desc` 保留装箱时的 enum 契约，投影使用明确的目标类型身份。
+
+newtype 的具名类型返回 Ref；解析引用后，kind 为 Newtype，children 包含唯一的
+载荷类型。`dyn.tuple_items` 可读取其单个载荷，并保留载荷自己的类型身份。
+newtype 的 JSON 表示和 schema 使用载荷契约。
 
 ## 执行与效果
 

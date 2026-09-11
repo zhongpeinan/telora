@@ -53,9 +53,6 @@ impl<'a> Lowerer<'a> {
                     parse_float_literal(&self.text(node))
                         .map_err(|message| self.error(node, message))?,
                 ),
-                Token::Atom => {
-                    PatternKind::Atom(self.text(node).trim_start_matches('\'').to_owned())
-                }
                 _ => return Err(self.error(node, "expected pattern token")),
             };
             return Ok(located(inner, self.location(node)));
@@ -70,6 +67,33 @@ impl<'a> Lowerer<'a> {
             );
         }
         let inner = match rule {
+            Rule::ConstructorPattern => {
+                let mut names = self.token_children(node, Token::Identifier);
+                let first = self.identifier(names.next().expect("constructor has a name"));
+                let mut constructor = located(ExprKind::Variable(first.clone()), first.location);
+                for name in names {
+                    let field = self.identifier(name);
+                    let location = Location::new(
+                        constructor.location.source,
+                        crate::source::TextRange::from_usize(
+                            constructor.location.start as usize..field.location.end as usize,
+                        ).expect("constructor path is within a parsed source"),
+                    );
+                    constructor = located(ExprKind::Field {
+                        receiver: Box::new(constructor), field,
+                    }, location);
+                }
+                let payload = if let Some(open) = self.token_children(node, Token::LParen).next() {
+                    let payload = self.children(node).find(|child| self.is_pattern(*child)
+                        && self.cst.span(*child).start >= self.cst.span(open).end)
+                        .ok_or_else(|| self.error(node, "constructor pattern has no payload"))?;
+                    Some(Box::new(self.pattern(payload)?))
+                } else { None };
+                PatternKind::Constructor {
+                    constructor: Box::new(constructor),
+                    payload,
+                }
+            }
             Rule::IdentifierPattern => {
                 if self
                     .token_children(node, Token::Placeholder)
@@ -102,27 +126,6 @@ impl<'a> Lowerer<'a> {
                     .ok_or_else(|| self.error(node, "string pattern has no literal"))?;
                 PatternKind::String(self.plain_string(string, "string pattern")?)
             }
-            Rule::AtomPattern => PatternKind::Atom(
-                self.text(self.first_token(node, Token::Atom)?)
-                    .trim_start_matches('\'')
-                    .to_owned(),
-            ),
-            Rule::TaggedPattern => PatternKind::Tagged {
-                tag: self
-                    .text(self.first_token(node, Token::Atom)?)
-                    .trim_start_matches('\'')
-                    .to_owned(),
-                payload: Box::new(
-                    self.pattern(
-                        self.children(node)
-                            .filter(|child| {
-                                !matches!(self.cst.get(*child), Node::Token(Token::Atom, _))
-                            })
-                            .find(|child| self.is_pattern(*child))
-                            .ok_or_else(|| self.error(node, "tagged pattern has no payload"))?,
-                    )?,
-                ),
-            },
             Rule::TuplePattern => PatternKind::Tuple(
                 self.children(node)
                     .filter(|child| self.is_pattern(*child))
@@ -170,7 +173,7 @@ impl<'a> Lowerer<'a> {
                                 && self.cst.span(*child).start > self.cst.span(colon).start
                         })
                     })
-                    .map(|annotation| self.expression(annotation))
+                    .map(|annotation| self.type_expression(annotation))
                     .transpose()?;
                 Ok(ClosureParameter { name, annotation })
             })
@@ -184,19 +187,78 @@ impl<'a> Lowerer<'a> {
         location: Location,
     ) -> Expr {
         let parameters = located(ExprKind::Array(parameters), location);
-        let callee_name = located("Func".to_owned(), location);
-        located(
+        let callee_name = located("\0telora_function_type".to_owned(), location);
+        let expression = located(
             ExprKind::Call {
                 callee: Box::new(located(ExprKind::Variable(callee_name), location)),
                 arguments: vec![parameters, result],
             },
             location,
+        );
+        located(ExprKind::TypeSyntax(Box::new(expression)), location)
+    }
+
+    fn unit_type_expression(&self, location: Location) -> Expr {
+        located(
+            ExprKind::Variable(located("\0telora_unit_type".to_owned(), location)),
+            location,
         )
+    }
+
+    fn type_expression(&self, node: NodeRef) -> Result<Expr, Diagnostic> {
+        self.normalize_type_expression(self.expression(node)?)
+    }
+
+    fn normalize_type_expression(&self, expression: Expr) -> Result<Expr, Diagnostic> {
+        let location = expression.location;
+        let value = match expression.value {
+            ExprKind::TypeSyntax(_) => return Ok(expression),
+            ExprKind::Variable(_) | ExprKind::Field { .. } => expression,
+            ExprKind::Tuple(items) => {
+                if items.is_empty() {
+                    self.unit_type_expression(location)
+                } else {
+                    let items = items.into_iter().map(|item| self.normalize_type_expression(item))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    located(ExprKind::Call {
+                        callee: Box::new(located(ExprKind::Variable(located("\0telora_tuple_type".into(), location)), location)),
+                        arguments: vec![located(ExprKind::Array(items), location)],
+                    }, location)
+                }
+            }
+            ExprKind::Call { callee, arguments } => {
+                let arguments = arguments.into_iter().map(|argument| {
+                    if let ExprKind::Array(items) = argument.value {
+                        let items = items.into_iter().map(|item| self.normalize_type_expression(item))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        Ok(located(ExprKind::Array(items), argument.location))
+                    } else {
+                        self.normalize_type_expression(argument)
+                    }
+                }).collect::<Result<Vec<_>, Diagnostic>>()?;
+                located(ExprKind::Call { callee, arguments }, location)
+            }
+            _ => return Err(Diagnostic::error(
+                "a static type requires a type declaration, constructor or family; computed metadata cannot become a type",
+                location,
+            )),
+        };
+        Ok(located(ExprKind::TypeSyntax(Box::new(value)), location))
     }
 
     fn contract_expression(&self, node: NodeRef) -> Result<Expr, Diagnostic> {
         let location = self.location(node);
         match self.rule(node) {
+            Some(Rule::UnitContract) => {
+                let mut items = self.rule_children(node)
+                    .map(|child| self.contract_expression(child))
+                    .collect::<Result<Vec<_>, _>>()?;
+                if items.len() == 1 && self.token_children(node, Token::Comma).next().is_none() {
+                    Ok(items.pop().unwrap())
+                } else {
+                    self.normalize_type_expression(located(ExprKind::Tuple(items), location))
+                }
+            }
             Some(Rule::Contract) => {
                 let inner = self
                     .first_rule(node)
@@ -233,6 +295,7 @@ impl<'a> Lowerer<'a> {
                                 Rule::Contract
                                     | Rule::ContractExpr
                                     | Rule::FunctionContract
+                                    | Rule::UnitContract
                                     | Rule::ContractArray
                             )
                         )
@@ -257,7 +320,7 @@ impl<'a> Lowerer<'a> {
                         .filter(|child| {
                             matches!(
                                 self.rule(*child),
-                                Some(Rule::Contract | Rule::ContractExpr | Rule::FunctionContract)
+                                Some(Rule::Contract | Rule::ContractExpr | Rule::FunctionContract | Rule::UnitContract)
                             )
                         })
                         .map(|child| self.contract_expression(child))
@@ -271,7 +334,7 @@ impl<'a> Lowerer<'a> {
                     .filter(|child| {
                         matches!(
                             self.rule(*child),
-                            Some(Rule::Contract | Rule::ContractExpr | Rule::FunctionContract)
+                            Some(Rule::Contract | Rule::ContractExpr | Rule::FunctionContract | Rule::UnitContract)
                         )
                     })
                     .map(|child| self.contract_expression(child))
@@ -337,6 +400,19 @@ impl<'a> Lowerer<'a> {
 
     fn declared_type_initializer(&self, node: NodeRef) -> Result<(Expr, Decorator), Diagnostic> {
         let (operation, members) = match self.rule(node) {
+            Some(Rule::StructInitializer) if self.first_token(node, Token::LParen).is_ok() => {
+                let payload = self.children(node)
+                    .find(|child| self.is_expression(*child))
+                    .ok_or_else(|| self.error(node, "newtype has no payload type"))?;
+                ("\0telora_newtype", vec![located(
+                    DictFieldKind {
+                        decorators: Vec::new(),
+                        name: Some(located("payload".to_owned(), self.location(payload))),
+                        value: self.type_expression(payload)?,
+                    },
+                    self.location(payload),
+                )])
+            }
             Some(Rule::StructInitializer) => {
                 let mut fields = Vec::new();
                 let mut names = std::collections::HashSet::new();
@@ -361,7 +437,7 @@ impl<'a> Lowerer<'a> {
                         })
                         .ok_or_else(|| self.error(field, "Struct field has no type"))?;
                     let decorators = self.decorators(field)?;
-                    let value = self.expression(value_node)?;
+                    let value = self.type_expression(value_node)?;
                     fields.push(located(
                         DictFieldKind {
                             decorators,
@@ -380,9 +456,10 @@ impl<'a> Lowerer<'a> {
                     .rule_children(node)
                     .filter(|child| self.rule(*child) == Some(Rule::EnumInitializerVariant))
                 {
-                    let tag_node = self.first_token(variant, Token::Atom)?;
+                    let tag_node = self.token_children(variant, Token::Identifier).next()
+                        .ok_or_else(|| self.error(variant, "missing Identifier"))?;
                     let name = located(
-                        self.text(tag_node).trim_start_matches('\'').to_owned(),
+                        self.text(tag_node).into_owned(),
                         self.location(tag_node),
                     );
                     if !names.insert(name.value.clone()) {
@@ -399,7 +476,7 @@ impl<'a> Lowerer<'a> {
                             .ok_or_else(|| {
                                 self.error(variant, "Enum variant has no payload type")
                             })?;
-                        self.expression(payload)?
+                        self.type_expression(payload)?
                     } else {
                         located(ExprKind::Atom("None".to_owned()), self.location(tag_node))
                     };

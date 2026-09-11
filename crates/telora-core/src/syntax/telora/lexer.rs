@@ -69,6 +69,7 @@ pub enum Token {
     BangEqual,
     Equal,
     BitAnd,
+    StructUpdate,
     BitOr,
     BitXor,
     AndAnd,
@@ -87,7 +88,6 @@ pub enum Token {
     UnterminatedEscapeSequence,
     InterpolationStart,
     Bytes,
-    Atom,
     Placeholder,
     IndexedPlaceholder,
     Identifier,
@@ -197,6 +197,8 @@ enum NormalToken {
     Equal,
     #[token("&")]
     BitAnd,
+    #[token("<~")]
+    StructUpdate,
     #[token("|")]
     BitOr,
     #[token("^")]
@@ -221,8 +223,6 @@ enum NormalToken {
     RawString,
     #[regex(r#"b\"([^\"\\]|\\.)*\""#)]
     Bytes,
-    #[regex(r"'[A-Za-z_][A-Za-z0-9_]*")]
-    Atom,
     #[token("_", priority = 4)]
     Placeholder,
     #[regex(r"_[0-9]+", priority = 4)]
@@ -549,8 +549,9 @@ fn contextualize_declared_type_tokens(
         };
         if tokens[equal] == Token::Equal
             && tokens[initializer] == Token::Identifier
-            && tokens[brace] == Token::LBrace
             && let Some(kind) = classify(initializer)
+            && (tokens[brace] == Token::LBrace
+                || (kind == Token::StructInitializer && tokens[brace] == Token::LParen))
         {
             tokens[initializer] = kind;
         }
@@ -765,6 +766,7 @@ impl From<NormalToken> for Token {
             NormalToken::Arrow => Self::Arrow,
             NormalToken::Equal => Self::Equal,
             NormalToken::BitAnd => Self::BitAnd,
+            NormalToken::StructUpdate => Self::StructUpdate,
             NormalToken::BitOr => Self::BitOr,
             NormalToken::BitXor => Self::BitXor,
             NormalToken::AndAnd => Self::AndAnd,
@@ -777,7 +779,6 @@ impl From<NormalToken> for Token {
             NormalToken::Backtick => Self::Backtick,
             NormalToken::RawString => Self::RawString,
             NormalToken::Bytes => Self::Bytes,
-            NormalToken::Atom => Self::Atom,
             NormalToken::Placeholder => Self::Placeholder,
             NormalToken::IndexedPlaceholder => Self::IndexedPlaceholder,
             NormalToken::Identifier => Self::Identifier,

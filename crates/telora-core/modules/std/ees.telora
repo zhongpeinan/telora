@@ -26,17 +26,14 @@ def model: Fn(String, String, Value) -> Model = fn(kind, name, config) {
 def none: Config = {vars: {}, models: []};
 
 def sqlite_model: Fn(String, String) -> Model = fn(name, path) {
-    model("sqlite-query", name, 'Object({path: 'String(path)}))
+    model("sqlite-query", name, Value.Object({path: Value.String(path)}))
 };
 
 def sqlite_query: Fn(String, String, Array(ScalarValue)) -> Request = fn(actor, sql, bindings) {
     request(
         actor,
         "Query",
-        match codec.encode(codec.Value, {sql, bindings}) {
-            'Ok(value) => value,
-            'Err(error) => fail!(codec.format_error(error)),
-        },
+        codec.encode(codec.Value.type, {sql, bindings}),
     )
 };
 
@@ -44,7 +41,7 @@ def imos_model: Fn(String, String, String) -> Model = fn(name, store, home) {
     model(
         "imos",
         name,
-        'Object({store: 'String(store), home: 'String(home)}),
+        Value.Object({store: Value.String(store), home: Value.String(home)}),
     )
 };
 
@@ -52,7 +49,7 @@ def install_shared: Fn(String, Value) -> Request = fn(actor, plan) {
     request(
         actor,
         "InstallShared",
-        'Object(dict.map_values({plan}, fn(value) { value })),
+        Value.Object(dict.map_values({plan}, fn(value) { value })),
     )
 };
 

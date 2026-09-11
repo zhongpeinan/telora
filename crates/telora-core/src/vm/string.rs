@@ -1,4 +1,12 @@
 #[allow(clippy::too_many_arguments)]
+fn run_string_parse(
+    arguments: &[Val], return_target: ReturnTarget, function: &BytecodeFunction,
+    pc: usize, current: &mut Heap, background: &Heap, account: &mut QuotaAccount,
+) -> Result<VmAction, RuntimeError> {
+    run_solved_string_parse(arguments, None, return_target, function, pc, current, background, account)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_core_string(
     operation: CoreStringFunction,
     arguments: &[Val],
@@ -21,6 +29,8 @@ fn run_core_string(
     };
     let call_loc = instruction_location(function, pc);
     let value = match operation {
+        CoreStringFunction::Parse => return run_string_parse(arguments, return_target,
+            function, pc, current, background, account),
         CoreStringFunction::Length => {
             let length = i64::try_from(argument(0)?.chars().count()).map_err(|_| {
                 error(
@@ -250,4 +260,3 @@ fn normalize_lexical_path(path: &str) -> String {
         components.join("/")
     }
 }
-

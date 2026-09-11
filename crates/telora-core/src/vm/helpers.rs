@@ -349,17 +349,13 @@ fn runtime_value_kind(actual: Val) -> &'static str {
         DecodedValue::InlineString(_) | DecodedValue::ShortString(_) => "String",
         DecodedValue::Bytes(_) => "Bytes",
         DecodedValue::Opaque(_) => "Opaque",
-        DecodedValue::NativeType(_) => "Type",
-        DecodedValue::DeclaredType(_) | DecodedValue::SymbolicType(_) => "Type",
+        DecodedValue::NativeType(_) | DecodedValue::SolvedType(_) => "Type",
         DecodedValue::Array(_) => "Array",
         DecodedValue::Tuple(_) => "Tuple",
         DecodedValue::Tagged(_) => "Tagged",
         DecodedValue::Dict(_) => "Dict",
         DecodedValue::Func(_) => "Func",
-        DecodedValue::FuncRef(_) => "Func",
         DecodedValue::Dyn(_) => "Dyn",
-        DecodedValue::Module(_) => "Module",
-        DecodedValue::TypeSlot(_) => "internal up-link",
     }
 }
 
@@ -468,8 +464,7 @@ fn out_of_range_error(
     function: &BytecodeFunction,
     pc: usize,
 ) -> RuntimeError {
-    // Equivalent to allocating the two-subject Tuple and three-field BlameError
-    // produced by fail!("OutOfRange", receiver, index).
+    // Use the same diagnostic budget as fail!("OutOfRange", receiver, index).
     let bytes = logical_value_bytes(5)
         .and_then(|bytes| {
             bytes
@@ -494,8 +489,7 @@ fn non_finite_float_error(
     function: &BytecodeFunction,
     pc: usize,
 ) -> RuntimeError {
-    // Equivalent to allocating the two-subject Tuple and three-field BlameError
-    // produced by fail!("NonFiniteFloat", left, right).
+    // Use the same diagnostic budget as fail!("NonFiniteFloat", left, right).
     let bytes = logical_value_bytes(5)
         .and_then(|bytes| {
             bytes
@@ -603,4 +597,3 @@ fn error(
         propagated_failure: None,
     }
 }
-

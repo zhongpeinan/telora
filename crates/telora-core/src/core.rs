@@ -1,6 +1,6 @@
 use crate::value::{
     CoreArrayFunction, CoreCodecFunction, CoreDictFunction, CoreDynFunction, CoreEqFunction,
-    CoreHashFunction, CoreJsonFunction, CoreModelFunction, CorePathFunction, CoreResultFunction,
+    CoreHashFunction, CoreJsonFunction, CorePathFunction,
     CoreStringFunction, CoreTypeDescFunction, NativeFunction,
 };
 
@@ -11,6 +11,16 @@ pub(crate) const DICT_MODULE: &str = "std/dict";
 pub(crate) const EXEC_MODULE: &str = "std/rt-types/exec";
 pub(crate) const ARGV_MODULE: &str = "std/argv";
 pub(crate) const CODEC_MODULE: &str = "std/codec";
+pub(crate) const BLAME_MODULE: &str = "std/blame";
+pub(crate) fn blame_native_type() -> crate::NativeType {
+    crate::NativeType::bind(
+        crate::value::NativeTypeId {
+            module: crate::value::NativeModuleId(34),
+            local: 0,
+        },
+        "std/blame#BlameError",
+    )
+}
 pub(crate) const OPTION_MODULE: &str = "std/option";
 pub(crate) const RESULT_MODULE: &str = "std/result";
 pub(crate) const JSON_MODULE: &str = "std/json";
@@ -53,6 +63,37 @@ pub(crate) struct BuiltinModuleSpec {
 pub(crate) fn module_specs() -> Vec<BuiltinModuleSpec> {
     let mut specs = vec![
         BuiltinModuleSpec {
+            native_id: 33,
+            name: "std/test",
+            source: include_str!("../modules/std/test.telora"),
+            functions: vec![
+                (
+                    "should_ok",
+                    NativeFunction::new_with_native_type("std/test.should_ok", 1, 0, |cx| {
+                        cx.make_test(crate::test_protocol::TestKind::ShouldOk)
+                    }),
+                ),
+                (
+                    "should_fail",
+                    NativeFunction::new_with_native_type("std/test.should_fail", 1, 0, |cx| {
+                        cx.make_test(crate::test_protocol::TestKind::ShouldFail)
+                    }),
+                ),
+                (
+                    "should_fail_with",
+                    NativeFunction::new_with_native_type("std/test.should_fail_with", 2, 0, |cx| {
+                        cx.make_test(crate::test_protocol::TestKind::ShouldFailWith)
+                    }),
+                ),
+                (
+                    "with_fixtures",
+                    NativeFunction::new_with_native_type("std/test.with_fixtures", 2, 0, |cx| {
+                        cx.make_test(crate::test_protocol::TestKind::Fixtures)
+                    }),
+                ),
+            ],
+        },
+        BuiltinModuleSpec {
             native_id: 4,
             name: PRIVATE_CODEC_MODULE,
             source: include_str!("../modules/std/_codec.telora"),
@@ -87,50 +128,13 @@ pub(crate) fn module_specs() -> Vec<BuiltinModuleSpec> {
                         crate::value::CoreRuntimeFunction::CallWithDiagnostics,
                     ),
                 ),
-                (
-                    "state_type",
-                    NativeFunction::new("std/_rt.state_type", 1, crate::types::native_value_type),
-                ),
             ],
         },
         BuiltinModuleSpec {
             native_id: 25,
             name: TYPE_PROPERTY_MODULE,
             source: include_str!("../modules/std/type-property.telora"),
-            functions: vec![
-                (
-                    "get_type_prop",
-                    NativeFunction::new(
-                        "std/type-property.get_type_prop",
-                        2,
-                        crate::property::native_get_type,
-                    ),
-                ),
-                (
-                    "get_field_prop",
-                    NativeFunction::new(
-                        "std/type-property.get_field_prop",
-                        3,
-                        crate::property::native_get_field,
-                    ),
-                ),
-                (
-                    "get_variant_prop",
-                    NativeFunction::new(
-                        "std/type-property.get_variant_prop",
-                        3,
-                        crate::property::native_get_variant,
-                    ),
-                ),
-                (
-                    "evidence",
-                    NativeFunction::new(
-                        "std/type-property.evidence",
-                        3,
-                        crate::property::native_evidence,
-                    ),
-                ),
-            ],
+            functions: vec![],
         },
         BuiltinModuleSpec {
             native_id: 23,
@@ -172,19 +176,19 @@ pub(crate) fn module_specs() -> Vec<BuiltinModuleSpec> {
                     "check_bytes",
                     NativeFunction::core_dyn(CoreDynFunction::CheckBytes),
                 ),
-                ("field", NativeFunction::core_dyn(CoreDynFunction::Field)),
-                ("fields", NativeFunction::core_dyn(CoreDynFunction::Fields)),
+                ("field_raw", NativeFunction::core_dyn(CoreDynFunction::Field)),
+                ("fields_raw", NativeFunction::core_dyn(CoreDynFunction::Fields)),
                 (
-                    "array_items",
+                    "array_items_raw",
                     NativeFunction::core_dyn(CoreDynFunction::ArrayItems),
                 ),
                 (
-                    "tuple_items",
+                    "tuple_items_raw",
                     NativeFunction::core_dyn(CoreDynFunction::TupleItems),
                 ),
-                ("tag", NativeFunction::core_dyn(CoreDynFunction::Tag)),
+                ("tag_raw", NativeFunction::core_dyn(CoreDynFunction::Tag)),
                 (
-                    "payload",
+                    "payload_raw",
                     NativeFunction::core_dyn(CoreDynFunction::Payload),
                 ),
                 (
@@ -223,7 +227,7 @@ pub(crate) fn module_specs() -> Vec<BuiltinModuleSpec> {
                     NativeFunction::core_type_desc(CoreTypeDescFunction::OpaqueName),
                 ),
                 (
-                    "resolve",
+                    "resolve_raw",
                     NativeFunction::core_type_desc(CoreTypeDescFunction::Resolve),
                 ),
                 (
@@ -354,7 +358,7 @@ pub(crate) fn module_specs() -> Vec<BuiltinModuleSpec> {
                 ),
                 (
                     "parse_with",
-                    NativeFunction::new("std/string.parse_with", 3, crate::regex::native_parse),
+                    NativeFunction::core_string(CoreStringFunction::Parse),
                 ),
             ],
         },
@@ -397,6 +401,12 @@ pub(crate) fn module_specs() -> Vec<BuiltinModuleSpec> {
             )],
         },
         BuiltinModuleSpec {
+            native_id: 34,
+            name: BLAME_MODULE,
+            source: include_str!("../modules/std/blame.telora"),
+            functions: vec![],
+        },
+        BuiltinModuleSpec {
             native_id: 13,
             name: CODEC_MODULE,
             source: include_str!("../modules/std/codec.telora"),
@@ -421,10 +431,7 @@ pub(crate) fn module_specs() -> Vec<BuiltinModuleSpec> {
             native_id: 15,
             name: RESULT_MODULE,
             source: include_str!("../modules/std/result.telora"),
-            functions: vec![(
-                "unwrap",
-                NativeFunction::core_result(CoreResultFunction::Unwrap),
-            )],
+            functions: vec![],
         },
         BuiltinModuleSpec {
             native_id: 16,
@@ -492,10 +499,6 @@ pub(crate) fn module_specs() -> Vec<BuiltinModuleSpec> {
                     NativeFunction::core_json(CoreJsonFunction::Parse),
                 ),
                 (
-                    "decode_with",
-                    NativeFunction::core_json(CoreJsonFunction::Decode),
-                ),
-                (
                     "schema_with",
                     NativeFunction::core_json(CoreJsonFunction::Schema),
                 ),
@@ -513,16 +516,7 @@ pub(crate) fn module_specs() -> Vec<BuiltinModuleSpec> {
             native_id: 18,
             name: PRELUDE_MODULE,
             source: include_str!("../modules/std/prelude.telora"),
-            functions: vec![
-                (
-                    "union",
-                    NativeFunction::core_model(CoreModelFunction::Union),
-                ),
-                (
-                    "validate",
-                    NativeFunction::new("validate", 2, crate::types::native_validate),
-                ),
-            ],
+            functions: vec![],
         },
         BuiltinModuleSpec {
             native_id: 19,
@@ -595,15 +589,6 @@ pub(crate) fn module_specs() -> Vec<BuiltinModuleSpec> {
                     ),
                 ),
                 (
-                    "from_atom",
-                    NativeFunction::new_with_native_type(
-                        "std/fmt.from_atom",
-                        1,
-                        1,
-                        crate::fmt::native_from_atom,
-                    ),
-                ),
-                (
                     "concat",
                     NativeFunction::new_with_native_type(
                         "std/fmt.concat",
@@ -637,6 +622,7 @@ pub(crate) fn module_specs() -> Vec<BuiltinModuleSpec> {
         TYPE_PROPERTY_MODULE => 0,
         PRIVATE_CODEC_MODULE => 1,
         VALUE_MODULE => 1,
+        BLAME_MODULE => 1,
         EQ_MODULE => 2,
         DYN_MODULE => 3,
         TYPE_DESC_MODULE => 4,
