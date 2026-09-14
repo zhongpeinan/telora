@@ -10,6 +10,8 @@ mod diagnostics;
 mod definitions;
 mod alias_cycles;
 mod family_cycles;
+mod instance_convergence;
+mod instance_patterns;
 mod evidence;
 mod instances;
 mod layouts;
@@ -122,6 +124,10 @@ struct Solver<'a> {
     pending_blocks: Vec<bool>,
     /// Instance slots still waiting for their source constructor evidence.
     pending_instances: BTreeSet<TypeSlotId>,
+    /// Results of type-position calls have a producer, not a free value hole.
+    type_results: Vec<TypeSlotId>,
+    nonconvergent_instances: BTreeSet<SymbolId>,
+    nonconvergent_evidence: BTreeSet<(TypeId, TypeId)>,
     value_spreads: Vec<bool>,
     administrative: Vec<bool>,
     scheme_references: Vec<bool>,
@@ -280,6 +286,9 @@ impl Solver<'_> {
             return_slots: vec![None; mir.hir.len()],
             pending_blocks: vec![false; mir.hir.len()],
             pending_instances: BTreeSet::new(),
+            type_results: vec![],
+            nonconvergent_instances: BTreeSet::new(),
+            nonconvergent_evidence: BTreeSet::new(),
             administrative: vec![false; mir.hir.len()],
             scheme_references: vec![false; mir.hir.len()],
             type_uses: vec![false; mir.hir.len()],
@@ -680,7 +689,13 @@ impl Solver<'_> {
                         | BindingKind::NativeType
                 ) {
                     if let Some(value) = self.child(node, Role::Value) {
-                        self.fit(node, node.ty(), value.ty());
+                        if *kind == BindingKind::Type {
+                            // A type declaration names its initializer's identity;
+                            // it is not a value conversion waiting in the Fit queue.
+                            self.same(node, value.ty());
+                        } else {
+                            self.fit(node, node.ty(), value.ty());
+                        }
                     }
                 }
                 self.annotation(node);
@@ -753,6 +768,11 @@ impl Solver<'_> {
                 self.assign(node, TypeConstructor::Function, args);
             }
             HirKind::Call => {
+                if self.type_uses[node.index()] {
+                    let result = self.fresh();
+                    self.assign(node, TypeConstructor::Meta, vec![result]);
+                    self.type_results.push(result);
+                }
                 let callee = self.child(node, Role::Callee).unwrap();
                 let args = self
                     .children(node, Role::Argument)

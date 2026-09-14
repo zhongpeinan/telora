@@ -7,6 +7,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 mod wasm;
 mod backend_surface;
+mod usage;
+mod declaration_shapes;
 
 fn fixture() -> PathBuf {
     let unique = SystemTime::now()

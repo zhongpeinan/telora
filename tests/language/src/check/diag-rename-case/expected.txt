@@ -1,1 +1,1 @@
-cannot unify String with RenameCase
+type mismatch between RenameCase and String
