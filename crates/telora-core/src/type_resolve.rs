@@ -24,6 +24,8 @@ mod generalization;
 mod metadata_joins;
 mod properties;
 mod construction_origins;
+mod contracts;
+mod contract_sources;
 mod interpreters;
 mod type_facets;
 mod patterns;
@@ -43,9 +45,10 @@ enum Task {
     RecordSpread { node: HirId },
     StructUpdate { node: HirId, left: TypeSlotId, right: TypeSlotId },
     FieldProjection { node: HirId, receiver: TypeSlotId },
-    ShapeEqual { left: TypeSlotId, right: TypeSlotId, location: Option<Location> },
+    ShapeEqual { left: TypeSlotId, right: TypeSlotId, location: Option<Location>, origin: Option<HirId> },
     Unchecked { node: HirId, argument: TypeSlotId },
     RefineInstance {
+        origin: Option<HirId>,
         source: TypeSlotId,
         target: TypeSlotId,
         arguments: Vec<(SymbolId, TypeSlotId)>,
@@ -62,6 +65,7 @@ enum Task {
         input: TypeSlotId,
     },
     Instantiate {
+        origin: Option<HirId>,
         source: TypeSlotId,
         target: TypeSlotId,
         arguments: Vec<(SymbolId, TypeSlotId)>,
@@ -95,6 +99,7 @@ enum Task {
         node: HirId,
         expected: TypeSlotId,
         actual: TypeSlotId,
+        contract: Option<HirId>,
     },
     Tuple {
         node: HirId,
@@ -117,6 +122,14 @@ enum Task {
 struct Solver<'a> {
     mir: &'a mut Mir,
     revision: usize,
+    constraint_origin: Option<HirId>,
+    constraint_contract: Option<HirId>,
+    /// Expected contracts attached to syntax uses, never canonical type roots.
+    contract_uses: Vec<Vec<HirId>>,
+    annotation_sources: Vec<Option<HirId>>,
+    /// Skeletons established from declarations before any value evidence.
+    /// Kept on union representatives; inferred structures are not contracts.
+    contract_slots: Vec<bool>,
     tasks: Vec<Task>,
     nominal_index: Vec<Option<usize>>,
     nominal_owner: Vec<Option<SymbolId>>,
@@ -163,7 +176,6 @@ pub fn resolve(mir: &mut Mir) {
     }
     solver.prepare_definitions();
     solver.prepare_type_uses();
-    solver.prepare_properties();
     solver.prepare_generalization();
     for index in 0..solver.mir.symbols.len() {
         let slot = solver.mir.symbol_types[index];
@@ -204,8 +216,10 @@ pub fn resolve(mir: &mut Mir) {
         }
     }
     solver.reject_alias_cycles();
+    let generated = solver.solve_contracts();
+    solver.prepare_properties();
     for index in 0..solver.mir.hir.len() {
-        solver.generate(HirId(index as u32));
+        if !generated[index] { solver.generate(HirId(index as u32)); }
     }
     loop {
         let revision = solver.revision;
@@ -263,6 +277,7 @@ pub fn resolve(mir: &mut Mir) {
             solver.mir.generic_references[index] = Some(GenericReference::Scheme { symbol, scheme });
         }
     }
+    solver.mir.build_declaration_contracts();
     solver.mir.types_solved = true;
 }
 
@@ -298,8 +313,13 @@ impl Solver<'_> {
             bottom_candidates: vec![],
             generalizations: vec![],
             value_slots: vec![false; mir.hir.len()],
-            mir,
+            contract_slots: vec![false; mir.hir.len()],
             revision: 0,
+            constraint_origin: None,
+            constraint_contract: None,
+            contract_uses: vec![vec![]; mir.hir.len()],
+            annotation_sources: Self::annotation_sources(mir),
+            mir,
             tasks: vec![],
         }
     }
@@ -335,11 +355,14 @@ impl Solver<'_> {
             .unwrap_or_else(|| {
                 let id = TypeConflictId(self.mir.type_conflicts.len() as u32);
                 self.mir.type_conflicts.push(TypeConflict {
+                    origin: None,
+                    contracts: vec![],
                     left: slot,
                     right: slot,
                     location: None,
                     message: format!("inherited resolve failure {origin:?}"),
                     resolve_origin: Some(origin),
+                    diagnostic: None,
                 });
                 id
             });
@@ -347,6 +370,11 @@ impl Solver<'_> {
         self.mir.ty_slots[root.index()] = TypeState::Conflicted(id);
     }
     fn generate(&mut self, node: HirId) {
+        let previous = self.constraint_origin.replace(node);
+        self.generate_inner(node);
+        self.constraint_origin = previous;
+    }
+    fn generate_inner(&mut self, node: HirId) {
         if self.administrative[node.index()] {
             return;
         }
@@ -872,6 +900,31 @@ impl Solver<'_> {
         }
     }
     fn solve_task(&mut self, task: Task) -> Option<Task> {
+        let contract = match &task { Task::Fit { contract, .. } => *contract, _ => None };
+        let origin = match &task {
+            Task::Interpreter { node, .. } | Task::TypeFacet { node, .. }
+            | Task::ValueEqual { node, .. } | Task::Ordered { node, .. }
+            | Task::Reference { node, .. } | Task::TypeApply { node }
+            | Task::Propagate { node } | Task::TupleSpread { node }
+            | Task::RecordSpread { node } | Task::StructUpdate { node, .. }
+            | Task::FieldProjection { node, .. } | Task::Unchecked { node, .. }
+            | Task::BoundContext { node, .. } | Task::DiagnosticInput { node, .. }
+            | Task::Call { node, .. } | Task::Join { node, .. } | Task::Block { node, .. }
+            | Task::Projection { node, .. } | Task::ConstructorPattern { node, .. }
+            | Task::Fit { node, .. } | Task::Tuple { node, .. } | Task::Member { node, .. }
+            | Task::Not { node, .. } | Task::Numeric { node, .. } => Some(*node),
+            Task::PropagationBottom { body, .. } => Some(*body),
+            Task::ShapeEqual { origin, .. } | Task::Instantiate { origin, .. }
+            | Task::RefineInstance { origin, .. } => *origin,
+        };
+        let previous = std::mem::replace(&mut self.constraint_origin, origin);
+        let previous_contract = std::mem::replace(&mut self.constraint_contract, contract);
+        let result = self.solve_task_inner(task);
+        self.constraint_origin = previous;
+        self.constraint_contract = previous_contract;
+        result
+    }
+    fn solve_task_inner(&mut self, task: Task) -> Option<Task> {
         let task = match self.solve_constraint(task) {
             Ok(done) => return done,
             Err(task) => task,

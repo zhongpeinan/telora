@@ -4,7 +4,7 @@ use super::*;
 fn native_value_shapes_are_diagnosed_before_codegen_and_enforced_by_seal() {
     let mut mir = graph(&[(
         "@src/main",
-        "native value: Int; export { value }; export def independent = 42;",
+        "native value: Int; export { value }; export def independent: Int = 42;",
     )]);
     resolve(&mut mir);
     assert!(
@@ -29,7 +29,7 @@ fn conflicts_render_both_type_shapes_before_poisoning_the_slots() {
         r#"
         def values: Array(Int) = [1];
         export def bad: Bool = values;
-        export def independent = 42;
+        export def independent: Int = 42;
     "#,
     )]);
     resolve(&mut mir);
@@ -99,7 +99,7 @@ fn call_arity_diagnostics_use_the_solved_signature() {
             "call expects 0 arguments, found 1",
         ),
     ] {
-        let source = format!("{source} export def independent = 42;");
+        let source = format!("{source} export def independent: Int = 42;");
         let mut mir = graph(&[("@src/main", &source)]);
         resolve(&mut mir);
         assert!(
@@ -125,7 +125,7 @@ fn list_type_constructors_reject_variadic_and_non_list_arguments() {
         ("Func([Int])", "expected 2 arguments, got 1"),
         ("Func([Int], String, Bool)", "expected 2 arguments, got 3"),
     ] {
-        let source = format!("type Invalid = {expression}; export def independent = 42;");
+        let source = format!("type Invalid = {expression}; export def independent: Int = 42;");
         let mut mir = graph(&[("@src/main", &source)]);
         resolve(&mut mir);
         assert!(
@@ -199,7 +199,10 @@ fn syntax_recovery_keeps_independent_type_conflicts_without_a_fake_result_obliga
     crate::symbol_resolve::resolve(&mut mir);
     resolve(&mut mir);
     assert!(matches!(symbol_type(&mir, "healthy"), TypeState::Known(_)));
-    assert!(matches!(symbol_type(&mir, "bad"), TypeState::Conflicted(_)));
+    assert!(matches!(symbol_type(&mir, "bad"), TypeState::Known(_)));
+    let bad = mir.symbols.iter().find(|symbol| symbol.name == "bad"
+        && matches!(symbol.kind, SymbolKind::Declaration(_))).unwrap().declarations[0];
+    assert_eq!(mir.type_conflicts_in(bad).len(), 1, "failed use must remain queryable");
     assert!(
         mir.diagnostics
             .iter()
@@ -223,19 +226,20 @@ fn retains_independent_conflicts_and_does_not_poison_intrinsic_types() {
     "#,
     )]);
     resolve(&mut mir);
-    assert!(matches!(
-        symbol_type(&mir, "first"),
-        TypeState::Conflicted(_)
-    ));
-    assert!(matches!(
-        symbol_type(&mir, "second"),
-        TypeState::Conflicted(_)
-    ));
+    for (name, constructor) in [("first", TypeConstructor::Int), ("second", TypeConstructor::String)] {
+        let TypeState::Known(ty) = symbol_type(&mir, name) else { panic!("contract must survive"); };
+        assert_eq!(mir.types[ty.index()].constructor, constructor);
+        let declaration = mir.symbols.iter().find(|symbol| symbol.name == name
+            && matches!(symbol.kind, SymbolKind::Declaration(_))).unwrap().declarations[0];
+        assert_eq!(mir.type_conflicts_in(declaration).len(), 1);
+    }
     assert_eq!(mir.type_conflicts.len(), 2, "{}", mir.dump());
     let TypeState::Known(good) = symbol_type(&mir, "good") else {
         panic!("{}", mir.dump());
     };
     assert_eq!(mir.types[good.index()].constructor, TypeConstructor::Int);
+    mir.diagnostics.clear();
+    assert!(mir.seal().is_err(), "failed obligations survive removal of diagnostic text");
 }
 
 #[test]
@@ -243,15 +247,16 @@ fn unresolved_imports_are_inherited_without_new_type_diagnostics() {
     let mut mir = graph(&[
         (
             "@src/main",
-            "import \"@src/other\" {missing}; export def bad = missing; export def good = 42;",
+            "import \"@src/other\" {missing}; export def bad: Int = missing; export def good: Int = 42;",
         ),
-        ("@src/other", "export def present = 1;"),
+        ("@src/other", "export def present: Int = 1;"),
     ]);
     let references = mir.resolve_slots.clone();
     let diagnostics = mir.diagnostics.len();
     resolve(&mut mir);
     assert_eq!(references, mir.resolve_slots);
-    assert!(matches!(symbol_type(&mir, "bad"), TypeState::Conflicted(_)));
+    let TypeState::Known(bad) = symbol_type(&mir, "bad") else { panic!("{}", mir.dump()); };
+    assert_eq!(mir.types[bad.index()].constructor, TypeConstructor::Int);
     assert!(
         mir.type_conflicts
             .iter()
@@ -266,23 +271,20 @@ fn unresolved_imports_are_inherited_without_new_type_diagnostics() {
 fn unresolved_symbols_remain_authoritative_while_other_slots_are_solved() {
     let mut mir = graph(&[(
         "@src/main",
-        "def missing = absent; def dependent = [missing.item]; export def good = 1;",
+        "type Item = struct {item: Int}; def missing: Item = absent; def dependent: Array(Int) = [missing.item]; export def good: Int = 1;",
     )]);
     let references = mir.resolve_slots.clone();
     let diagnostics = mir.diagnostics.len();
     resolve(&mut mir);
     assert_eq!(references, mir.resolve_slots);
-    let TypeState::Conflicted(failure) = symbol_type(&mir, "missing") else {
-        panic!("{}", mir.dump());
-    };
-    assert!(matches!(
-        mir.type_conflicts[failure.index()].resolve_origin,
-        Some(ResolveFailure::Reference(_))
-    ));
-    assert_eq!(
-        symbol_type(&mir, "dependent"),
-        TypeState::Conflicted(failure)
-    );
+    assert!(matches!(symbol_type(&mir, "missing"), TypeState::Known(_)));
+    assert!(matches!(symbol_type(&mir, "dependent"), TypeState::Known(_)));
+    assert!(mir.type_conflicts.iter().any(|failure|
+        matches!(failure.resolve_origin, Some(ResolveFailure::Reference(_)))));
+    let unresolved = mir.hir.iter().enumerate().find(|(_, node)|
+        matches!(&node.kind, HirKind::Variable(name) if name == "absent")).unwrap().0;
+    assert!(matches!(mir.ty_slots[unresolved], TypeState::Conflicted(_)),
+        "the unresolved expression keeps the inherited failure, while declarations keep their contracts");
     assert!(matches!(symbol_type(&mir, "good"), TypeState::Known(_)));
     assert_eq!(
         mir.diagnostics.len(),

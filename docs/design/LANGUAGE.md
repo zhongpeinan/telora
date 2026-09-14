@@ -70,7 +70,7 @@ BuildState.Ready           # BuildState 的无 payload variant
 enum variant 首先是类型域身份，import/re-export 只为身份提供名字。在值表达式中
 使用时，variant 如 literal 一样在当前位置物化：无载荷成员产生 enum 值，有载荷
 成员产生构造器函数值。`let a = True` 的值来源精确落在 True，不追溯到 prelude；
-`let b = a` 则保留 a 的来源。普通 `def disabled = False` 创建的是值，导入或重导出
+`let b = a` 则保留 a 的来源。普通 `def disabled: Bool = False` 创建的是值，导入或重导出
 disabled 不会在读取处重新物化。以上规则由 resolve 后的身份决定，不按名字识别。
 
 有载荷构造器被调用后，enum 外层值继承构造器物化位置，payload 保留自己的来源。
@@ -263,7 +263,7 @@ pairs 保留元素类型 A，merge 的两个输入共享 A，同名键由右侧�
 ```telora
 type State = struct {count: Int, label: String};
 type Label = struct {label: String};
-def update = fn(base: State, label: Label) {
+def update: Fn(State, Label) -> State = fn(base, label) {
     base <~ label <~ {count: 2, ...label}
 };
 ```
@@ -514,11 +514,19 @@ def add: Fn(Int, Int) -> Int = fn(left, right) {
 函数是一等不可变值，可以捕获词法环境。参数和返回值可以显式标注；调用 arity 是
 静态和运行时契约的一部分。尾位置的函数调用支持 proper tail call。
 
-模块级 `def` 按依赖 component 分析。无环 definition 可以按依赖顺序推断和泛化；
-递归及相互递归 definition 在没有显式泛型契约时保持单态，并通过固定点约束获得
-可证明的函数形状。
+模块顶层的每个普通 `def` 都必须有显式完整类型，无论私有还是导出。完整契约不能
+包含推导 hole，也不能由 initializer 或调用者补齐；显式绑定的 `for(T)` 参数不属于
+hole。配对的 `decl name: Type; def name = ...;` 使用 decl 的签名。仅给 fn 内部参数
+加注解不替代绑定签名。导出列表不改变要求，直接重导出使用原声明契约。
+
+所有契约先在同一张 MIR 图中建立，再加入值证据。函数体和调用不满足契约时记录
+失败约束，保留契约骨架和健康类型；错误 session 不能 seal 或执行。局部声明仍允许
+推导；局部闭包可泛化，递归及相互递归定义在没有显式泛型契约时保持单态。
 
 单个 binding 的 alias 只实例化其右侧泛型一次。它不会自动获得任意 let-polymorphism。
+例如局部 `let identity = identity;` 遮蔽模板声明后，后续调用共享同一组类型实参槽；
+可以由局部使用补齐，但 seal 前必须确定。需要多个实例时直接引用模板，或声明显式
+`for(...)` 契约的模板绑定；不能在已物化的普通 alias 上重新选择类型实参。
 
 泛型函数模板属于静态声明，不是运行时值。导出但未实例化的模板可以保留其绑定
 类型参数并接受契约检查，不要求凭空选择具体类型。进入求值路径的函数引用必须
@@ -614,8 +622,13 @@ fact；定义是否合法以严格检查的结果为准。
 
 未标注、由 closure 字面量初始化的合格局部 binding 可以得到保守 rank-1 scheme。
 Generalization 保留尚未解决的 callable 和数值 obligation；递归组、不稳定约束以及
-普通 alias 不会被无条件泛化。跨模块导出的 scheme 会在每个合法使用点重新实例化，
-且其私有 bound identity 不泄漏到导入方。
+普通值 alias 不会产生新的隐式 scheme。跨模块导出的模板声明在每个值域引用处独立
+实例化，且其私有 bound identity 不泄漏到导入方。
+
+局部 `let foo = foo;` 的右侧若引用模板声明，只产生一次实例化；左侧绑定的是函数值。
+后续作用域中的 foo 引用共享该实例，可以继续为其补齐类型实参，但不能各自选择不同
+实例。所有实参必须在可执行 MIR seal 前闭合。真正的 import/reexport 传递声明身份，
+不等同于普通值 alias。
 
 ### 6.4 静态 Trait 与约束
 
@@ -740,7 +753,7 @@ Array，`result` 是单个 TypeMetadata。`std/type-desc` 和 `std/dyn` 对函�
 type Window = struct { limit: Int, offset: Int };
 
 def first: Window = { limit: 10, offset: 0 };
-def next = first <~ { offset: 10 };
+def next: Window = first <~ { offset: 10 };
 ```
 
 `next` 保留 limit，更新后的整个 Window 再接受校验；`first <~ { limit: 0 }` 会被拒绝。
@@ -1020,7 +1033,7 @@ export {LocalPlan as Plan};
 alias 只供下游 import 和 Module member resolution 使用。
 
 `export def` 和 `export type` 是普通 module binding 后接 export marker
-的语法糖。例如 `export def f = value;` 与 `def f = value; export {f};` 具有相同
+的语法糖。例如 `export def f: T = value;` 与 `def f: T = value; export {f};` 具有相同
 语义。本地 `f` 由 `def` 建立；export marker 不建立 lexical binding、不执行用户代码，
 只选择要发布的 local binding。
 
@@ -1080,7 +1093,7 @@ production catalog。枚举顺序确定，符号链接（包括 tests 根）被�
 Production module 使用显式命名导出：
 
 ```telora
-export def version = 1;
+export def version: Int = 1;
 export def compile: Fn(Input) -> Option(Output) = fn(input) { ... };
 export { User, compile };
 ```
@@ -1403,7 +1416,7 @@ alias 或 typed boundary function：
 ```telora
 type Rejection = RejectionPayload(Entity, Dimension, Intent, Expr, Plan, Sql);
 
-def encode_rejection = fn(value: Rejection) {
+def encode_rejection: Fn(Rejection) -> Value = fn(value) {
     codec.encode(Value.type, value)
 };
 
@@ -1566,6 +1579,29 @@ JSONL：先按稳定顺序输出
 ID、dependency 数量和 `ok` 或 `error` status。Warning 本身不阻止成功；失败不伪造
 Module value，并以非零退出。普通 stderr 只用于 CLI/Host 故障，`dbg!` 仍是独立旁路。
 
+静态 `diagnostic` record 的 `module` 是 primary 来源所属的规范模块 ID；
+`session` 保留本次查询或检查的根选择（例如 `--lib`）。批量检查不会把同一条
+错误复制给每个导入者。没有可归属的源码 primary 时，`module` 回退为本次根选择。
+这一静态归属不代表运行时失败的触发导出项；规则位置与触发求值的根是不同信息。
+显式契约失配时，secondary 的 `type contract declared here` 指向提供期望类型的
+原始注解。该来源随具体使用关系保存；导入和重导出沿用原声明位置，成功的类型槽
+合并不会把错误调用的来源改成某个无关的健康调用。延迟产生类型的表达式也保留
+先前接收的契约来源。
+
+初始化执行期间，Wasm 为诊断事件记录当前调度根的稳定身份。`check` 的对应 record
+带有 `initialization: {node, module, symbol, name}`；具名全局值包含 symbol/name，
+property 等其他需求根用 node/module 标识且 symbol/name 为 null。ID 仅在本次封闭图内
+有意义。共享函数中的规则位置、输入值的来源和触发根分别表达；不能由 primary、
+数据来源或 import 闭包推导触发者。依赖者读取缓存失败时保留原事件，不重复报告或
+改写根身份。初始化之外的运行时诊断不携带初始化根。
+
+`query` 的 definition/export/reference/expression record 中，`state` 表达类型或解析
+结果，`failed_constraints` 列出该语法子树产生的失败类型约束 ID（仅在本次图内有效），
+可与静态 diagnostic record 的 `constraint_ids` 对应。
+例如 `def value: Int = "wrong"` 可以保留 `Known`、`Int`，同时带有失败约束。
+引用不继承被引用声明的所有失败；导出记录查询其原声明。空列表不代表程序或声明合法，
+仍须结合 Unknown、resolve 结果、缺失契约及其他诊断判断，不能据此绕过 seal。
+
 `query` 查询同一普通 Module 管线产生的全面证据图，包括 recoverable CST、部分语义事实和
 诊断求值结果，因此存在错误或求值失败时仍可返回不受影响的事实。`query` 成功只表示查询
 成功，不表示模块健康；恢复节点通过独立 fact state 表达未确定或失败的状态。
@@ -1579,7 +1615,7 @@ Module value，并以非零退出。普通 stderr 只用于 CLI/Host 故障，`d
 import "std/ees" as ees;
 
 def config: entry.ContextConfig = {sources: [], envs: [], args: False};
-export def run = entry.run(State.type, config, ees.none, fn(ctx) {
+export def run: entry.Run(State) = entry.run(State.type, config, ees.none, fn(ctx) {
     let initial: State = ...;
     let reduce: Fn(State, actor.Event) -> actor.Transition(State) = ...;
     (initial, reduce)

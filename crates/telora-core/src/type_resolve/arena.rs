@@ -12,6 +12,7 @@ impl Solver<'_> {
         );
         self.mir.ty_slots.push(TypeState::Unknown);
         self.value_slots.push(false);
+        self.contract_slots.push(false);
         id
     }
     pub(super) fn structure(
@@ -90,13 +91,6 @@ impl Solver<'_> {
         location: Option<Location>,
         message: String,
     ) {
-        let id = TypeConflictId(
-            self.mir
-                .type_conflicts
-                .len()
-                .try_into()
-                .expect("type conflict capacity"),
-        );
         let left = self.find(left);
         let right = self.find(right);
         if matches!(self.mir.ty_slots[left.index()], TypeState::Conflicted(_))
@@ -105,15 +99,36 @@ impl Solver<'_> {
             self.equal(left, right, location);
             return;
         }
+        let id = self.record_conflict(left, right, location, message);
+        for slot in [left, right] {
+            if !self.contract_slots[slot.index()] {
+                self.mir.ty_slots[slot.index()] = TypeState::Conflicted(id);
+            }
+        }
+        self.revision += 1;
+    }
+
+    /// A failed relation does not invalidate either operand's type identity.
+    /// Explicitly invalid inference nodes still use `conflict` above.
+    fn record_conflict(
+        &mut self,
+        left: TypeSlotId,
+        right: TypeSlotId,
+        location: Option<Location>,
+        message: String,
+    ) -> TypeConflictId {
+        let id = TypeConflictId(self.mir.type_conflicts.len().try_into().expect("type conflict capacity"));
+        let contracts = self.failed_contract_sources();
         self.mir.type_conflicts.push(TypeConflict {
+            origin: self.constraint_origin,
+            contracts: contracts.clone(),
             left,
             right,
             location,
             message: message.clone(),
             resolve_origin: None,
+            diagnostic: Some(self.mir.diagnostics.len()),
         });
-        self.mir.ty_slots[left.index()] = TypeState::Conflicted(id);
-        self.mir.ty_slots[right.index()] = TypeState::Conflicted(id);
         if let Some(location) = location {
             self.mir
                 .diagnostics
@@ -126,7 +141,16 @@ impl Solver<'_> {
                 notes: vec![],
             });
         }
-        self.revision += 1;
+        for annotation in contracts {
+            let location = self.mir.hir[annotation.index()].location;
+            let diagnostic = self.mir.diagnostics.last_mut().unwrap();
+            if !diagnostic.labels.iter().any(|label| label.location == location) {
+                diagnostic.labels.push(crate::source::Label {
+                    location, message: "type contract declared here".into(), primary: false,
+                });
+            }
+        }
+        id
     }
     pub(super) fn equal(
         &mut self,
@@ -134,6 +158,8 @@ impl Solver<'_> {
         right: TypeSlotId,
         location: Option<Location>,
     ) {
+        let initial_conflicts = self.mir.type_conflicts.len();
+        let mut structures = vec![];
         let mut queue = VecDeque::from([(left, right)]);
         while let Some((left, right)) = queue.pop_front() {
             let left = self.find(left);
@@ -148,8 +174,14 @@ impl Solver<'_> {
             let b = self.mir.ty_slots[right.index()];
             match (a, b) {
                 (TypeState::Conflicted(id), _) | (_, TypeState::Conflicted(id)) => {
-                    self.mir.ty_slots[left.index()] = TypeState::Conflicted(id);
-                    self.mir.ty_slots[right.index()] = TypeState::ProxyTo(left);
+                    // Inherit the existing failed evidence only into inference
+                    // state. A declaration remains inspectable even when its
+                    // implementation or a consumer already failed.
+                    for slot in [left, right] {
+                        if !self.contract_slots[slot.index()] {
+                            self.mir.ty_slots[slot.index()] = TypeState::Conflicted(id);
+                        }
+                    }
                 }
                 (TypeState::Unknown, _) => {
                     if self.occurs(left, right) {
@@ -180,15 +212,27 @@ impl Solver<'_> {
                         }
                         let message = format!("type mismatch between {} and {}",
                             self.diagnostic_type(left), self.diagnostic_type(right));
-                        self.conflict(left, right, location, message);
+                        self.record_conflict(left, right, location, message);
                     } else {
                         queue.extend(a.arguments.iter().copied().zip(b.arguments.iter().copied()));
-                        self.mir.ty_slots[right.index()] = TypeState::ProxyTo(left);
+                        structures.push((left, right));
                     }
                 }
                 _ => unreachable!("only provisional states exist during solving"),
             }
             self.revision += 1;
+        }
+        // Only equal structures may share a representative. Merging parents
+        // before comparing children erases the actual type on a failed fit.
+        if self.mir.type_conflicts.len() == initial_conflicts {
+            for (left, right) in structures {
+                let left = self.find(left);
+                let right = self.find(right);
+                if left != right {
+                    self.contract_slots[left.index()] |= self.contract_slots[right.index()];
+                    self.mir.ty_slots[right.index()] = TypeState::ProxyTo(left);
+                }
+            }
         }
     }
     pub(super) fn finalize(&mut self) {

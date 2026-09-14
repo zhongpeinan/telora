@@ -35,7 +35,9 @@ impl Solver<'_> {
     fn attach_properties(&mut self, syntax: HirId, owner: TypeSlotId, site: PropertySite) {
         for decorator in self.children(syntax, Role::Decorator) {
             if matches!(self.mir.hir[decorator.index()].kind, HirKind::ConstructionCheck { .. }) {
+                let previous = self.constraint_origin.replace(decorator);
                 self.attach_check(decorator, owner, site);
+                self.constraint_origin = previous;
                 continue;
             }
             let context = match site {
@@ -100,15 +102,13 @@ impl Solver<'_> {
     pub(super) fn finalize_checks(&mut self) {
         let mut described = std::collections::BTreeSet::new();
         for &(owner, site, decorator) in &self.check_declarations {
-            if let TypeState::Conflicted(id) = self.mir.ty_slots[decorator.ty().index()]
-                && described.insert(id) {
+            for id in self.mir.type_conflicts_in(decorator) {
+                if !described.insert(id) { continue; }
                 let conflict = &self.mir.type_conflicts[id.index()];
                 // Preserve the diagnostic emitted with the original evidence.
                 // A failed name resolution already has its own explanation.
                 if conflict.resolve_origin.is_none()
-                    && let Some(diagnostic) = self.mir.diagnostics.iter_mut().find(|diagnostic|
-                        diagnostic.message == conflict.message
-                            && diagnostic.labels.iter().any(|label| Some(label.location) == conflict.location)) {
+                    && let Some(diagnostic) = conflict.diagnostic.and_then(|index| self.mir.diagnostics.get_mut(index)) {
                     diagnostic.message = format!("invalid @check function: {}; expected one construction input and Result((), BlameError)", diagnostic.message);
                     let location = self.mir.hir[decorator.index()].location;
                     if !diagnostic.labels.iter().any(|label| label.location == location) {
