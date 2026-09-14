@@ -1,12 +1,13 @@
-//! Deferred test value protocol shared by native constructors and VM consumers.
+//! Deferred test value protocol shared by the Wasm runtime and fixture Host.
 use crate::SystemDataFormat;
 use std::path::Path;
 
-/// Finite bounds on deferred expansion and host-retained fixture data.
+/// Coarse stopping bounds on deferred expansion and cumulative fixture input.
 #[derive(Clone, Copy, Debug)]
 pub struct TestLimits {
     pub cases: usize,
     pub depth: usize,
+    /// Cumulative source bytes admitted, not a measurement of heap allocation.
     pub fixture_bytes: usize,
 }
 
@@ -43,24 +44,3 @@ pub struct TestContext<'a> {
     pub limits: TestLimits,
     pub module_paths: std::collections::HashMap<String, std::path::PathBuf>,
 }
-
-#[derive(Clone, Debug)]
-pub(crate) struct TestDescription {
-    pub(crate) kind: TestKind,
-    pub(crate) expected: Option<String>,
-    pub(crate) sources: Vec<String>,
-    pub(crate) origin: Option<crate::Loc>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum TestKind {
-    ShouldOk,
-    ShouldFail,
-    ShouldFailWith,
-    Fixtures,
-}
-
-pub(crate) const TEST_NATIVE_TYPE: crate::value::NativeTypeId = crate::value::NativeTypeId {
-    module: crate::value::NativeModuleId(crate::mir::NativeTypeId::TEST.module),
-    local: crate::mir::NativeTypeId::TEST.slot,
-};

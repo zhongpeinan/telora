@@ -84,7 +84,10 @@ pub(crate) fn run(context: PathBuf, name: &str) -> Result<i32, String> {
         let telora_core::mir::ModuleTarget::Bound(module) = mir.roots[0] else {
             unreachable!("sealed root must be resolved");
         };
-        telora_core::codegen::compile_tests(sealed, module)
+        let plan = telora_core::test_plan::TestPlan::from_mir(&sealed, module)?;
+        let session = crate::wasm_cli::compile_tests(sealed)
+            .map_err(|message| vec![crate::wasm_cli::error(message)])?;
+        Ok((session, plan))
     });
     let compiled = match compiled {
         Ok(compiled) => compiled,
@@ -107,41 +110,37 @@ pub(crate) fn run(context: PathBuf, name: &str) -> Result<i32, String> {
         }
     };
     let config = crate::execution_config();
-    let linked =
-        match telora_core::execution_link::link_entry_with_data(compiled.bootstrap, |link| {
-            inventory.read_data(link, config.data_limits.file_size)
-        }) {
-            Ok(linked) => linked,
-            Err(diagnostics) => {
-                return emit_report(
-                    &root,
-                    &mir.sources,
-                    TestReport {
-                        diagnostics,
-                        aborted: true,
-                        ..Default::default()
-                    },
-                    warnings,
-                );
-            }
-        };
+    let (mut session, plan) = compiled;
+    if let Err(diagnostics) =
+        crate::wasm_cli::initialize_diagnostics(&mut session, &inventory, &mut mir.sources)
+    {
+        return emit_report(
+            &root,
+            &mir.sources,
+            TestReport {
+                diagnostics,
+                aborted: true,
+                ..Default::default()
+            },
+            warnings,
+        );
+    }
+    let diagnostics = crate::wasm_cli::check_diagnostics(&session, &mir.sources, Ok(()));
     let mut host = FileTestHost {
         workspace: inventory.workspace().ok_or("test requires a workspace")?,
     };
-    let mut report = telora_core::Vm::new()
-        .with_debug_sink(Arc::new(crate::StderrDebugSink))
-        .test_linked(
-            linked,
-            compiled.plan,
-            config.session_quota,
-            config.data_limits,
-            &mut mir.sources,
-            TestContext {
-                host: Some(&mut host),
-                module_paths: inventory.module_paths(),
-                ..Default::default()
-            },
-        )?;
+    let mut report = crate::wasm_cli::testing::run(
+        session,
+        plan,
+        &mut mir.sources,
+        TestContext {
+            host: Some(&mut host),
+            module_paths: inventory.module_paths(),
+            ..Default::default()
+        },
+        config.data_limits,
+    )?;
+    report.diagnostics.splice(0..0, diagnostics);
     report.diagnostics.splice(0..0, mir.diagnostics);
     emit_report(&root, &mir.sources, report, warnings)
 }
@@ -163,14 +162,8 @@ fn emit_report(
             .iter()
             .map(|label| {
                 let source = sources.get(label.location.source);
-                let start = source
-                    .text()
-                    .position(label.location.start, telora_core::PositionEncoding::Utf8)
-                    .unwrap();
-                let end = source
-                    .text()
-                    .position(label.location.end, telora_core::PositionEncoding::Utf8)
-                    .unwrap();
+                let start = source.utf8_position(label.location.start);
+                let end = source.utf8_position(label.location.end);
                 json!({"source": source.name.as_ref(), "location": {
                 "line": start.line + 1, "column": start.character,
                 "end_line": end.line + 1, "end_column": end.character,

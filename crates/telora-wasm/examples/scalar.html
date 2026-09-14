@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>Telora Wasm 产物执行</title>
+<h1>Telora Wasm 产物执行</h1>
+<p>选择生成的 .wasm 文件，无需源码即可执行。函数入口填写 JSON 参数数组；Eval 入口填写含 args、env、sources 的 JSON 对象。</p>
+<input type="file" accept=".wasm" aria-label="Wasm 文件">
+<textarea aria-label="参数数组" placeholder="留空求值，函数示例：[42]"></textarea>
+<button id="run">执行</button>
+<button id="stop">停止</button>
+<pre role="status"></pre>
+<pre id="diagnostics"></pre>
+<pre id="debug"></pre>
+<script type="module">
+const input = document.querySelector('input');
+const output = document.querySelector('pre');
+const diagnostics = document.querySelector('#diagnostics');
+let worker;
+document.querySelector('#stop').onclick = () => { worker?.terminate(); worker = null; output.textContent = '已停止'; };
+document.querySelector('#run').onclick = async () => {
+  const file = input.files[0];
+  if (!file) return;
+  worker?.terminate();
+  try {
+    const args = document.querySelector('textarea').value.trim();
+    const arguments_ = args ? JSON.parse(args) : null;
+    if (arguments_ !== null && typeof arguments_ !== 'object') throw Error('参数必须是 JSON 数组或 Eval 上下文对象');
+    const active = new Worker('./worker.mjs', { type: 'module' });
+    worker = active;
+    active.onmessage = ({ data }) => {
+      if (worker !== active) return;
+      output.textContent = data.error ?? data.result; active.terminate(); worker = null;
+      document.querySelector('#debug').textContent = (data.debug ?? []).map(event => JSON.stringify(event)).join('\n');
+      diagnostics.textContent = data.diagnostics.map(event => `${event.source}:${event.line ?? event.origin[1]}:${event.column ?? event.origin[2]} ${event.severity}: ${event.message}`).join('\n');
+    };
+    active.onerror = error => {
+      if (worker !== active) return;
+      output.textContent = error.message; active.terminate(); worker = null;
+    };
+    output.textContent = '执行中…';
+    diagnostics.textContent = '';
+    document.querySelector('#debug').textContent = '';
+    const bytes = await file.arrayBuffer();
+    if (worker === active) active.postMessage({ bytes, arguments: arguments_ }, [bytes]);
+  } catch (error) {
+    output.textContent = String(error);
+  }
+};
+</script>
+</html>

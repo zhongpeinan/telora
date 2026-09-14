@@ -67,11 +67,28 @@ BuildState.Ready           # BuildState 的无 payload variant
 
 具名 enum 保留自己的 nominal TypeId。variant 的名称和 payload 由 enum 声明定义。
 
+enum variant 首先是类型域身份，import/re-export 只为身份提供名字。在值表达式中
+使用时，variant 如 literal 一样在当前位置物化：无载荷成员产生 enum 值，有载荷
+成员产生构造器函数值。`let a = True` 的值来源精确落在 True，不追溯到 prelude；
+`let b = a` 则保留 a 的来源。普通 `def disabled = False` 创建的是值，导入或重导出
+disabled 不会在读取处重新物化。以上规则由 resolve 后的身份决定，不按名字识别。
+
+有载荷构造器被调用后，enum 外层值继承构造器物化位置，payload 保留自己的来源。
+例如 `arr |> map\(_, Some)` 的输出外层来源是这里的 Some，内部值来源是各输入元素。
+同一封闭签名和 variant 的构造器具有相同身份，来源位置不参与相等；泛型构造器
+必须在 MIR 中完成类型求解后才能成为运行时值。LSP 仍可按符号引用导航到声明。
+
 普通字符串支持 `\0`、`\n`、`\r`、`\t`、`\"`、`\\`、两位 ASCII `\xNN`、
 Unicode scalar `\u{...}` 和反斜杠换行后的显式续行。反引号字符串使用同一组
 标量转义，但以 `` \` `` 代替 `\"`，并作为结构化连接表达式使用 `\{...}` 嵌入
 表达式。raw String 不处理转义或插值；需要保留大量反斜杠或引号时应增加 `#`
 delimiter，而不是发明新的 escape。
+
+所有字符串字面量中的实际源码换行（LF、CRLF、单独 CR）统一产生 LF，
+包括普通 String、raw String、插值字符串的文本片段以及 Bytes 字面量。
+显式 `\r`、`\x0D`、`\u{D}` 仍产生 CR；规范化发生在文本片段解码时，
+不对转义或插值产生的值再次替换。反斜杠续行接受上述三种源码换行。
+因此源码检出格式不改变多行字符串的值；数据模块仍遵守各自格式的字符串规则。
 
 ```telora
 let greeting = `hello \{name}`;
@@ -106,7 +123,7 @@ property-constrained blanket impl 由此为 `Endpoint` 提供 `Display` evidence
 由常量 String 与字段名 Array 组成。property interpreter
 在发布阶段解析模板、验证字段、把字段名解析为 canonical index，并捕获字段的 Display
 closure。运行期路径只按固定 index 投影并调用已捕获 closure。codec 的 text bridge 通过
-VM continuation 调用同一个 closure，共用当前 quota account；失败的公开 rule 保持调用者
+VM continuation 调用同一个 closure，共用当前 session 的执行边界；失败的公开 rule 保持调用者
 位置，data-src 保持 closure 输入的数据来源。它直接支持
 String、Int、Float 以及嵌套的 `DisplayBy` struct；它不动态调用字段类型上的任意
 显式 `Display` impl。
@@ -161,7 +178,7 @@ let second: Int = ids[1];
 `Array(Result(String, Int))`。不同类型族或冲突的具体参数会报错；缺少证据的参数
 可用 `.ty!(Ty)`、`func@[Ty](...)` 或类型注解补全。
 显式 `Array(T)` expected type 会向每个普通元素和 spread operand 下传 `T`。因此当
-`T` 是 concrete family 实例时，多个匿名记录元素中的 variant 构造、闭包、
+`T` 是 concrete family 实例时，多个记录构造元素中的 variant 构造、闭包、
 Option variant 和空集合都按完整的共同契约检查。
 该检查与元素顺序无关；真正不兼容的字段在对应元素位置报告类型冲突。
 在 `if`、`if let` 或 `match` 的结构化分支结果中，同一 Array 或 Dict 元素位置的具体
@@ -188,7 +205,7 @@ let alias: Unit = value;
 ```
 
 该类型记法适用于 annotation 根、type initializer 根、声明的 member 类型、显式
-类型实参、`ty!` / `cast!` 目标和受限契约（含嵌套参数）。`Array(())` 表示
+类型实参、`ty!` 目标和受限契约（含嵌套参数）。`Array(())` 表示
 空 Tuple 的 Array 类型，`Array(()).type` 才是其元数据。普通函数的实参仍是数据。
 `(Int, String).type` 是 Tuple 类型的元数据，`(Int.type, String.type)` 是元数据
 组成的 Tuple 数据。混合类型和数据的 `(Int, 1)` 非法。类型 Tuple 的 spread 暂不支持。
@@ -206,17 +223,18 @@ Tuple spread 所需的固定长度证据。
 操作数从左到右各求值一次，空 spread 仍求值；元素 Val 的来源和名义身份
 被复制保留，新容器采用整个 Tuple 构造表达式的位置。
 
-Record 字面量与 `Dict(T)` 在运行时都使用 String key 的 Dict 表示，但静态意义不同：
+记录字面量必须由全图上下文确定为具名 Struct 或 `Dict(T)`：
 
 ```telora
-let user = {name: "Ada", active: True};
+type User = struct {name: String, active: Bool};
+let user: User = {name: "Ada", active: True};
 let labels: Dict(String) = {region: "east", tier: "gold"};
 ```
 
-Record 的字段集合属于静态结构；`Dict(T)` 的 key 集合可以动态变化，所有 value 具有
+Struct 的字段集合属于静态结构；`Dict(T)` 的 key 集合可以动态变化，所有 value 具有
 同一静态类型。Dict 的无领域顺序观察和序列化采用规范顺序。
 
-字段投影保留静态证据：已知 Record/Struct 必须声明该字段，`Dict(T)` 的字段结果是
+字段投影保留静态证据：已知 Struct 必须声明该字段，`Dict(T)` 的字段结果是
 T。非记录值和 `Dyn` 会产生静态诊断。
 暂未确定的 receiver 可以在同一个单态推断边界内积累字段 obligation，后续
 具体证据必须满足全部字段；这种 obligation 不会泛化或发布为开放 row constraint。
@@ -319,8 +337,8 @@ exact nominal identity，另一侧的 dict 字面量获得该具名类型上下�
 构造获得同一类型族的参数和 payload 上下文，与操作数顺序无关。上下文沿 Array 元素、Tuple 对应位置、
 dict 字段和值、同 variant 的 payload 递归传播，例如 `[item] == [{value: 42}]`
 中的字段字面量可从 `item` 获得名义类型；不同位置的上下文可分别来自两个操作数。
-传播只作用于当前表达式中的字面量构造（包括 spread 中直接书写的字面量），不为
-已构造的匿名变量或函数返回值重新赋予名义身份。
+构造上下文沿整图槽位传播，包括经局部变量和函数返回值连接的未定构造。
+无标注的声明不会提前冻结一个匿名类型；已确定的具名类型身份不能被更换。
 函数调用通过共享的泛型类型变量传播同样的构造上下文。例如 `for(T) Fn(T, T)`
 和 `for(T) Fn(Array(T), T)` 均可从一个参数获得名义类型证据，为另一个参数中的
 字面量提供上下文；回调的返回值也可提供该证据。不同泛型变量不会因为解析后的
@@ -494,13 +512,20 @@ def add: Fn(Int, Int) -> Int = fn(left, right) {
 ```
 
 函数是一等不可变值，可以捕获词法环境。参数和返回值可以显式标注；调用 arity 是
-静态和运行时契约的一部分。尾位置的 bytecode 函数调用支持 proper tail call。
+静态和运行时契约的一部分。尾位置的函数调用支持 proper tail call。
 
 模块级 `def` 按依赖 component 分析。无环 definition 可以按依赖顺序推断和泛化；
 递归及相互递归 definition 在没有显式泛型契约时保持单态，并通过固定点约束获得
 可证明的函数形状。
 
 单个 binding 的 alias 只实例化其右侧泛型一次。它不会自动获得任意 let-polymorphism。
+
+泛型函数模板属于静态声明，不是运行时值。导出但未实例化的模板可以保留其绑定
+类型参数并接受契约检查，不要求凭空选择具体类型。进入求值路径的函数引用必须
+在全图类型求解期间，通过显式类型实参或上下文确定具体实例；未确定的类型参数
+不能通过重新泛化来成为值，也不能用于值比较。MIR 封闭之后不再补充实例或求解
+类型。例如 `identity@[Int] == identity@[Int]` 的类型身份明确，而缺少其他类型
+证据的 `identity == identity` 必须报告静态错误。
 
 Call section 使用占位符构造 closure，是普通函数的便利表面；显式 `fn` 始终可以表达
 同一计算。
@@ -519,7 +544,10 @@ Type, TypeOf(A), Dyn, opaque native type
 Never
 ```
 
-匿名 Record 按字段结构检查。直接 `struct` / `enum` 类型声明具有声明拥有的名义身份；
+不存在可独立求值的匿名 Record 类型。记录字面量提供字段构造证据，若整图求解
+仍无法确定为具名 Struct 或 `Dict(T)`，静态检查失败。`<~` 右侧的更新字面量和
+投影直接向结果 Struct 提供字段，不形成独立的匿名值。
+直接 `struct` / `enum` 类型声明具有声明拥有的名义身份；
 相同结构的两个声明互不兼容。type alias 不创建新的身份，只保留被引用类型的身份。
 Native opaque type 具有由注册模块和 slot 决定的名义身份，普通用户代码不能伪造其值。
 
@@ -570,7 +598,7 @@ pair@[Int, _](1, "text")
 类型参数从完整调用收集证据；variant 构造的名称确定类型族，同次调用中的其他
 实参可以补全该类型族的参数和 payload 的类型上下文。调用按具名 enum 检查
 variant 及 payload；不相关 enum 或 enum 之外的 variant 是类型错误。
-匿名 Struct 实参同样在完整调用上下文中检查。若 generic callback 的结果确定了共享
+记录构造实参同样在完整调用上下文中检查。若 generic callback 的结果确定了共享
 Struct 类型，较早书写的 seed 中的 variant 构造字段和空 collection 字段按该结果
 检查；例如 fold callback 返回 Bool 时，seed 的 `{flag: False, items: []}` 可
 参与 `{flag: Bool, items: Array(A)}`。若 callback 分支没有共同契约，必须显式提供
@@ -697,6 +725,33 @@ Array，`result` 是单个 TypeMetadata。`std/type-desc` 和 `std/dyn` 对函�
 先完成自身校验，再校验外层候选值。读取、复制、编码和传递已构造的值不重复
 校验。运行时用类型见证实例化泛型函数体内的构造目标，并保留规则与输入来源。
 
+构造校验适合表达值自身的不变量，merge-update 则复用已有合法值的其余字段：
+
+```telora
+@check(fn(window) {
+    if window.limit <= 0 {
+        Err(blame!("limit must be positive", window.limit))
+    } else if window.offset < 0 {
+        Err(blame!("offset must be non-negative", window.offset))
+    } else {
+        Ok(())
+    }
+})
+type Window = struct { limit: Int, offset: Int };
+
+def first: Window = { limit: 10, offset: 0 };
+def next = first <~ { offset: 10 };
+```
+
+`next` 保留 limit，更新后的整个 Window 再接受校验；`first <~ { limit: 0 }` 会被拒绝。
+同时修改互相约束的字段时，应放在同一次更新中，避免要求中间值也满足最终约束。
+需要外部授权、关系图或最终排序信息的规则仍由掌握这些信息的函数检查，不能仅凭
+局部对象的字段完成。校验器返回 `Err(blame!(...))` 可保留具体字段的输入来源。
+
+装饰器名称也遵循普通 resolve 规则。例如 `import "std/type-property" as property;`
+会遮蔽 prelude 的 `property` 函数；需要同时使用时可显式导入
+`import "std/prelude" as prelude;`，并写 `@prelude.property(...)`。
+
 `type A = struct(B);` 声明单元素具名 tuple（newtype），具有独立的 nominal
 identity。`a.0` 返回 B，并保留载荷的类型身份和来源；其他位置索引不成立。
 newtype 和 B 不存在隐式包装或解包转换。其元数据解析后的 kind 为 Newtype，
@@ -747,7 +802,7 @@ type Status = enum {
 
 每个直接声明拥有由 provider module 与声明位置确定的私有身份。不同声明即使字段或
 variant 完全相同，也不是同一个类型；alias、import 和 reexport 则保留原身份。普通
-TypeMetadata 值、codec、schema、`Dyn`、TypeDesc 和工具从同一份权威元数据图工作。
+TypeMetadata 值、codec、`Dyn`、TypeDesc 和工具从同一份权威元数据图工作。
 
 Decorator 只适用于没有类型参数的具名 Struct/Enum 声明及其直接字段/variant。
 Property carrier 本身也必须是具名 Struct/Enum，并用内建 capability 标记：
@@ -901,15 +956,13 @@ memoization 只缓存 lifting 所构造的 wrapper；它不会提前执行 inner
 metadata、解析 eDSL 并产生领域 closure 的准备逻辑仍由普通 tool-stage/property 代码
 显式定义，如 `DisplayBy.display`。
 
-### 7.5 静态约束、checked cast 与 Dyn 投影
+### 7.5 静态约束与 Dyn 投影
 
 以下边界具有不同语义，不能互相替代：
 
 ```telora
 let empty = [].ty!(Array(Int));
 let truth = ty!(True, Bool);
-
-let checked = raw.cast!(User);             // Result(User, String)
 
 import "std/dyn" as dyn;
 let exact = dyn.project_with(User.type, package); // Option(User)
@@ -920,12 +973,6 @@ let exact_sugar = dyn.project@[User](package);
 向 `expr` 内部传递；无法证明时前端报错。它不改变 payload、名义 witness 或来源，
 Dyn 中的值需要显式投影为具体类型。
 
-`cast!(expr, T)` 与 `expr.cast!(T)` 做表示不变的 checked refinement，并返回
-`Result(T, String)`。匿名 Dict 的完整表示符合目标 struct T 时可以安装 T 的 canonical witness；
-已经带有另一个名义 `TypeId` 的值即使结构相同也失败。cast 不解析 String、不做数值
-转换、不解包公共数据 sum、不应用 rename/default/flatten，也不重建业务数据图；这些
-行为属于 codec/translation。失败只返回 `Err(String)`，只有显式 `unwrap!`/`raise!`
-才产生诊断；Fail 输入按统一规则传播。
 
 `Dyn` 精确投影比较打包 descriptor 与目标的 canonical type identity，不走结构比较或
 assignability。`project@[T]` 只对解析到 `std/dyn` namespace 的 `project` 生效，并等价于
@@ -1147,8 +1194,7 @@ let model = codec.decode(Model.type, request).unwrap!();
 let value = codec.encode(Value.type, model);
 ```
 
-`cast!` 只做表示不变的 checked refinement，不移除 Value variant、不解析 String，也
-不应用 rename/default/flatten。`Dyn` 是带 canonical witness 的存在类型，公共数据交换
+`Dyn` 是带 canonical witness 的存在类型，公共数据交换
 使用 `Value`。JSON stringify 只接受 Value，但 JSON
 没有 Bytes 或 temporal scalar，因此含这些 variant 的 Value 必须先由显式领域 codec
 转换为 JSON 可表达的模型。
@@ -1222,7 +1268,7 @@ rule 指向实际 authored intrinsic 调用位置，即使该调用在嵌套函�
 
 所有 contextual intrinsic 都支持统一后置糖：
 `receiver.ident!(arguments...)` 等价于 `ident!(receiver, arguments...)`。
-这不是 method lookup，也不开放用户定义宏。`dbg!`、`ty!` 与 `cast!` 保持各自
+这不是 method lookup，也不开放用户定义宏。`dbg!` 与 `ty!` 保持各自
 既有语义。函数、参数和待处理表达式按普通求值顺序执行一次。
 
 解码使用不可观察的 native `codec.BlameError`，保存消息和失败值的来源。
@@ -1251,7 +1297,10 @@ rt.with_diagnostics:
 ```
 
 `rt.Diagnostic` 是类型化快照，包含 `severity`、`message`、`labels` 和 `notes`。
-每个标签包含 `location`、`message` 和 `primary`；位置记录源码名称以及起止字节偏移。
+每个标签包含 `location`、`message` 和 `primary`；位置记录源码名称以及起止位置。
+`start/end` 是 `(line << 24) | utf8_offset` 编码的 40 bit 整数，
+行号和行内 UTF-8 字节偏移从 0 开始，范围为 `[start,end)`，并非文件绝对字节偏移。
+CRLF、LF、单独 CR 都计作一次换行；面向用户显示时再将行号转换为从 1 开始。
 这些类型和捕获能力限于已有的特权 Entry 边界。
 
 调用成功时返回值和该作用域内产生的 Warning；可恢复 failure 时返回该 failure 以及
@@ -1276,7 +1325,7 @@ value.dbg!("message")
 
 观察使用有界、确定、cycle-safe 的 debug formatter，直接读取 VM 值图。
 其表示独立于 JSON serialization contract。Host sink、格式化、截断或输出
-失败不能改变 Telora 的值、失败、诊断、控制流、fuel、stack 或 allocation account。
+失败不能改变 Telora 的值、失败、诊断、控制流或执行终止边界。
 Float 的 debug 表示与 Rust `f64` 的 `{:?}` 一致且不受 locale 影响；它与 Display
 表示有意区分，例如 `3.0` 和 `-0.0` 的 debug 表示分别保留为 `3.0` 和 `-0.0`。
 
@@ -1298,76 +1347,46 @@ Warning 和 failure 诊断属于 evaluation account，而不是普通 Array 返�
 展示 Warning。`warn!` 与 `ok_or_warn!` 产生非阻塞 Warning；`raise!`、
 `unwrap!` 和 `fail!` 使当前结果不可产生。
 
-严格求值和 best-effort 求值使用相同的 rule 与 data sources。Fail 进入 failure arena
-之后，所有依赖传播都引用同一个 root failure；传播点不得生成替代诊断，也不得改写
-原 rule、data sources 或其顺序。
+失败传播保留原始 rule、data sources 及其顺序，不生成替代诊断。
 
-在 best-effort 求值中，`fail!` 得到的内部 `Never` 会阻止所有依赖计算执行；Host
-仍可继续已经证明独立的求值单元，以一次收集更多根因。Struct、Tuple、Array、tagged
-payload 和 Dict 在诊断求值图中可以暂时保留失败子节点。这类节点保持原有静态类型，
-但不是 Telora 值，源码不能构造、匹配或恢复它们。保形逐项操作可以跳过失败槽位并
-继续健康槽位；只依赖容器形状的操作不依赖子节点；选择失败槽位则传播同一根诊断。
+`check` 将多个导出项及所需 property 初始化作为多根求值。共享依赖只计算一次；
+一个根失败后，可以继续其他根。读取已失败的依赖会传播同一个根因，不重复报告。
+每个根内部采用顺序失败传播：函数调用、let initializer、block、闭包、容器构造或
+逐项操作失败后，立即退出当前调用，不执行后续语句或 callback。
+容器不保存可供后续计算使用的失败子节点，也不提供“健康投影”。
 
-Fail 传播按操作实际读取的数据确定：
+静态求解独立收集 Unresolved、Conflicted 和 Unknown 等诊断；类型未闭合不进入求值。
+运行阶段不提供 best-effort。run/serve/eval/eval-with 初始化失败即停止，不启动入口。
+serve 已有的单请求失败恢复属于显式请求边界，不改变普通函数的顺序中断规则。
+资源耗尽等终止性错误中止整个 session，不尝试剩余根。
 
-- 标量一元/二元运算、比较、插值、条件、match 判别、字段/索引/tuple 投影，以及
-  普通 Func 的 callee 或任一实参直接为 Fail 时，结果传播该 Fail；被阻断的 Func
-  body 不执行。tag constructor 属于复合值构造，可以保留失败 payload。
-- Array、Tuple、Struct/Dict 和 tagged 构造只确定外层形状，可以保留失败子节点。
-  `array.length`、`enumerate`、`push`、`zip` 以及 Dict 的 keys/values/pairs 等仅依赖
-  已知形状或保形搬运的操作可以继续；选中失败子节点时才传播。
-- `array.map` 和 `dict.map_values` 保留原位置的失败节点，并继续处理健康成员。
-  `filter`、`flat_map`、`concat`、spread 和 fold 一类输出形状或 accumulator 依赖
-  失败节点的操作，其最终值传播 Fail。filter/flat_map 可以先继续彼此独立的健康
-  callback 以收集诊断；fold 的 accumulator 失败后立即停止依赖它的 reducer。
-- `any` 找到健康的 True、`all` 找到健康的 False 时，短路结果不依赖其他槽位；否则
-  任一失败 predicate 令结果为 Fail。`find` 只有在所选成员之前没有失败 predicate
-  时才能产生 Some；先前失败会令成员身份不确定并传播 Fail。
-- 结构相等、codec、JSON 和 Host value 会读取完整可达数据图；任一可达 Fail 都传播
-  原根因或拒绝边界，不能把内部节点渲染成普通类型错误。Module 在 WorkWorld 与
-  MainWorld 间的内部固化不是 Host publication，可以保留 Fail 以供下游继续诊断。
-
-传播节点不是新的根因诊断。实现可以保存有界的传播 lineage，但同一 Fail 穿过 callback、
-native 函数、模块或边界时不得产生诸如“expected Func/Array”之类的二次类型错误。
-非保形操作不提供源码可观察的“健康投影”；为收集诊断而暂存的健康成员也不能被下游
-代码、codec、Entry 或 Host 当作结果使用。
-
-任何 error diagnostic 都会使本轮命令的最终结果失去 Host 发布意义，即使最终根值不依赖
-内部失败且能够算出。失败节点的可达性只决定 best-effort 还能继续哪些诊断计算，不决定
-结果能否交付。codec、最终返回值和 SystemEffect 都不得越过 Host 边界；一批
-SystemEffect 必须先整体完成可信审计，才能执行其中第一个 effect。严格执行遇到未处理
-失败立即失败。
-
-跨模块 best-effort 始终使用普通 Module。Module 的 `Available/Unavailable` 只表达源码
-是否存在；定义和表达式各自携带 `Known/Unknown/Incomputable` 等事实状态。Module 可以在
-MainWorld 内部同时保留健康 export 与含 Fail 的 export：下游读取健康 export 可继续工作，
-读取失败 export 则传播同一个 Fail。不存在 `PartialModule` 或 `UntrustedModule` 语言实体，
-依赖边界也不重复制造根因诊断。
+任何未消费的 error 都阻止本轮 session 成功发布，即使其他根能够算出健康结果。
+为收集诊断继续初始化不代表可以发布部分结果；失败传播不制造派生类型错误。
 
 ### 9.5 失败类别
 
 VM 区分可恢复的程序失败与终止整个 evaluation session 的资源/一致性失败。前者包括
 类型不匹配、missing field、non-exhaustive dynamic match、panic 和 `fail!`；后者
-包括取消、fuel/分配/栈/调用深度耗尽以及无效 bytecode。
+包括取消、资源耗尽以及执行引擎 trap。
 
-Workspace recovery 可以在一个 binding 或模块失败后继续独立工作，但严格 Host
-执行不会把 recoverable failure 当作成功值。
+check 可以在一个初始化根失败后继续其他根，但不会把 failure 当作成功值。
 
 ## 10. 求值和资源语义
 
-当前工具链使用 lossless CST、AST/HIR、类型分析、LIR、bytecode 和寄存器 VM 实现
+当前工具链使用 lossless CST、扁平 HIR/MIR、全图类型求解、Wasm 和 Wasmi 实现
 语言。各层共同服从本文定义的可观察语义和来源映射，不建立彼此竞争的语言模型。
 各阶段、运行时布局、模块骨架、World 和 promotion 的当前实现见
 [`IMPLEMENTATION.md`](IMPLEMENTATION.md)；这些私有结构不是第二套语言语义。
 
 ### 10.1 两个阶段，一个求值器
 
-Tool stage 执行 annotation、type initializer、decorator、module interface 和其他分析
-所需的闭合计算。Program stage 使用显式 Host 输入执行普通应用函数。两者共用：
+模块、符号和类型求解是纯静态阶段，不执行语言代码。Tool stage 在静态闭合后执行
+property provider 和顶层初始化；Program stage 使用显式 Host 输入执行普通应用函数。
+两个执行阶段共用：
 
-- bytecode 与函数调用规则；
+- Wasm 与函数调用规则；
 - 不可变值和 heap 表示；
-- fuel、stack、call-depth 和 allocation account；
+- 执行资源约束；
 - runtime failure 与来源规则。
 
 静态 annotation 和 witness 默认从程序执行中擦除；当程序显式把 TypeMetadata 当作
@@ -1377,7 +1396,7 @@ Tool stage 执行 annotation、type initializer、decorator、module interface �
 解码返回 `Result(Target, codec.BlameError)`。编码直接返回 `Value`，失败产生诊断，
 并保留失败值和编码规则的来源位置。
 `codec.encode(Value.type, model)` 的首个参数固定为 canonical `TypeOf(Value)`，并从 model
-已经携带的 nominal witness 选择 schema。Dyn 中的模型需先投影到具体类型。
+在 MIR 中确定的具体类型选择编码实现。Dyn 中的模型需先投影到具体类型。
 复杂 concrete family 的定义模块应拥有一次完整实例化，并导出 concrete
 alias 或 typed boundary function：
 
@@ -1397,19 +1416,22 @@ family，不引入隐式反射或新的表面语法。
 
 ### 10.2 Fuel 和配额
 
-Fuel 在函数调用及实际执行的 control-flow back edge 等动态扩展点扣减。直线指令和
-未采取的 back edge 不消耗同类进度 fuel。Fuel 是确定的终止边界，不代表 CPU 时间。
+资源边界的目的，是让持续循环、持续分配或无法取得进展的执行能够被终止，
+不是精确核算成本或严格约束实际资源占用。阈值可以宽松，不构成 CPU 时间、
+进程 RSS 或跨版本可消费操作数量的承诺。
 
-独立配额限制：
+Fuel 用于对抗执行能否收敛的不确定性，而不是对执行成本精确计费。这是既有的
+求值语义（RFC 0010）：不要求逐指令、逐元素或逐字节核算，也不要求按 native
+算法的内部操作次数扣减。指令融合、数据复制方式或库内部实现的变化，不应成为
+重新定义 fuel 计费规则的理由。
 
-- 逻辑分配量；
-- VM stack slot；
-- 调用深度；
-- 输出和递归格式化深度；
-- module 与整个 session 的工作量。
+当前直接使用 Wasm 引擎的 fuel、内存增长和调用栈限制，不另建 Telora 操作、
+逻辑分配或跨边界调用的统一 account。编译到 Wasm 的 Rust RT 与语言代码同受
+引擎限制，超限终止会话，不能作为可恢复语言失败被吞掉。
 
-Native function 和 Telora callback 共享调用 session 的 account，不能通过跨 native
-边界绕过预算。配额耗尽产生带来源的结构化失败。
+Host 的解析、fixture 展开和外部 IO 不由 Wasm fuel 覆盖，仍需简单的输入规模、
+结构深度、有限展开或超时/取消边界。fuel 不是墙钟超时，不能让任意 Host 调用
+自动及时返回。验收验证持续循环与持续分配能被拦住，不验证精确扣费次数。
 
 ### 10.3 确定性
 
@@ -1453,7 +1475,7 @@ telora [-C <context>] check <module>
 telora [-C <context>] test <name>
 telora [-C <context>] eval <module:export>
 telora [-C <context>] eval-with <module:export> [--source <name>=<source>]... [-- <arg>...]
-telora [-C <context>] run <module:export> [--best-effort] [--source <name>=<source>]... [--ees-var <name>=<value>]... [-- <arg>...]
+telora [-C <context>] run <module:export> [--source <name>=<source>]... [--ees-var <name>=<value>]... [-- <arg>...]
 telora [-C <context>] serve <module:export> [--source <name>=<source>]... [--ees-var <name>=<value>]... --bind stdio:// [-- <arg>...]
 telora [-C <context>] query|q modules [-p <substring>]
 telora [-C <context>] query|q exports <module> [-p <substring>]
@@ -1548,12 +1570,8 @@ Module value，并以非零退出。普通 stderr 只用于 CLI/Host 故障，`d
 诊断求值结果，因此存在错误或求值失败时仍可返回不受影响的事实。`query` 成功只表示查询
 成功，不表示模块健康；恢复节点通过独立 fact state 表达未确定或失败的状态。
 
-`run --best-effort` 在启动 Entry 前对 Main 执行静默的 best-effort 诊断求值，并把
-`telora.run/v1` diagnostic records 写入 stderr。它只用于遇到问题时扩大诊断覆盖：只要
-本轮出现任何 error，恢复得到的 Main 就整体废弃，命令输出 error summary、非零退出，且
-不初始化 Entry、不解释 SystemEffect；一个不依赖失败的干净根值也不例外。没有 error 时，
-命令重新进入严格 Entry reducer 与 Host effect lifecycle，不进行 speculative recovery。
-最终验收必须使用省略该参数、保持 fail-fast 的普通 `run`。
+运行命令不接受 `--best-effort`。需要多根初始化诊断时使用 `check`；只检查静态事实时
+使用 `check --only-types`。运行命令不为诊断而额外预执行用户代码。
 
 普通 module 用 `std/entry` 构造工具 wrapper。应用以具体 State 类型编写：
 
@@ -1614,9 +1632,15 @@ model 名称、kind 和配置完全一致。
 `std/ees.install_shared` 和 `std/ees.sqlite_query` 只构造 component-neutral request，
 不执行 I/O。资源 locator
 使用 `user-data:`、`user-cache:`、`user-config:` 或 `user-state:`，冒号后是规范化
-相对路径。component adapter 优先使用对应的 `XDG_DATA_HOME`、`XDG_CACHE_HOME`、
-`XDG_CONFIG_HOME`、`XDG_STATE_HOME`；缺失时分别回退到 `$HOME/.local/share`、
-`$HOME/.cache`、`$HOME/.config`、`$HOME/.local/state`。Entry 能看到 wrapper 声明的
+相对路径。component adapter 按 Host 平台惯例解析物理目录：Linux 优先使用对应的
+`XDG_DATA_HOME`、`XDG_CACHE_HOME`、`XDG_CONFIG_HOME`、`XDG_STATE_HOME`（必须为非空绝对路径）；
+无效或缺失时分别回退到用户主目录下的 `.local/share`、`.cache`、`.config`、`.local/state`，
+主目录优先取 `HOME`，未设置时使用系统用户目录。Windows 使用 Known Folder：data/config
+使用 RoamingAppData，cache 使用 LocalAppData；macOS 的 data/config 使用
+`~/Library/Application Support`，cache 使用 `~/Library/Caches`。平台没有专用 state
+目录时，使用本地 data 目录下的 `state` 子目录（Windows 为 LocalAppData，macOS 为
+`~/Library/Application Support`）。Windows/macOS 不使用 `XDG_*` 覆盖这些目录。
+Entry 能看到 wrapper 声明的
 逻辑 locator，普通应用代码不能读取解析后的物理路径；物理路径不进入 Telora World，也不能由
 operation 改写。
 
@@ -1727,7 +1751,7 @@ graph 解引用、TOML table 组装所需的索引，进入必要的 side table�
 不会包含递归 Owned payload graph，也不会分配运行时对象；目标 Heap materializer 在
 验证和结构限制预检全部成功后单次消费它。
 
-数据源不消耗也不依赖 VM 的 fuel、stack 或 allocation quota。Host 在完整分配 source
+数据源不消耗也不依赖引擎的执行 fuel 或内存增长上限。Host 在完整分配 source
 字符串前以有界读取检查原始 `file_size`；验证计划随后独立检查 `nodes`（YAML alias/merge
 按最终每次出现计数）、`depth`（根为 1）、单个 `container_size`、单个 `bytes_len`、单个
 UTF-8 `string_len`，以及所有 String、对象键、时间字符串和 Bytes 解码后长度之和
@@ -1746,8 +1770,8 @@ EES 调用。terminal、reducer 失败、协议失败或 Host 失败时，Host �
 编码 Telora 值。Entry 可以用自己的 `MainType`、codec 和 formatter 生成任意多个
 String chunk。CLI 在 terminal effect 前缓冲它们；协议失败不暴露部分输出。
 `Exit(Int)` 是 terminal effect，必须位于 effects 尾部。没有内部 Wake 或任意 turn
-上限；无队列事件且无活动 EES 调用时判定无进展。每次 reducer 调用仍受普通 VM quota
-约束。
+上限；无队列事件且无活动 EES 调用时判定无进展。所有 reducer 调用共同受 session
+的引擎终止边界约束，不重新建立逐事件计账。
 
 `check`、`test`、`query` 和 `lsp` 当前仍是 Host 固定命令路径，尚未通过 run Entry ABI。它们
 把目标当作 module。`check` 给出严格 module load/compile verdict，但不等价于一次
@@ -1794,7 +1818,7 @@ declarations。普通 definitions 实现 Option、Result、argv 等组合政策�
 declarations 提供需要高效 heap 观察或受控 runtime identity 的确定操作。
 
 当前通用能力包括 Array/Dict 组合、String、lexical path、SHA-256、regex、JSON codec
-与 schema、typed property、Dyn observer、文本 parse/display 等。
+、typed property、Dyn observer、文本 parse/display 等。
 这些 API 不授予环境或文件系统访问权限。例如 path 操作是词法操作，hash 操作只
 处理显式输入。
 
@@ -1852,12 +1876,12 @@ payload 精化均属于当前语义。但推断不保证为任意一组分别构
 公共的高层 family 实例。
 
 特别是，当同一个 Array 没有显式 item expected type，而元素同时包含不同
-variant 构造、不同 closure 或匿名 Struct 时，仅凭元素字面量可能
+variant 构造、不同 closure 或记录构造时，仅凭元素字面量可能
 无法主动找到预期的封闭 enum、函数契约或参数化 family。严格模式会报告冲突或未
 解决约束，并要求各元素满足共同类型。使用 `.ty!(Ty)` 或 `@[Ty]` 可以提供完整
 上下文；领域中的多种数据形态通过显式 enum 定义。
 
-在最小公共边界给 Array 提供具体契约即可把同一个 family 实例下传到匿名元素：
+在最小公共边界给 Array 提供具体契约即可把同一个 family 实例下传到记录元素：
 
 ```telora
 type Entry(Id, Value) = struct {
@@ -1892,7 +1916,7 @@ type ColumnRef = struct {alias: String, column: String};
 type Expr = enum {Column(ColumnRef)};
 ```
 
-该限制只属于类型声明。构造 tagged value 时，payload 的匿名记录仍会按具名 Struct
+该限制只属于类型声明。构造 tagged value 时，payload 的记录字面量仍会按具名 Struct
 契约检查，因此下式合法：
 
 ```telora
@@ -1942,7 +1966,7 @@ alias 绑定后，只在该 alias 初始化时实例化一次；需要在多个�
 2. 对不可变小型值模型的普通函数计算；
 3. 由同一 VM 求值并由类型检查器解释的 TypeMetadata；
 4. 明确受限的 `Dyn`、诊断和 Host bridge；
-5. 由资源 account 包围、成功后原子发布的一次执行；
+5. 具有执行终止边界、成功后原子发布的一次执行；
 6. 最终仍需 Host 赋予意义的普通输出值。
 
 Telora 的核心承诺不是“所有错误都能静态发现”，也不是“所有程序都会终止”。它的

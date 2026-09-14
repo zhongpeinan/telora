@@ -15,14 +15,8 @@ use telora_core::{
 
 fn location(mir: &Mir, loc: Location) -> Value {
     let source = mir.sources.get(loc.source);
-    let start = source
-        .text()
-        .position(loc.start, PositionEncoding::Utf8)
-        .expect("HIR position");
-    let end = source
-        .text()
-        .position(loc.end, PositionEncoding::Utf8)
-        .expect("HIR position");
+    let start = source.utf8_position(loc.start);
+    let end = source.utf8_position(loc.end);
     json!({"line": start.line+1, "column": start.character, "end_line": end.line+1, "end_column": end.character})
 }
 
@@ -39,7 +33,7 @@ pub fn check(
     args: crate::CheckArgs,
     schema: &str,
 ) -> Result<i32, String> {
-    let types_only = args.types_only;
+    let types_only = args.types_only || args.dump_types_layout.is_some();
     let started = Instant::now();
     let mut inventory = Inventory::new(&context, args.module_id.as_deref().is_some_and(|s| s.starts_with("std/")))?;
     let roots = if let Some(selector) = &args.module_id {
@@ -85,28 +79,46 @@ pub fn check(
     };
     let static_failed = static_failed || !seal_diagnostics.is_empty();
     let static_seconds = started.elapsed().as_secs_f64();
+    if let (Some(path), Some(sealed)) = (&args.dump_types_layout, &sealed) {
+        let entries = if roots.is_empty() { vec![] } else {
+            telora_core::candidate_layout::calculate(sealed)?
+        };
+        let mut templates = 0;
+        let mut compile_time = 0;
+        let mut uninhabited = 0;
+        let mut layouts = Vec::with_capacity(entries.len());
+        for entry in &entries {
+            match entry.layout {
+                telora_core::candidate_layout::State::Template { .. } => templates += 1,
+                telora_core::candidate_layout::State::CompileTime { .. } => compile_time += 1,
+                telora_core::candidate_layout::State::Uninhabited { .. } => uninhabited += 1,
+                _ => {},
+            }
+            let type_name = MirQuery::new(sealed.mir()).type_name(entry.id());
+            layouts.push(json!({"type_name": type_name, "entry": entry}));
+        }
+        let report = json!({"schema": "telora.types-layout/v1", "candidate": true, "roots": roots,
+            "target": {"word_bytes": 8, "heap_id_bytes": 4, "type_id_bytes": 4},
+            "types": layouts, "summary": {"types": entries.len(), "pending": 0, "templates": templates,
+                "compile_time": compile_time, "uninhabited": uninhabited,
+                "known": entries.len()-templates-compile_time-uninhabited, "closed": true},
+            "header": {"loc_offset": 0, "type_id_offset": 12, "data_offset": 16},
+            "offset_bases": {"members": "object_start", "variants": "value_start"}});
+        write_layout_report(path, &report)?;
+    }
     let execution_started = Instant::now();
     let mut execution_diagnostics = vec![];
     if let Some(sealed) = sealed.filter(|_| !types_only && !roots.is_empty()) {
-        let artifact = telora_core::codegen::compile_check(sealed);
-        let linked = artifact.and_then(|artifact| {
-            telora_core::execution_link::link_entry_with_data(artifact, |link| {
-                inventory.read_data(link, crate::execution_config().data_limits.file_size)
-            })
-        });
-        match linked {
-            Ok(linked) => {
-                let config = crate::execution_config();
-                execution_diagnostics = telora_core::Vm::new()
-                    .with_debug_sink(std::sync::Arc::new(crate::StderrDebugSink))
-                    .check_linked(
-                        linked,
-                        config.session_quota,
-                        config.data_limits,
-                        &mut mir.sources,
-                    );
+        {
+            match crate::wasm_cli::compile_check(sealed) {
+                Ok(mut session) => {
+                    execution_diagnostics = match crate::wasm_cli::initialize_diagnostics(&mut session, &inventory, &mut mir.sources) {
+                        Ok(()) => crate::wasm_cli::check_diagnostics(&session, &mir.sources, Ok(())),
+                        Err(diagnostics) => diagnostics,
+                    };
+                }
+                Err(message) => execution_diagnostics.push(crate::wasm_cli::error(message)),
             }
-            Err(diagnostics) => execution_diagnostics = diagnostics,
         }
     }
     let execution_seconds = if types_only || static_failed || roots.is_empty() {
@@ -135,6 +147,22 @@ pub fn check(
         "catalog_seconds": catalog_seconds}),
     )?;
     Ok(i32::from(failed))
+}
+
+/// Stage in the destination directory so replacement stays on one filesystem.
+/// Serialization and write failures leave an existing destination untouched.
+fn write_layout_report(path: &std::path::Path, report: &Value) -> Result<(), String> {
+    use std::io::Write;
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+    let write = || -> Result<(), Box<dyn std::error::Error>> {
+        let mut staged = tempfile::NamedTempFile::new_in(parent)?;
+        serde_json::to_writer_pretty(&mut staged, report)?;
+        staged.write_all(b"\n")?;
+        staged.flush()?;
+        staged.persist(path)?;
+        Ok(())
+    };
+    write().map_err(|e| format!("cannot export type layouts to {}: {e}", path.display()))
 }
 
 fn type_fields(mir: &Mir, state: TypeState) -> (Option<usize>, Option<String>, &'static str) {

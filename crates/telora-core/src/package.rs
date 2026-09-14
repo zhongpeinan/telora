@@ -5,7 +5,7 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::module_id::{ModuleFormat, validate_crate_name};
+use crate::module_format::ModuleFormat;
 
 pub const CONFIG_FILE: &str = "telora-config.json";
 pub const CRATE_FILE: &str = "telora-crate.json";
@@ -913,7 +913,7 @@ fn ensure_sorted_set(label: &str, values: &[String]) -> Result<(), PackageError>
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, PackageError> {
     let source = fs::read(path)
         .map_err(|error| PackageError::new(format!("cannot read {}: {error}", path.display())))?;
-    serde_json::from_slice(&source)
+    telora_data::json_serde::from_slice(&source)
         .map_err(|error| PackageError::new(format!("invalid {}: {error}", path.display())))
 }
 
@@ -932,6 +932,19 @@ fn contained_directory(root: &Path, relative: &Path, label: &str) -> Result<Path
         )));
     }
     Ok(path)
+}
+
+fn validate_crate_name(name: &str) -> Result<(), PackageError> {
+    if name.is_empty()
+        || name.starts_with(['@', '_'])
+        || name.contains(['/', '.', '\\'])
+        || !name.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return Err(PackageError::new(format!(
+            "invalid crate name {name:?}; expected ASCII letters, digits, and '-'"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_relative_path(path: &Path, label: &str) -> Result<(), PackageError> {
@@ -963,19 +976,20 @@ fn absolute(path: &Path) -> Result<PathBuf, PackageError> {
 }
 
 fn package_digest(domain: &[u8], parts: &[&[u8]]) -> String {
-    let mut hash = crate::sha256::Context::default();
+    use sha2::{Digest, Sha256};
+
+    let mut hash = Sha256::new();
     hash.update(b"telora.package.tarball\0\x01");
     hash.update(domain);
     for part in parts {
         hash.update(&(part.len() as u64).to_be_bytes());
         hash.update(part);
     }
-    hash.finish()
+    hash.finalize()
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
 }
 
 #[cfg(test)]
-#[path = "package/tests.rs"]
 mod tests;

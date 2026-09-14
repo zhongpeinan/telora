@@ -1,5 +1,30 @@
 # Rust test migration inventory
 
+## Wasm-only runtime follow-up
+
+The runtime follow-up replaces 26 Rust test functions (including the CLI's
+multi-fixture output table) with 37 named Test exports in five groups:
+
+| Group | Coverage |
+| --- | --- |
+| `test/runtime-codec` | closed scalar/collection/enum codecs, rename, nominal decoding, display bridges |
+| `test/runtime-data` | JSON, TOML, YAML parsing and JSON serialization |
+| `test/runtime-reflection` | closed reflection, display properties, Dyn observers |
+| `test/runtime-text` | parsing, regex, format equality, repeated hash calls, lexical paths |
+| `test/runtime-language` | local generic captures/recursion and Test descriptions |
+
+Expected values were transferred from the existing Rust assertions, including
+array lengths. The harness now has 413 case entrances; an entrance may contain
+multiple named Test exports. Retained Rust tests read source assets at runtime,
+so fixture edits no longer invalidate Rust compilation through `include_str!`.
+The source structure check rejects embedded assets in Rust test modules.
+
+Rust retains MIR/ABI/Host/GC assertions and exact diagnostic origin/count
+checks. In particular, tests using private `std/_rt` diagnostic capture stay
+in Rust; public language tests do not gain access to private runtime modules.
+
+## Earlier core migration
+
 This inventory records the completed migration of public language behavior from
 Rust unit tests to Telora fixtures. The migration started with 21,062 lines in
 `crates/telora-core/src/**/tests/*.rs`. After every Rust test namespace was
@@ -22,9 +47,9 @@ deferred Test migration maps them to their current locations in the next section
 | `check/type-inference` | generic contracts, local generalization, recursive inference, explicit type application, and type families |
 | `check/diag-*` | parser, elaboration, type, trait, property, module, and intrinsic diagnostics |
 | `check/module-interfaces` | imports, exports, re-exports, namespaces, private nominal identity, and cross-module generic interfaces |
-| `check/stdlib-semantics` | Option, Result, Dict, codec, schema, Fmt, and Display contracts |
+| `check/stdlib-semantics` | Option, Result, Dict, codec, Fmt, and Display contracts |
 | `eval/stdlib-collections` | Array, Dict, String, Path, and equality results |
-| `eval/codec-schema`, `eval/enum-codec` | structural and recursive codecs, enum representations, JSON schema, and JSON/TOML/YAML string parsing |
+| `eval/codec-schema`, `eval/enum-codec` | structural and recursive codecs, enum representations, and JSON/TOML/YAML string parsing; experimental JSON Schema checks were removed |
 | `eval/data-modules` | manifest-backed JSON, TOML, and YAML module loading and typed decoding |
 | `eval/runtime-intrinsics`, `eval/diag-*` | dynamic projection, cast, unwrap, diagnostic intrinsic, bounds, and non-finite runtime behavior |
 | `eval/display`, `eval/properties` | Display, interpolation, typed properties, member properties, and property-driven blanket implementations |

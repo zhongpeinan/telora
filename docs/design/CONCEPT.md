@@ -329,7 +329,14 @@ polymorphism 的通用替代品。
 `Never` 是公开契约中可见的无居住者（bottom）静态类型，表示一条路径不产生普通值。
 `return`、`fail!` 和 `panic!` 等终止路径可以得到 `Never`，使 directional checking
 不必为不可达结果伪造类型，并抑制连锁错误。用户不能把 `Never` 构造成普通数据；
-best-effort evaluator 内部保存的 Fail 节点也不是 `Never` 的源码可观察实例。
+初始化缓存中的失败状态也不是 `Never` 的源码可观察实例。
+
+### Enum variant 的值物化
+
+enum variant 的身份属于类型域。在值表达式位置，它物化为无载荷值或有载荷构造器，
+值来源从这处表达式开始；类型定义、导入和重导出身份不形成值来源链。
+普通绑定已经持有值，其后续引用、传参、返回保留原来源。构造器调用产生的 enum
+外层继承构造器来源，payload 保持输入来源。定义导航与值来源是两种独立关系。
 
 ### Decorator 与 Typed Property
 
@@ -400,6 +407,10 @@ interface 和 semantic fact 所需的闭合计算。它按依赖范围执行，�
 stack、call depth 与 allocation。它们使 Host 获得有限终止边界，而不要求每个程序
 都是 total function。
 
+Fuel 的定位是对抗执行能否收敛的不确定性，防止递归和重复控制流失控，不是精确
+计费。它不衡量 CPU 时间、指令条数、复制字节数或 native 实现内部的操作次数。
+内存与输入规模等风险由独立配额约束，不能用 fuel 代替。
+
 ### Persistent World 与 Temporary World
 
 **Temporary world（临时世界）**保存推测性或调用局部工作；**persistent world
@@ -453,14 +464,14 @@ expression。其状态至少区分：
 结构化 failure diagnostic 的核心是 `rule + data_sources`。rule 包含拒绝消息与规则
 应用位置；data sources 是显式 subjects 的有序来源位置。函数边界内触发的 contextual
 failure 把 rule 归因到最外层 authored caller，内部 `fail!` 位置只保留为实现 trace。
-Host 如何把这些位置显示为 primary/secondary 属于呈现策略。Fail 在 best-effort 图中
+Host 如何把这些位置显示为 primary/secondary 属于呈现策略。失败在初始化依赖之间
 传播时继续引用原 root diagnostic，不增加新的根因。
 
 `rt.with_diagnostics` 把一次调用的成功值与 Warning 作为 `Ok((value, diagnostics))`
 返回，把可恢复 failure 作为 `Err(diagnostics)` 返回并消费这些诊断。资源耗尽、取消与
 其他终止性 runtime failure 仍向外传播。
 
-Best-effort continuation 是 evaluator 对已经证明独立的计算单元所采用的策略，不是
+Best-effort 是 check 在多个初始化根之间采用的策略，单个根失败立即中断，不是
 源码中的“报告后继续” intrinsic。它可以帮助 Host 一次观察更多根因，但任何 Error
 仍阻止 candidate artifact 和 effect 发布。完整表面与传播规则见
 [`LANGUAGE.md`](LANGUAGE.md#9-来源失败和诊断)。

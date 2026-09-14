@@ -6,15 +6,14 @@ use crate::source::{Diagnostic, Location, SourceDatabase, SourceId};
 use crate::syntax::telora::parser::CstData;
 use std::fmt::Write;
 
-#[path = "mir/lower.rs"]
 pub(crate) mod lower;
-#[path = "mir/seal.rs"]
 mod seal;
-#[path = "mir/type-schemes.rs"]
+mod executable;
 mod type_schemes;
-#[path = "mir/properties.rs"]
 mod properties;
+mod materializations;
 pub use seal::SealedMir;
+pub use executable::{ExecutionClosure, ExecutionRoot, SealedExecutable};
 
 macro_rules! id {
     ($($name:ident),*) => {$(
@@ -59,28 +58,17 @@ id!(PropertyId);
 /// or from missing instance IDs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GenericReference {
+    /// A static export of a declaration contract; never an executable value.
     Scheme { symbol: SymbolId, scheme: TypeSchemeId },
-    /// A value contract with substitutions retained in type_instances: some
-    /// arguments may be concrete and others are bound by its Quantified type.
-    Quantified { symbol: SymbolId, scheme: TypeSchemeId },
+    /// The type pass has selected this use's instance before publication.
     Instance(GenericInstanceId),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum FunctionFamily {
-    Alias(SymbolId),
-    Variants {
-        /// A restricted alias keeps the source identity with its own key table.
-        identity: Option<SymbolId>,
-        instances: Vec<(Vec<TypeId>, GenericInstanceId)>,
-    },
 }
 
 impl GenericReference {
     pub fn instance(self) -> Option<GenericInstanceId> {
         match self {
             Self::Instance(instance) => Some(instance),
-            Self::Scheme { .. } | Self::Quantified { .. } => None,
+            Self::Scheme { .. } => None,
         }
     }
 }
@@ -98,6 +86,14 @@ pub struct GenericInstance {
     pub references: Vec<(HirId, GenericInstanceId)>,
     pub implementations: Vec<(HirId, GenericInstanceId)>,
     pub adjustments: Vec<(HirId, TypeId)>,
+}
+
+impl Mir {
+    /// Stable instance identities paired with their solved records.
+    pub fn generic_instances(&self) -> impl Iterator<Item = (GenericInstanceId, &GenericInstance)> {
+        self.generic_instances.iter().enumerate().map(|(index, instance)|
+            (GenericInstanceId(index as u32), instance))
+    }
 }
 
 impl GenericInstance {
@@ -353,6 +349,15 @@ pub enum MemberSelection {
     },
 }
 
+/// A type-domain identity materialized at this HIR expression's Loc. Its
+/// signature is the node's solved type (or the selected generic instance type).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ValueMaterialization {
+    Boolean(bool),
+    EnumVariant { index: u32 },
+    NewtypeConstructor,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PropertySite {
     Type,
@@ -584,7 +589,6 @@ pub enum HirKind {
         expression: String,
     },
     TypeAscription,
-    CheckedCast,
     Binary(BinaryOperator),
     Field,
     FieldProjection,
@@ -648,12 +652,12 @@ pub struct Mir {
     pub type_instances: Vec<Vec<(SymbolId, TypeSlotId)>>,
     pub generic_instances: Vec<GenericInstance>,
     pub generic_references: Vec<Option<GenericReference>>,
-    pub function_families: Vec<Option<FunctionFamily>>,
     pub implementation_instances: Vec<Option<GenericInstanceId>>,
     pub type_terms: Vec<TypeTerm>,
     pub types: Vec<ResolvedType>,
     pub type_layouts: Vec<Option<TypeLayout>>,
     pub member_selections: Vec<Option<MemberSelection>>,
+    pub value_materializations: Vec<Option<ValueMaterialization>>,
     pub interpreter_plans: Vec<Option<InterpreterPlan>>,
     pub type_definitions: Vec<TypeDefinition>,
     pub properties: Vec<PropertyRecord>,
@@ -822,6 +826,11 @@ impl Mir {
         for (id, plan) in self.interpreter_plans.iter().enumerate() {
             if let Some(plan) = plan {
                 writeln!(out, "interpreter-plan {id} {plan:?}").unwrap();
+            }
+        }
+        for (id, fact) in self.value_materializations.iter().enumerate() {
+            if let Some(fact) = fact {
+                writeln!(out, "value-materialization {id} {fact:?}").unwrap();
             }
         }
         for (id, scheme) in self.type_schemes.iter().enumerate() {

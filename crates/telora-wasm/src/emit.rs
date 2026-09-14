@@ -1,0 +1,582 @@
+use crate::{
+    abi::*,
+    plan::{Key, Plan, Special, child, symbol},
+};
+use std::collections::{BTreeMap, BTreeSet};
+use telora_core::mir::{HirId, HirKind, Mir, Role, SymbolId, TypeConstructor, TypeId};
+use wasm_encoder::{BlockType, Function, Instruction as I, ValType};
+
+pub(crate) struct Emitter<'a> {
+    pub mir: &'a Mir,
+    pub plan: &'a Plan,
+    pub key: Key,
+    code: Vec<I<'static>>,
+    function_pointers: BTreeMap<usize, u32>,
+    static_pointers: BTreeSet<usize>,
+    pub locals: Vec<ValType>,
+    pub bindings: BTreeMap<SymbolId, u32>,
+    pub local_instances: BTreeMap<telora_core::mir::GenericInstanceId, u32>,
+    pub tail_calls: BTreeSet<HirId>,
+}
+
+impl<'a> Emitter<'a> {
+    pub fn new(mir: &'a Mir, plan: &'a Plan, key: Key) -> Self {
+        Self {
+            mir,
+            plan,
+            key,
+            code: vec![],
+            function_pointers: BTreeMap::new(),
+            static_pointers: BTreeSet::new(),
+            locals: vec![],
+            bindings: BTreeMap::new(),
+            local_instances: BTreeMap::new(),
+            tail_calls: BTreeSet::new(),
+        }
+    }
+    pub fn local(&mut self, ty: ValType) -> u32 {
+        let index = self.locals.len() as u32 + 2;
+        self.locals.push(ty);
+        index
+    }
+    pub fn emit(&mut self, instruction: I<'static>) {
+        self.code.push(instruction);
+    }
+    pub fn extend(&mut self, code: impl IntoIterator<Item = I<'static>>) {
+        self.code.extend(code);
+    }
+    pub fn function_pointer(&mut self, index: u32) {
+        self.function_pointers.insert(self.code.len(), index);
+        self.emit(I::I32Const(0));
+    }
+    pub fn static_base(&mut self) -> u32 {
+        let local = self.local(ValType::I32);
+        self.static_pointers.insert(self.code.len());
+        self.extend([I::I32Const(0), I::LocalSet(local)]);
+        local
+    }
+    pub fn finish(mut self) -> crate::object::ObjectFunction {
+        let demand = (!self.key.callable).then(|| self.plan.demands[&self.key]);
+        let result = self.locals.len() as u32 + 2;
+        if demand.is_some() {
+            self.locals.push(ValType::I32);
+        }
+        let mut function = crate::object::ObjectFunction::new(Function::new(
+            self.locals.into_iter().map(|ty| (1, ty)),
+        ));
+        let count = FIRST_FUNCTION + self.plan.functions.len() as u32 + 3;
+        if demand.is_some() {
+            function.instruction(&I::Block(wasm_encoder::BlockType::Result(ValType::I32)));
+        }
+        let mut depth = 0;
+        for (index, instruction) in self.code.into_iter().enumerate() {
+            if demand.is_some() {
+                match instruction {
+                    I::Return => {
+                        function.instruction(&I::Br(depth));
+                        continue;
+                    }
+                    I::Block(_) | I::Loop(_) | I::If(_) => depth += 1,
+                    I::End => depth -= 1,
+                    _ => {}
+                }
+            }
+            if let Some(&symbol) = self.function_pointers.get(&index) {
+                function.function_pointer(symbol);
+            } else if self.static_pointers.contains(&index) {
+                function.memory_pointer(count + GLOBAL_COUNT + 1);
+            } else {
+                function.linked_instruction(&instruction, count);
+            }
+        }
+        if let Some(offset) = demand {
+            // All exits, including failure propagation, pass through this
+            // boundary. The second word holds either a value or failure origin.
+            for instruction in [
+                I::End,
+                I::LocalSet(result),
+                I::I32Const(offset as i32),
+                I::LocalGet(result),
+                I::I32Eqz,
+                I::If(wasm_encoder::BlockType::Result(ValType::I32)),
+                I::I32Const(3),
+                I::Else,
+                I::I32Const(2),
+                I::End,
+                I::I32Store(memory(0, 2)),
+                I::I32Const(offset as i32),
+                I::LocalGet(result),
+                I::I32Eqz,
+                I::If(wasm_encoder::BlockType::Result(ValType::I32)),
+                I::GlobalGet(ERROR_GLOBAL),
+                I::Else,
+                I::LocalGet(result),
+                I::End,
+                I::I32Store(memory(4, 2)),
+                I::LocalGet(result),
+            ] {
+                function.linked_instruction(&instruction, count);
+            }
+        }
+        function.instruction(&I::End);
+        function
+    }
+    pub fn ty(&self, node: HirId) -> Result<TypeId, String> {
+        self.key.ty(self.mir, node)
+    }
+    pub fn alloc(&mut self, bytes: u32) -> u32 {
+        let result = self.local(ValType::I32);
+        self.extend([
+            I::I32Const(bytes as i32),
+            I::Call(ALLOC),
+            I::LocalSet(result),
+        ]);
+        result
+    }
+    pub fn store32(&mut self, pointer: u32, offset: u64, value: u32) {
+        self.extend([
+            I::LocalGet(pointer),
+            I::I32Const(value as i32),
+            I::I32Store(memory(offset, 2)),
+        ]);
+    }
+    pub fn value(&mut self, node: HirId, bytes: u32) -> Result<u32, String> {
+        let ty = self.effective_ty(node)?;
+        self.value_as(node, ty, bytes)
+    }
+    pub fn value_as(&mut self, node: HirId, ty: TypeId, bytes: u32) -> Result<u32, String> {
+        if self.width(ty)? != bytes {
+            return Err(format!("Wasm: value width mismatch at {node:?}"));
+        }
+        let result = self.alloc(bytes);
+        let loc = self.mir.hir[node.index()].location;
+        let loc_words = self.mir.sources.get(loc.source).compact(loc).0;
+        self.store32(result, SOURCE, loc_words[0]);
+        self.store32(result, START, loc_words[1]);
+        self.store32(result, END, loc_words[2]);
+        self.store32(result, TYPE, ty.index() as u32);
+        Ok(result)
+    }
+    pub fn scalar(&mut self, node: HirId, bits: i64) -> Result<u32, String> {
+        self.scalar_as(node, self.effective_ty(node)?, bits)
+    }
+    pub fn scalar_as(&mut self, node: HirId, ty: TypeId, bits: i64) -> Result<u32, String> {
+        let result = self.value_as(node, ty, SCALAR_BYTES)?;
+        self.extend([
+            I::LocalGet(result),
+            I::I64Const(bits),
+            I::I64Store(memory(DATA, 3)),
+        ]);
+        Ok(result)
+    }
+    pub fn bits(&mut self, pointer: u32) {
+        self.extend([I::LocalGet(pointer), I::I64Load(memory(DATA, 3))]);
+    }
+    pub fn checked(&mut self, result: u32) {
+        self.extend([
+            I::LocalGet(result),
+            I::I32Eqz,
+            I::If(BlockType::Empty),
+            I::I32Const(0),
+            I::Return,
+            I::End,
+        ]);
+    }
+    pub fn failure(&mut self, node: HirId, code: u32) {
+        let location = self.mir.hir[node.index()].location;
+        let location_words = self.mir.sources.get(location.source).compact(location).0;
+        let pointer = self.alloc(DIAGNOSTIC_BYTES);
+        self.store32(pointer, 0, location_words[0]);
+        self.store32(pointer, 4, location_words[1]);
+        self.store32(pointer, 8, location_words[2]);
+        self.store32(pointer, 12, code);
+        self.table_push(DIAGNOSTICS, pointer, DIAGNOSTIC_BYTES);
+        self.extend([
+            I::LocalGet(pointer),
+            I::GlobalSet(ERROR_GLOBAL),
+            I::I32Const(3),
+            I::GlobalSet(PHASE_GLOBAL),
+            I::I32Const(0),
+            I::Return,
+        ]);
+    }
+    pub fn fail_if(&mut self, node: HirId, code: u32) {
+        self.emit(I::If(BlockType::Empty));
+        self.failure(node, code);
+        self.emit(I::End);
+    }
+    pub fn call_key(&mut self, key: Key) -> Result<u32, String> {
+        let function = *self
+            .plan
+            .functions
+            .get(&key)
+            .ok_or("Wasm: unregistered function")?;
+        let result = self.local(ValType::I32);
+        self.extend([
+            I::I32Const(0),
+            I::I32Const(0),
+            I::Call(function),
+            I::LocalSet(result),
+        ]);
+        self.checked(result);
+        Ok(result)
+    }
+    pub fn expression(&mut self, node: HirId) -> Result<u32, String> {
+        let value = self.raw_expression(node)?;
+        if self.mir.value_adjustments[node.index()].is_some() {
+            let target = self.effective_ty(node)?;
+            self.construction_check(node, target, telora_core::mir::PropertySite::Type, value)?;
+            let result = self.value_as(node, target, self.width(target)?)?;
+            self.copy(result, 0, value, self.width(target)?);
+            self.store32(result, TYPE, target.index() as u32);
+            return Ok(result);
+        }
+        Ok(value)
+    }
+    fn raw_expression(&mut self, node: HirId) -> Result<u32, String> {
+        if let Some(telora_core::mir::MemberSelection::Boolean(value)) =
+            crate::enums::selection(self.mir, node)
+        {
+            return self.scalar(node, i64::from(value));
+        }
+        if let Some(
+            selection @ (telora_core::mir::MemberSelection::EnumVariant { .. }
+            | telora_core::mir::MemberSelection::NewtypeConstructor),
+        ) = crate::enums::selection(self.mir, node)
+        {
+            if self.mir.types[self.ty(node)?.index()].constructor == TypeConstructor::Function {
+                let key = Key {
+                    node,
+                    instance: self.key.instance,
+                    callable: true,
+                    special: Special::Normal,
+                };
+                return self.function_value(node, key, self.ty(node)?, &[]);
+            }
+            if let telora_core::mir::MemberSelection::EnumVariant { index } = selection {
+                return self.enum_value(node, self.effective_ty(node)?, index, None);
+            }
+        }
+        match &self.mir.hir[node.index()].kind {
+            HirKind::Raise(action) => self.raise(node, *action),
+            HirKind::Panic => self.raise(node, telora_core::ast::BlameAction::Fail),
+            HirKind::TypeMetadata => {
+                let ty = self.ty(node)?;
+                let shape = &self.mir.types[ty.index()];
+                if shape.constructor != TypeConstructor::TypeOf || shape.arguments.len() != 1 {
+                    return Err("Wasm: metadata witness is not sealed".into());
+                }
+                self.scalar(node, shape.arguments[0].index() as i64)
+            }
+            HirKind::Binding {
+                kind: telora_core::ast::BindingKind::Native,
+                ..
+            } => {
+                let key = Key {
+                    node,
+                    instance: self.key.instance,
+                    callable: true,
+                    special: Special::Normal,
+                };
+                self.function_value(node, key, self.ty(node)?, &[])
+            }
+            HirKind::Int(value) => self.scalar(node, *value),
+            HirKind::Float(value) => self.scalar(node, value.to_bits() as i64),
+            HirKind::String(value) => self.text(node, value.as_bytes()),
+            HirKind::InterpolatedString => self.interpolate(node),
+            HirKind::Bytes(value) => self.bytes_literal(node, value),
+            HirKind::Array => self.array_expression(node),
+            HirKind::Dict => {
+                if self.mir.types[self.effective_ty(node)?.index()].constructor
+                    == TypeConstructor::Dict
+                {
+                    self.dictionary(node)
+                } else {
+                    self.record(node)
+                }
+            }
+            HirKind::TupleProjection(index) => self.projection(node, *index),
+            HirKind::FieldProjection => self.field_projection(node),
+            HirKind::Field => self.field(node),
+            HirKind::Index => self.index(node),
+            HirKind::Match | HirKind::IfLet | HirKind::LetElse => self.pattern_branch(node),
+            HirKind::Propagate => self.propagate(node),
+            HirKind::Tuple => self.tuple_expression(node),
+            HirKind::Binding { kind, .. } => {
+                if *kind == telora_core::ast::BindingKind::Decl
+                    && self.mir.modules[self.mir.hir[node.index()].module.index()].kind
+                        == telora_core::mir::ModuleKind::Data
+                {
+                    self.failure(node, ERROR_DATA);
+                    return Ok(self.local(ValType::I32));
+                }
+                if *kind == telora_core::ast::BindingKind::Decl {
+                    let symbol = self.mir.hir_symbols[node.index()]
+                        .ok_or("Wasm: local declaration has no stable symbol")?;
+                    return self.bindings.get(&symbol).copied().ok_or_else(|| {
+                        format!("Wasm: local declaration {symbol:?} has no reserved function")
+                    });
+                }
+                if !matches!(
+                    kind,
+                    telora_core::ast::BindingKind::Let
+                        | telora_core::ast::BindingKind::Def
+                        | telora_core::ast::BindingKind::Impl
+                ) {
+                    return Err(format!("Wasm: unsupported binding {kind:?}"));
+                }
+                let result = self.expression(child(self.mir, node, Role::Value)?)?;
+                if self.mir.types[self.ty(node)?.index()].constructor == TypeConstructor::Function {
+                    self.extend([I::LocalGet(result), I::I32Load(memory(DATA, 2)), I::I32Eqz]);
+                    self.fail_if(node, ERROR_UNINITIALIZED_FUNCTION);
+                }
+                if let Some(symbol) = self.mir.hir_symbols[node.index()] {
+                    if let Some(&reserved) = self.bindings.get(&symbol)
+                        && self.mir.types[self.ty(node)?.index()].constructor
+                            == TypeConstructor::Function
+                    {
+                        self.extend([
+                            I::LocalGet(reserved),
+                            I::LocalGet(result),
+                            I::I32Const(FUNCTION_BYTES as i32),
+                            I::MemoryCopy {
+                                src_mem: 0,
+                                dst_mem: 0,
+                            },
+                        ]);
+                        return Ok(reserved);
+                    }
+                    self.bindings.insert(symbol, result);
+                }
+                Ok(result)
+            }
+            HirKind::Variable(_) | HirKind::TypeApply => {
+                if let Some(instance) = self.key.reference(self.mir, node) {
+                    if let Some(&value) = self.local_instances.get(&instance) {
+                        return Ok(value);
+                    }
+                    if self.plan.local_instances.contains(&instance) {
+                        return Err(format!(
+                            "Wasm: local instance {instance:?} is unavailable in {:?}",
+                            self.key
+                        ));
+                    }
+                    return self.call_key(
+                        *self
+                            .plan
+                            .instances
+                            .get(&instance)
+                            .ok_or("Wasm: missing sealed instance")?,
+                    );
+                }
+                if matches!(self.mir.hir[node.index()].kind, HirKind::TypeApply) {
+                    return self.expression(child(self.mir, node, Role::Callee)?);
+                }
+                let symbol = symbol(self.mir, node)?;
+                if let Some(&local) = self.bindings.get(&symbol) {
+                    return Ok(local);
+                }
+                self.call_key(
+                    *self
+                        .plan
+                        .globals
+                        .get(&symbol)
+                        .ok_or_else(|| format!(
+                            "Wasm: lexical capture {} ({symbol:?}) is not available at {node:?} in {:?}",
+                            self.mir.symbols[symbol.index()].name, self.key
+                        ))?,
+                )
+            }
+            HirKind::TypeAscription => {
+                let inner = child(self.mir, node, Role::Value)?;
+                let value = self.expression(inner)?;
+                self.adapt(
+                    node,
+                    self.effective_ty(inner)?,
+                    self.effective_ty(node)?,
+                    value,
+                )
+            }
+            HirKind::Block => {
+                self.reserve_local_instances(node)?;
+                for edge in &self.mir.hir[node.index()].children {
+                    if edge.role == Role::Binding
+                        && matches!(
+                            self.mir.hir[edge.node.index()].kind,
+                            HirKind::Binding {
+                                kind: telora_core::ast::BindingKind::Def,
+                                ..
+                            }
+                        )
+                        && self.mir.hir_symbols[edge.node.index()].is_some_and(|symbol| {
+                            self.mir.symbol_generics[symbol.index()].is_empty()
+                        })
+                        && self.mir.types[self.ty(edge.node)?.index()].constructor
+                            == TypeConstructor::Function
+                    {
+                        let symbol = self.mir.hir_symbols[edge.node.index()]
+                            .ok_or("Wasm: local definition has no symbol")?;
+                        let reserved = self.alloc(FUNCTION_BYTES);
+                        self.bindings.insert(symbol, reserved);
+                    }
+                }
+                for edge in &self.mir.hir[node.index()].children {
+                    if edge.role == Role::Binding {
+                        if self.emit_local_template(edge.node)? {
+                            continue;
+                        }
+                        self.expression(edge.node)?;
+                    }
+                }
+                self.expression(child(self.mir, node, Role::Result)?)
+            }
+            HirKind::Binary(telora_core::ast::BinaryOperator::StructUpdate) => {
+                self.struct_update(node)
+            }
+            HirKind::Binary(op) => self.binary(node, *op),
+            HirKind::Unary(op) => self.unary(node, *op),
+            HirKind::If => {
+                let condition_node = child(self.mir, node, Role::Condition)?;
+                if self.mir.types[self.ty(condition_node)?.index()].constructor
+                    != TypeConstructor::Bool
+                {
+                    return Err("Wasm: condition is not sealed Bool".into());
+                }
+                let condition = self.expression(condition_node)?;
+                let result = self.local(ValType::I32);
+                self.bits(condition);
+                self.extend([I::I64Eqz, I::If(BlockType::Empty)]);
+                let no = self.expression(child(self.mir, node, Role::Else)?)?;
+                self.extend([I::LocalGet(no), I::LocalSet(result), I::Else]);
+                let yes = self.expression(child(self.mir, node, Role::Then)?)?;
+                self.extend([I::LocalGet(yes), I::LocalSet(result), I::End]);
+                Ok(result)
+            }
+            HirKind::Return => {
+                let value = self.expression(child(self.mir, node, Role::Value)?)?;
+                self.extend([I::LocalGet(value), I::Return]);
+                Ok(value)
+            }
+            HirKind::Debug { .. } => self.debug(node),
+            HirKind::Closure | HirKind::Interpreter => self.closure(node),
+            HirKind::Call => self.call(node),
+            other => Err(format!(
+                "Wasm: unsupported expression {other:?} at {:?}",
+                self.mir.hir[node.index()].location
+            )),
+        }
+    }
+}
+
+pub(crate) fn compile(
+    mir: &Mir,
+    plan: &Plan,
+    key: Key,
+) -> Result<crate::object::ObjectFunction, String> {
+    let mut emit = Emitter::new(mir, plan, key);
+    if let Special::Equal(ty) = key.special {
+        emit.compare_type(ty)?;
+    } else if let Special::Parse(ty) = key.special {
+        let value = emit.parse_type(ty)?;
+        emit.emit(I::LocalGet(value));
+    } else if let Special::Json(ty) = key.special {
+        emit.json_type(ty)?;
+    } else if let Special::Encode(source, target) = key.special {
+        let value = emit.codec_encode_type(source, target, 1)?;
+        emit.emit(I::LocalGet(value));
+    } else if let Special::Decode(source, target) = key.special {
+        let value = emit.codec_decode_type(source, target, 1)?;
+        emit.emit(I::LocalGet(value));
+    } else if let Special::DecodeVariant(source, target, index) = key.special {
+        let value = emit.codec_decode_variant(source, target, index)?;
+        emit.emit(I::LocalGet(value));
+    } else if key.callable && crate::natives::identity(mir, key.node).is_some() {
+        let value = emit.native()?;
+        emit.emit(I::LocalGet(value));
+    } else if key.callable && matches!(mir.hir[key.node.index()].kind, HirKind::Interpreter) {
+        let value = emit.interpreter()?;
+        emit.emit(I::LocalGet(value));
+    } else if key.callable && !matches!(mir.hir[key.node.index()].kind, HirKind::Closure) {
+        let value = emit.constructor()?;
+        emit.emit(I::LocalGet(value));
+    } else if key.callable {
+        emit.plan_tail_calls()?;
+        for (index, symbol) in plan.captures[&key].iter().enumerate() {
+            let local = emit.local(ValType::I32);
+            emit.extend([
+                I::LocalGet(0),
+                I::I32Load(memory(index as u64 * 4, 2)),
+                I::LocalSet(local),
+            ]);
+            emit.bindings.insert(*symbol, local);
+        }
+        for (index, instance) in plan.instance_captures[&key].iter().enumerate() {
+            let local = emit.local(ValType::I32);
+            emit.extend([
+                I::LocalGet(0),
+                I::I32Load(memory((index + plan.captures[&key].len()) as u64 * 4, 2)),
+                I::LocalSet(local),
+            ]);
+            emit.local_instances.insert(*instance, local);
+        }
+        for (index, edge) in mir.hir[key.node.index()]
+            .children
+            .iter()
+            .filter(|e| e.role == Role::Parameter)
+            .enumerate()
+        {
+            let symbol =
+                mir.hir_symbols[edge.node.index()].ok_or("Wasm: parameter has no stable symbol")?;
+            let local = emit.local(ValType::I32);
+            emit.extend([
+                I::LocalGet(1),
+                I::I32Load(memory(index as u64 * 4, 2)),
+                I::LocalSet(local),
+            ]);
+            emit.bindings.insert(symbol, local);
+        }
+        let value = emit.expression(child(mir, key.node, Role::Body)?)?;
+        emit.emit(I::LocalGet(value));
+    } else {
+        let offset = plan.demands[&key];
+        // 0 = empty, 1 = evaluating, 2 = ready, 3 = failed.
+        emit.extend([
+            I::I32Const(offset as i32),
+            I::I32Load(memory(0, 2)),
+            I::I32Const(2),
+            I::I32Eq,
+            I::If(BlockType::Empty),
+            I::I32Const(offset as i32),
+            I::I32Load(memory(4, 2)),
+            I::Return,
+            I::End,
+            I::I32Const(offset as i32),
+            I::I32Load(memory(0, 2)),
+            I::I32Const(3),
+            I::I32Eq,
+            I::If(BlockType::Empty),
+            I::I32Const(offset as i32),
+            I::I32Load(memory(4, 2)),
+            I::GlobalSet(ERROR_GLOBAL),
+            I::I32Const(3),
+            I::GlobalSet(PHASE_GLOBAL),
+            I::I32Const(0),
+            I::Return,
+            I::End,
+            I::I32Const(offset as i32),
+            I::I32Load(memory(0, 2)),
+        ]);
+        emit.fail_if(key.node, ERROR_CYCLE);
+        emit.extend([
+            I::I32Const(offset as i32),
+            I::I32Const(1),
+            I::I32Store(memory(0, 2)),
+        ]);
+        let value = match key.special {
+            Special::Property(index) => emit.property_chain(index)?,
+            _ => emit.expression(key.node)?,
+        };
+        emit.emit(I::LocalGet(value));
+    }
+    Ok(emit.finish())
+}

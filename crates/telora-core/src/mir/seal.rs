@@ -12,20 +12,76 @@ pub struct SealedMir<'a> {
 }
 
 impl Mir {
+    pub(crate) fn record_construction_inputs(&self) -> Vec<bool> {
+        let mut inputs = vec![false; self.hir.len()];
+        let mut pending = Vec::new();
+        for node in &self.hir {
+            if matches!(node.kind, HirKind::Binary(crate::ast::BinaryOperator::StructUpdate)) {
+                pending.extend(node.children.iter().filter(|edge| edge.role == Role::Right).map(|edge| edge.node));
+            }
+        }
+        while let Some(node) = pending.pop() {
+            if inputs[node.index()] { continue; }
+            match self.hir[node.index()].kind {
+                HirKind::Dict => {
+                    inputs[node.index()] = true;
+                    for field in self.hir[node.index()].children.iter().filter(|edge| edge.role == Role::Field) {
+                        for value in self.hir[field.node.index()].children.iter().filter(|edge| edge.role == Role::Value) {
+                            if matches!(self.hir[value.node.index()].kind, HirKind::Spread) {
+                                pending.extend(self.hir[value.node.index()].children.iter().filter(|edge| edge.role == Role::Operand).map(|edge| edge.node));
+                            }
+                        }
+                    }
+                }
+                HirKind::FieldProjection => inputs[node.index()] = true,
+                _ => {}
+            }
+        }
+        for module in &self.modules {
+            if let ModuleState::Source { body, .. } | ModuleState::Data { body } = module.state {
+                for edge in self.hir[body.index()].children.iter().filter(|edge| edge.role == Role::Result) {
+                    inputs[edge.node.index()] = true;
+                }
+            }
+        }
+        inputs
+    }
+    fn valid_value_adjustment(&self, node: HirId, source: TypeId, target: TypeId, instance: Option<&GenericInstance>) -> bool {
+        let source = &self.types[source.index()];
+        if source.constructor == TypeConstructor::Unchecked { return source.arguments == [target]; }
+        let target = &self.types[target.index()];
+        if !matches!(self.hir[node.index()].kind, HirKind::Closure)
+            || source.constructor != TypeConstructor::Function || target.constructor != TypeConstructor::Function
+            || source.arguments.is_empty() || source.arguments.len() != target.arguments.len() { return false; }
+        let last = source.arguments.len() - 1;
+        if source.arguments[..last] != target.arguments[..last] { return false; }
+        let result = &self.types[source.arguments[last].index()];
+        if result.constructor != TypeConstructor::Unchecked || result.arguments != [target.arguments[last]] { return false; }
+        let Some(boundary) = self.hir[node.index()].children.iter().find(|edge| edge.role == Role::ReturnType).map(|edge| edge.node) else { return false; };
+        let adjusted = if let Some(instance) = instance { instance.adjustment(boundary) } else {
+            self.value_adjustments[boundary.index()].and_then(|slot| match self.ty_slots[slot.index()] {
+                TypeState::Known(ty) => Some(ty), _ => None,
+            })
+        };
+        adjusted == Some(target.arguments[last])
+    }
     /// These source forms have a fixed runtime representation. Check their
     /// solved skeleton before publishing MIR, including specialized bodies.
-    pub(crate) fn value_shape_error(&self, node: HirId, ty: TypeId) -> Option<&'static str> {
+    pub(crate) fn value_shape_error(&self, node: HirId, ty: TypeId, construction_inputs: &[bool]) -> Option<&'static str> {
         let shape = &self.types[ty.index()];
         match self.hir[node.index()].kind {
             HirKind::Binding { kind: crate::ast::BindingKind::Native, .. }
                 if shape.constructor != TypeConstructor::Function =>
                 Some("native declaration requires a function signature"),
-            HirKind::Dict => {
+            HirKind::Dict | HirKind::FieldProjection => {
+                if matches!(shape.constructor, TypeConstructor::Record(_)) && construction_inputs[node.index()] {
+                    return None;
+                }
                 let shape = if shape.constructor == TypeConstructor::Unchecked {
                     &self.types[shape.arguments[0].index()]
                 } else { shape };
                 let supported = match shape.constructor {
-                    TypeConstructor::Dict | TypeConstructor::Record(_) => true,
+                    TypeConstructor::Dict => true,
                     TypeConstructor::Nominal(symbol) => self.type_definitions.iter()
                         .any(|definition| definition.symbol == symbol && definition.operation == TypeOperation::Struct),
                     _ => false,
@@ -175,6 +231,25 @@ impl Mir {
     }
 
     pub fn seal(&self) -> Result<SealedMir<'_>, Vec<Diagnostic>> {
+        if self.value_materializations.len() == self.hir.len() {
+            let mut invalid = Vec::new();
+            for (index, fact) in self.value_materializations.iter().enumerate() {
+                let node = HirId(index as u32);
+                if fact.is_some() && let Some(TypeState::Known(ty)) = self.ty_slots.get(index)
+                    && !self.valid_materialization_type(node, *ty) {
+                    invalid.push(Diagnostic::error(format!("invalid materialization {fact:?} for {:?}", self.types.get(ty.index())), self.hir[index].location));
+                }
+            }
+            for instance in &self.generic_instances {
+                for &(node, ty) in &instance.types {
+                    if !self.valid_materialization_type(node, ty) {
+                        invalid.push(Diagnostic::error(format!("invalid instantiated materialization {:?} for {:?}", self.value_materializations[node.index()], self.types.get(ty.index())), self.hir[node.index()].location));
+                    }
+                }
+            }
+            if !invalid.is_empty() { return Err(invalid); }
+        }
+        let construction_inputs = self.record_construction_inputs();
         if !self.symbols_closed
             || !self.types_solved
             || !self.type_unknowns.is_empty()
@@ -184,16 +259,20 @@ impl Mir {
             || self.implementation_instances.len() != self.hir.len()
             || self.type_layouts.len() != self.types.len()
             || self.member_selections.len() != self.hir.len()
+            || self.value_materializations.len() != self.hir.len()
+            || self.value_materializations.iter().enumerate().any(|(node, fact)| {
+                let node = HirId(node as u32);
+                *fact != self.materialization_identity(node)
+            })
             || !self.valid_type_schemes()
             || !self.valid_generic_references()
-            || !self.valid_function_families()
             || !self.valid_properties()
             || !self.valid_check_coverage()
             || !self.valid_property_admissions()
             || self.hir.iter().enumerate().any(|(node, _)| matches!(self.ty_slots.get(node), Some(TypeState::Known(ty))
-                if self.value_shape_error(HirId(node as u32), *ty).is_some()))
+                if self.value_shape_error(HirId(node as u32), *ty, &construction_inputs).is_some()))
             || self.generic_instances.iter().any(|instance| instance.types.iter()
-                .any(|(node, ty)| self.value_shape_error(*node, *ty).is_some()))
+                .any(|(node, ty)| self.value_shape_error(*node, *ty, &construction_inputs).is_some()))
             || self.hir.iter().any(|node| matches!(node.kind, HirKind::LetElse)
                 && node.children.iter().find(|edge| edge.role == Role::Else).is_none_or(|edge|
                     !matches!(self.ty_slots.get(edge.node.index()), Some(TypeState::Known(ty))
@@ -217,12 +296,12 @@ impl Mir {
             || self.generic_instances.iter().any(|instance| instance.types.iter().any(|(node, source)| {
                 if self.value_adjustments.get(node.index()).is_none_or(Option::is_none) { return false; }
                 let Some(target) = instance.adjustment(*node) else { return true; };
-                self.types[source.index()].constructor != TypeConstructor::Unchecked || self.types[source.index()].arguments != [target]
+                !self.valid_value_adjustment(*node, *source, target, Some(instance))
             }))
             || self.value_adjustments.iter().enumerate().any(|(node, slot)| {
                 let Some(slot) = slot else { return false; };
                 let (Some(TypeState::Known(source)), Some(TypeState::Known(target))) = (self.ty_slots.get(node), self.ty_slots.get(slot.index())) else { return true; };
-                self.types[source.index()].constructor != TypeConstructor::Unchecked || self.types[source.index()].arguments != [*target]
+                !self.valid_value_adjustment(HirId(node as u32), *source, *target, None)
             })
             || self.construction_checks.iter().any(|check| {
                 let signature = if let Some(instance) = check.instance {
@@ -236,7 +315,7 @@ impl Mir {
             || self.type_instances.iter().enumerate().any(|(node, arguments)| {
                 !arguments.is_empty()
                     && (arguments.iter().any(|(_, slot)| !matches!(self.ty_slots[slot.index()], TypeState::Known(_)))
-                        || !matches!(self.generic_references[node], Some(GenericReference::Instance(_) | GenericReference::Quantified { .. })))
+                        || !matches!(self.generic_references[node], Some(GenericReference::Instance(_))))
             })
             || self.bound_requirements.iter().any(|b| !b.state.is_proven())
             || self
@@ -271,10 +350,5 @@ impl<'a> SealedMir<'a> {
     }
     pub fn types(&self) -> &TypeImage {
         &self.types
-    }
-
-    /// Transfer the image to the executable artifact without a second copy.
-    pub(crate) fn into_parts(self) -> (&'a Mir, TypeImage) {
-        (self.mir, self.types)
     }
 }

@@ -1,5 +1,7 @@
+use super::*;
+
 impl<'a> Lowerer<'a> {
-    fn recovered_expression_prefix(&self, node: NodeRef) -> Option<Expr> {
+    pub(super) fn recovered_expression_prefix(&self, node: NodeRef) -> Option<Expr> {
         if let Ok(expression) = self.expression(node) { return Some(expression); }
         if matches!(self.rule(node), Some(Rule::Expression | Rule::Primary | Rule::DotPostfixExpr)) {
             let receiver = self.children(node).find(|&child| self.is_expression(child))?;
@@ -8,7 +10,7 @@ impl<'a> Lowerer<'a> {
         None
     }
 
-    fn expression(&self, node: NodeRef) -> Result<Expr, Diagnostic> {
+    pub(super) fn expression(&self, node: NodeRef) -> Result<Expr, Diagnostic> {
         if let Node::Token(token, _) = self.cst.get(node) {
             let location = self.location(node);
             let inner = match token {
@@ -486,7 +488,7 @@ impl<'a> Lowerer<'a> {
         Ok(located(inner, location))
     }
 
-    fn ctrl_block(
+    pub(super) fn ctrl_block(
         &self,
         node: NodeRef,
         blocks: &[NodeRef],
@@ -515,7 +517,7 @@ impl<'a> Lowerer<'a> {
         ))
     }
 
-    fn lower_contextual_intrinsic(
+    pub(super) fn lower_contextual_intrinsic(
         &self,
         node: NodeRef,
         type_parameters: &[Identifier],
@@ -545,7 +547,7 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    fn lower_postfix_intrinsic(
+    pub(super) fn lower_postfix_intrinsic(
         &self,
         receiver_node: NodeRef,
         receiver: Expr,
@@ -575,7 +577,7 @@ impl<'a> Lowerer<'a> {
         )
     }
 
-    fn lower_named_intrinsic(
+    pub(super) fn lower_named_intrinsic(
         &self,
         name: &str,
         name_node: NodeRef,
@@ -585,7 +587,7 @@ impl<'a> Lowerer<'a> {
         self.lower_named_intrinsic_with_receiver(name, name_node, argument_nodes, None, invocation)
     }
 
-    fn lower_named_intrinsic_with_receiver(
+    pub(super) fn lower_named_intrinsic_with_receiver(
         &self,
         name: &str,
         name_node: NodeRef,
@@ -598,7 +600,6 @@ impl<'a> Lowerer<'a> {
             "panic"
                 | "dbg"
                 | "ty"
-                | "cast"
                 | "ok_or_warn"
                 | "unwrap"
                 | "fail"
@@ -648,26 +649,6 @@ impl<'a> Lowerer<'a> {
                 },
                 self.location(invocation),
             ))
-        } else if name == "cast" {
-            if arguments.len() != 2 {
-                return Err(self.error(
-                    invocation,
-                    format!(
-                        "cast! expects a value and a Type, found {} arguments",
-                        arguments.len()
-                    ),
-                ));
-            }
-            let mut arguments = arguments.into_iter();
-            let value = arguments.next().expect("two arguments");
-            let target = self.normalize_type_expression(arguments.next().expect("two arguments"))?;
-            Ok(located(
-                ExprKind::CheckedCast {
-                    value: Box::new(value),
-                    target: Box::new(target),
-                },
-                self.location(invocation),
-            ))
         } else if matches!(name, "ok_or_warn" | "unwrap") {
             self.lower_unwrap(name, arguments, invocation, self.location(name_node))
         } else if matches!(name, "fail" | "blame" | "raise" | "warn") {
@@ -688,7 +669,7 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    fn lower_debug(
+    pub(super) fn lower_debug(
         &self,
         arguments: &[NodeRef],
         receiver: Option<Expr>,
@@ -728,7 +709,7 @@ impl<'a> Lowerer<'a> {
         ))
     }
 
-    fn lower_blame(
+    pub(super) fn lower_blame(
         &self,
         name: &str,
         arguments: Vec<Expr>,
@@ -761,7 +742,7 @@ impl<'a> Lowerer<'a> {
         }, location))
     }
 
-    fn lower_unwrap(
+    pub(super) fn lower_unwrap(
         &self,
         name: &str,
         arguments: Vec<Expr>,
@@ -880,7 +861,7 @@ impl<'a> Lowerer<'a> {
         ))
     }
 
-    fn lower_interpreter(
+    pub(super) fn lower_interpreter(
         &self,
         node: NodeRef,
         type_parameters: &[Identifier],

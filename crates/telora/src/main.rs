@@ -1,17 +1,13 @@
 use clap::{Args, Parser, Subcommand};
-use serde::Serialize;
 use serde_json::json;
 use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::path::PathBuf;
-use std::sync::Arc;
-use telora_core::lir::RegisterId;
 use telora_core::{
-    CallContext, DataLimits, DebugEvent, DebugSink, EesCall, EesReply,
-    NativeError, NativeFunction, Quota, RunHost,
-    RunHostFuture, RunTermination, SystemCaps, SystemDataSource, SystemEvent, SystemStdin,
+    DataLimits, EesCall, EesReply, RunHost,
+    RunHostFuture, SystemCaps, SystemDataSource, SystemEvent, SystemStdin,
 };
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::sync::{mpsc, watch};
@@ -19,6 +15,7 @@ use tokio::task::JoinSet;
 mod ees_arg;
 mod ees_cli;
 mod eval_cli;
+mod wasm_cli;
 mod source_arg;
 mod static_cli;
 use telora::static_input;
@@ -29,47 +26,18 @@ use eval_cli::{EvalArgs, EvalWithArgs};
 use source_arg::{NamedSource, collect_entry_sources, is_stdin_source, parse_named_source};
 use telora::package_host;
 
-const EVALUATION_FUEL: usize = 1_000_000;
-const STACK_SLOTS: usize = 65_536;
-const ALLOCATION_BYTES: u64 = 256 * 1024 * 1024;
+const EVALUATION_FUEL: u64 = 100_000_000;
 const QUERY_SCHEMA: &str = "telora.query/v1";
 
 struct ExecutionConfig {
-    session_quota: Quota,
+    fuel: u64,
     data_limits: DataLimits,
 }
 
 fn execution_config() -> ExecutionConfig {
     ExecutionConfig {
-        session_quota: Quota::new(EVALUATION_FUEL, STACK_SLOTS, ALLOCATION_BYTES),
+        fuel: EVALUATION_FUEL,
         data_limits: DataLimits::default(),
-    }
-}
-
-struct StderrDebugSink;
-
-#[derive(Serialize)]
-struct DebugRecord<'a> {
-    name: &'a str,
-    repr: &'a str,
-    module: &'a str,
-    line: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    message: Option<&'a str>,
-}
-
-impl DebugSink for StderrDebugSink {
-    fn emit(&self, event: DebugEvent) {
-        let record = DebugRecord {
-            name: &event.name,
-            repr: &event.repr,
-            module: &event.module,
-            line: event.line,
-            message: event.message.as_deref(),
-        };
-        if let Ok(record) = serde_json::to_string(&record) {
-            eprintln!("{record}");
-        }
     }
 }
 
@@ -94,14 +62,27 @@ enum ReaderEvent {
     Error(String),
 }
 
+async fn send_reader_event(
+    sender: &mpsc::Sender<ReaderEvent>,
+    cancel: &mut watch::Receiver<bool>,
+    event: ReaderEvent,
+) -> bool {
+    if *cancel.borrow() { return false; }
+    tokio::select! {
+        biased;
+        _ = cancel.changed() => false,
+        sent = sender.send(event) => sent.is_ok(),
+    }
+}
+
 struct ProcessRunHost {
     source_locators: BTreeMap<String, String>,
     ees: Option<telora_ees::Service>,
     ees_actors: BTreeMap<String, String>,
     ees_active: HashSet<String>,
     ees_vars: Vec<NamedEesVar>,
-    sender: mpsc::UnboundedSender<ReaderEvent>,
-    receiver: mpsc::UnboundedReceiver<ReaderEvent>,
+    sender: mpsc::Sender<ReaderEvent>,
+    receiver: mpsc::Receiver<ReaderEvent>,
     cancel: watch::Sender<bool>,
     tasks: JoinSet<(String, Result<(), String>)>,
     finished: bool,
@@ -109,7 +90,7 @@ struct ProcessRunHost {
 
 impl ProcessRunHost {
     fn new(source_locators: BTreeMap<String, String>, ees_vars: Vec<NamedEesVar>) -> Self {
-        let (sender, receiver) = mpsc::unbounded_channel();
+        let (sender, receiver) = mpsc::channel(64);
         let (cancel, _) = watch::channel(false);
         Self {
             source_locators,
@@ -144,170 +125,7 @@ impl ProcessRunHost {
     }
 }
 
-fn native_string(
-    context: &CallContext<'_, '_>,
-    register: RegisterId,
-    path: &str,
-) -> Result<String, NativeError> {
-    context
-        .value(register)?
-        .as_str()
-        .map(|value| value.as_str().to_owned())
-        .ok_or_else(|| NativeError::new(format!("{path} must be String")))
-}
-
-fn native_field(
-    context: &mut CallContext<'_, '_>,
-    source: RegisterId,
-    field: &str,
-) -> Result<RegisterId, NativeError> {
-    let destination = context.scratch()?;
-    context.copy_field(destination, source, field)?;
-    Ok(destination)
-}
-
-fn native_dict_fields(
-    context: &CallContext<'_, '_>,
-    register: RegisterId,
-    path: &str,
-) -> Result<Vec<String>, NativeError> {
-    context
-        .value(register)?
-        .dict_fields()
-        .map(|fields| fields.into_iter().map(str::to_owned).collect())
-        .ok_or_else(|| NativeError::new(format!("{path} must be Dict")))
-}
-
-fn prepare_system_resources(context: &mut CallContext<'_, '_>) -> Result<(), NativeError> {
-    let caps = context.argument(0)?;
-    let _value_owner = context.argument(1)?;
-    let prepared_data = context.argument(2)?;
-    let prepared_keys = native_dict_fields(context, prepared_data, "prepared data sources")?
-        .into_iter()
-        .collect::<std::collections::HashSet<_>>();
-
-    let data_requests = native_field(context, caps, "data_srcs")?;
-    let mut data_fields = Vec::new();
-    for key in native_dict_fields(context, data_requests, "SystemCaps.data_srcs")? {
-        if prepared_keys.contains(key.as_str()) {
-            let item = context.scratch()?;
-            context.copy_field(item, prepared_data, &key)?;
-            data_fields.push((key, item));
-            continue;
-        }
-        let request = native_field(context, data_requests, &key)?;
-        let src_register = native_field(context, request, "src")?;
-        let src = native_string(context, src_register, "DataSrc.src")?;
-        let data = context.scratch()?;
-        let default = native_field(context, request, "default")?;
-        if context.value(default)?.as_atom().as_deref() == Some("None") {
-            return Err(NativeError::new(format!(
-                "cannot read data source {src:?}: file does not exist"
-            )));
-        }
-        context.copy_tagged_payload(data, default)?;
-        let item = context.scratch()?;
-        context.make_dict(item, &[("data".into(), data), ("src".into(), src_register)])?;
-        data_fields.push((key, item));
-    }
-    let data = context.scratch()?;
-    context.make_dict(data, &data_fields)?;
-
-    let text_requests = native_field(context, caps, "text_srcs")?;
-    let mut text_fields = Vec::new();
-    for key in native_dict_fields(context, text_requests, "SystemCaps.text_srcs")? {
-        let request = native_field(context, text_requests, &key)?;
-        let src_register = native_field(context, request, "src")?;
-        let src = native_string(context, src_register, "TextSrc.src")?;
-        let text = context.scratch()?;
-        match fs::read_to_string(&src) {
-            Ok(source) => context.set_string(text, source)?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                let default = native_field(context, request, "default")?;
-                if context.value(default)?.as_atom().as_deref() == Some("None") {
-                    return Err(NativeError::new(format!(
-                        "cannot read text source {src:?}: {error}"
-                    )));
-                }
-                context.copy_tagged_payload(text, default)?;
-            }
-            Err(error) => {
-                return Err(NativeError::new(format!(
-                    "cannot read text source {src:?}: {error}"
-                )));
-            }
-        }
-        let item = context.scratch()?;
-        context.make_dict(item, &[("data".into(), text), ("src".into(), src_register)])?;
-        text_fields.push((key, item));
-    }
-    let texts = context.scratch()?;
-    context.make_dict(texts, &text_fields)?;
-
-    let requested_vars = native_field(context, caps, "vars")?;
-    let var_count = context
-        .value(requested_vars)?
-        .sequence_len()
-        .ok_or_else(|| NativeError::new("SystemCaps.vars must be Array(String)"))?;
-    let mut var_fields = Vec::new();
-    for index in 0..var_count {
-        let name_register = context.scratch()?;
-        context.copy_sequence_item(name_register, requested_vars, index)?;
-        let name = native_string(context, name_register, "SystemCaps.vars item")?;
-        match env::var(&name) {
-            Ok(value) => {
-                let value_register = context.scratch()?;
-                context.set_string(value_register, value)?;
-                var_fields.push((name, value_register));
-            }
-            Err(env::VarError::NotPresent) => {}
-            Err(error) => {
-                return Err(NativeError::new(format!(
-                    "cannot read variable {name:?}: {error}"
-                )));
-            }
-        }
-    }
-    let vars = context.scratch()?;
-    context.make_dict(vars, &var_fields)?;
-
-    let stdin_mode = native_field(context, caps, "stdin")?;
-    let stdin = context.scratch()?;
-    match context.value(stdin_mode)?.as_atom().as_deref() {
-        Some("Text") => {
-            let mut source = String::new();
-            Read::read_to_string(&mut io::stdin(), &mut source).map_err(|error| {
-                NativeError::new(format!("cannot read standard input: {error}"))
-            })?;
-            let tag = context.scratch()?;
-            let payload = context.scratch()?;
-            context.set_atom(tag, "Some")?;
-            context.set_string(payload, source)?;
-            context.make_tagged(stdin, tag, payload)?;
-        }
-        Some("Lined" | "Null") => context.set_none(stdin)?,
-        _ => return Err(NativeError::new("SystemCaps.stdin is invalid")),
-    }
-
-    context.make_dict(
-        context.result(),
-        &[
-            ("data".into(), data),
-            ("texts".into(), texts),
-            ("vars".into(), vars),
-            ("stdin".into(), stdin),
-        ],
-    )
-}
-
 impl RunHost for ProcessRunHost {
-    fn resources_provider(&mut self) -> NativeFunction {
-        NativeFunction::new(
-            "telora.cli.prepare_system_resources",
-            3,
-            prepare_system_resources,
-        )
-    }
 
     fn ees_actors(&self) -> BTreeMap<String, String> {
         self.ees_actors.clone()
@@ -363,17 +181,19 @@ impl RunHost for ProcessRunHost {
                         };
                         match line {
                             Ok(Some(line)) => {
-                                let _ = sender
-                                    .send(ReaderEvent::Event(SystemEvent::StdinLine(Some(line))));
+                                if !send_reader_event(&sender, &mut cancel,
+                                    ReaderEvent::Event(SystemEvent::StdinLine(Some(line)))).await {
+                                    return ("<stdin>".into(), Ok(()));
+                                }
                             }
                             Ok(None) => {
-                                let _ =
-                                    sender.send(ReaderEvent::Event(SystemEvent::StdinLine(None)));
+                                send_reader_event(&sender, &mut cancel,
+                                    ReaderEvent::Event(SystemEvent::StdinLine(None))).await;
                                 return ("<stdin>".into(), Ok(()));
                             }
                             Err(error) => {
                                 let message = format!("cannot read standard input: {error}");
-                                let _ = sender.send(ReaderEvent::Error(message.clone()));
+                                send_reader_event(&sender, &mut cancel, ReaderEvent::Error(message.clone())).await;
                                 return ("<stdin>".into(), Err(message));
                             }
                         }
@@ -444,6 +264,7 @@ impl RunHost for ProcessRunHost {
             };
             let key = call.key.clone();
             let sender = self.sender.clone();
+            let mut cancel = self.cancel.subscribe();
             self.tasks.spawn(async move {
                 let event = service
                     .dispatch(
@@ -457,12 +278,13 @@ impl RunHost for ProcessRunHost {
                     )
                     .await;
                 let result = event.into_value();
-                let sent = sender
-                    .send(ReaderEvent::Event(SystemEvent::EesReply(EesReply {
+                let sent = send_reader_event(&sender, &mut cancel,
+                    ReaderEvent::Event(SystemEvent::EesReply(EesReply {
                         key: key.clone(),
                         result,
-                    })))
-                    .map_err(|_| "EES reply channel disconnected".to_owned());
+                    }))).await;
+                let sent = if sent || *cancel.borrow() { Ok(()) }
+                    else { Err("EES reply channel disconnected".to_owned()) };
                 (format!("ees:{key}"), sent)
             });
             Ok(())
@@ -472,6 +294,12 @@ impl RunHost for ProcessRunHost {
     fn next_event(&mut self) -> RunHostFuture<'_, Result<Option<SystemEvent>, String>> {
         Box::pin(async move {
             loop {
+                // A continuously nonempty event queue must not retain completed
+                // task records until shutdown.
+                while let Some(joined) = self.tasks.try_join_next() {
+                    let (_, result) = joined.map_err(|error| format!("Host task failed: {error}"))?;
+                    result?;
+                }
                 if let Ok(event) = self.receiver.try_recv() {
                     return self.receive_event(event);
                 }
@@ -572,8 +400,6 @@ struct RunArgs {
 struct ApplicationArgs {
     #[arg(value_name = "MODULE:EXPORT", value_parser = parse_application_selector)]
     selector: ApplicationSelector,
-    #[arg(long)]
-    best_effort: bool,
     /// Provide a named Value source: NAME=PATH or NAME=(file|stdin)+(json|yaml|toml)://PATH.
     #[arg(long = "source", value_name = "NAME=SOURCE", value_parser = parse_named_source)]
     sources: Vec<NamedSource>,
@@ -607,6 +433,9 @@ struct CheckArgs {
     /// Solve types without executing tool, property, or runtime code.
     #[arg(long = "only-types")]
     types_only: bool,
+    /// Export experimental MIR-derived layouts without execution.
+    #[arg(long, hide = true, value_name = "FILENAME")]
+    dump_types_layout: Option<PathBuf>,
     /// Check all declared modules in the current crate, including private modules.
     #[arg(long)]
     lib: bool,
@@ -842,8 +671,8 @@ async fn run_command(
     }
     let module_id = &arguments.selector.module_id;
     let mode = match entry {
-        "run" => telora_core::codegen::RunMode::Run,
-        "serve" => telora_core::codegen::RunMode::Serve,
+        "run" => telora_core::entry_plan::RunMode::Run,
+        "serve" => telora_core::entry_plan::RunMode::Serve,
         _ => return Err(format!("unknown entry mode {entry:?}")),
     };
     let mut inventory = static_input::Inventory::new(&context, module_id.starts_with("std/"))?;
@@ -859,46 +688,13 @@ async fn run_command(
         }
     }
     let static_failed = mir.diagnostics.iter().any(|d| d.severity == telora_core::source::Severity::Error);
-    if arguments.best_effort {
-        for diagnostic in &mir.diagnostics {
-            emit_stderr(static_cli::diagnostic(&mir, "telora.run/v1", module_id, diagnostic))?;
-        }
-        if static_failed {
-            emit_stderr(json!({"schema": "telora.run/v1", "module": module_id, "record": "summary", "status": "error"}))?;
-            return Ok(1);
-        }
-    } else if static_failed {
+    if static_failed {
         return Err(mir.diagnostics.iter().map(|d| mir.sources.render(d)).collect::<Vec<_>>().join("\n"));
     }
     let telora_core::mir::ModuleTarget::Bound(root) = mir.roots[0] else { return Err("entry adapter module is unresolved".into()) };
     let symbol = *mir.exports[root.index()].iter().find(|s| mir.symbols[s.index()].name == "configure")
         .ok_or("entry adapter has no configuration export")?;
-    let artifact = mir.seal().and_then(|sealed| telora_core::codegen::compile_run(sealed, symbol))
-        .map_err(|errors| errors.iter().map(|d| mir.sources.render(d)).collect::<Vec<_>>().join("\n"))?;
-    let config = execution_config();
-    let linked = telora_core::execution_link::link_entry_with_data(artifact, |link| inventory.read_data(link, config.data_limits.file_size))
-        .map_err(|errors| errors.iter().map(|d| mir.sources.render(d)).collect::<Vec<_>>().join("\n"))?;
-    let mut host = ProcessRunHost::new(entry_sources.locators, arguments.ees_vars);
-    let outcome = telora_core::Vm::new().with_debug_sink(Arc::new(StderrDebugSink))
-        .execute_run(
-            linked,
-            mode,
-            &arguments.args,
-            &entry_sources.entry,
-            &mut host,
-            config.session_quota,
-            config.data_limits,
-            &mut mir.sources,
-        )
-        .await?;
-    io::stdout()
-        .write_all(outcome.output.as_bytes())
-        .and_then(|()| io::stdout().flush())
-        .map_err(|error| format!("cannot write Entry output: {error}"))?;
-    match outcome.termination {
-        RunTermination::Exit(code) => i32::try_from(code)
-            .map_err(|_| format!("Entry exit status {code} is outside the Host range")),
-    }
+    wasm_cli::run::execute(mir, inventory, symbol, mode, arguments, entry_sources).await
 }
 
 fn command_context(context: Option<PathBuf>) -> Result<PathBuf, String> {

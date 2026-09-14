@@ -50,13 +50,14 @@ mod tests {
 
     #[test]
     fn generated_entry_policy_and_application_share_one_closed_graph() {
-        for (mode, family) in [(telora_core::codegen::RunMode::Run, "run"), (telora_core::codegen::RunMode::Serve, "serve")] {
+        for (mode, family) in [(telora_core::entry_plan::RunMode::Run, "run"), (telora_core::entry_plan::RunMode::Serve, "serve")] {
             let mir = inventory(family).solve_run("app/main", "main", mode).unwrap();
             let sealed = mir.seal().unwrap_or_else(|d| panic!("{family}: {d:?}\n{}", mir.diagnostics.iter().map(|d| mir.sources.render(d)).collect::<Vec<_>>().join("\n")));
             let telora_core::mir::ModuleTarget::Bound(root) = mir.roots[0] else { panic!("adapter root") };
             let entry = *mir.exports[root.index()].iter().find(|s| mir.symbols[s.index()].name == "configure").unwrap();
-            let compiled = telora_core::codegen::compile_run(sealed, entry).unwrap_or_else(|d| panic!("{family}: {d:?}"));
-            assert!(compiled.run_calls.is_some());
+            let telora_core::mir::TypeState::Known(ty) = mir.ty_slots[mir.symbol_types[entry.index()].index()] else { panic!("closed entry type") };
+            assert!(telora_core::entry_plan::run_contract(sealed.types(), ty).is_some());
+            sealed.seal_export(entry).unwrap_or_else(|d| panic!("{family}: {d:?}"));
             assert_eq!(mir.modules.iter().filter(|m| m.name == "app/main").count(), 1);
             assert!(mir.diagnostics.is_empty(), "{:?}", mir.diagnostics);
         }
@@ -65,9 +66,9 @@ mod tests {
     #[test]
     fn generated_entry_rejects_wrong_nominal_family_and_unsafe_export_text() {
         let mut inventory = inventory("serve");
-        let mir = inventory.solve_run("app/main", "main", telora_core::codegen::RunMode::Run).unwrap();
+        let mir = inventory.solve_run("app/main", "main", telora_core::entry_plan::RunMode::Run).unwrap();
         assert!(mir.seal().is_err(), "Serve cannot satisfy Run's nominal contract");
-        assert!(inventory.solve_run("app/main", "main }; fail!(\"injected\");", telora_core::codegen::RunMode::Run).is_err());
+        assert!(inventory.solve_run("app/main", "main }; fail!(\"injected\");", telora_core::entry_plan::RunMode::Run).is_err());
         assert!(inventory.request("app/main", "std/_entry/adapter").is_none());
     }
 }
@@ -138,23 +139,19 @@ impl Inventory {
         }
         Ok(warnings)
     }
-    /// Called by the execution linker after static solving and code generation.
-    pub fn read_data(
-        &self,
-        link: &telora_core::codegen::DataLink,
-        max_bytes: usize,
-    ) -> Result<telora_core::EvalSource, String> {
+    /// Read a catalog data module without depending on an execution linker.
+    pub fn read_data_text(&self, name: &str, max_bytes: usize) -> Result<(telora_core::data_plan::Format, String), String> {
         let entry = self
             .entries
-            .get(&link.name)
+            .get(name)
             .ok_or("unknown data module identity")?;
         let Source::File(path) = &entry.source else {
             return Err("data module has no file source".into());
         };
         let format = match entry.format {
-            ModuleFormat::Json => telora_core::SystemDataFormat::Json,
-            ModuleFormat::Yaml => telora_core::SystemDataFormat::Yaml,
-            ModuleFormat::Toml => telora_core::SystemDataFormat::Toml,
+            ModuleFormat::Json => telora_core::data_plan::Format::Json,
+            ModuleFormat::Yaml => telora_core::data_plan::Format::Yaml,
+            ModuleFormat::Toml => telora_core::data_plan::Format::Toml,
             ModuleFormat::Telora => {
                 return Err("source module cannot fill a data relocation".into());
             }
@@ -162,11 +159,7 @@ impl Inventory {
         let file = fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let bytes = read_limited(file, max_bytes, &path.display().to_string())?;
         let text = String::from_utf8(bytes).map_err(|e| format!("{}: {e}", path.display()))?;
-        Ok(telora_core::EvalSource {
-            source_name: link.name.clone(),
-            format,
-            text,
-        })
+        Ok((format, text))
     }
     pub fn new(context: &Path, builtin_only: bool) -> Result<Self, String> {
         let workspace = if builtin_only {
@@ -405,7 +398,7 @@ impl Inventory {
     }
 
     /// Compiler-owned entry sources share the application's graph and passes.
-    pub fn solve_run(&mut self, application: &str, export: &str, mode: telora_core::codegen::RunMode) -> Result<Mir, String> {
+    pub fn solve_run(&mut self, application: &str, export: &str, mode: telora_core::entry_plan::RunMode) -> Result<Mir, String> {
         let adapter = mode.adapter_source(application, export)?;
         for (name, source) in [
             (mode.policy_module(), Source::Embedded(mode.policy_source())),
