@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "packages": {
+    "sealed-min": {
+      "source": {
+        "workspace": ""
+      },
+      "modules": [
+        "@src/draft",
+        "@src/draft_alias",
+        "@src/draft_issue"
+      ],
+      "dependencies": []
+    }
+  }
+}

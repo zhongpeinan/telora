@@ -1,0 +1,2119 @@
+import "std/array" as array;
+import "std/codec" as codec;
+import "std/dict" as dict;
+import "std/json" as json;
+import "std/regex" as re;
+import "std/result" as result;
+import "std/string" as string;
+import "std/value" { Value };
+
+import "./draft_alias" {
+    DraftNodeAlias, DraftHopAlias, DraftBindingAlias, DraftOutputAlias,
+    DraftProjectionAlias, DraftClauseId, DraftOutputId,
+    node_alias, hop_alias, binding_alias, output_alias, projection_alias,
+    clause_id, output_id,
+};
+import "./draft_issue" { DraftIssue, DraftIssueCode, issue, at, ref };
+import DraftIssueCode.{BadLimit, BadPostAggregate, BadRankingTake, BadTimeRange, Decode, DuplicateAlias, EmptyOutput, KindNotString, MissingField, NoKind, NoOutputs, OntologyRevisionMismatch, Parse, RootBindingsForbidden, UnconsumedBinding, UnconsumedDatasetRoot, UnknownAlias, UnknownKind, UnknownProjection, UnsupportedDraftSchema};
+
+# ---------------------------------------------------------------------------
+# Shared closed vocabularies (wire spellings are the decode tables below)
+# ---------------------------------------------------------------------------
+
+# Traversal direction relative to the relation's canonical src -> dest
+# (0014 §5.1: forward / reverse, never out / in).
+type DraftDirection = enum {
+    Forward,
+    Reverse,
+};
+import DraftDirection.{Forward, Reverse};
+
+# The sort direction of a v2 output order entry / ranking order entry.
+type DraftOrderDirection = enum {
+    Asc,
+    Desc,
+};
+import DraftOrderDirection.{Asc, Desc};
+
+# The closed operator vocabulary (0014 §7.2 plus the *_ci spellings the v1
+# engine already supported - a superset, kept so no capability regresses).
+# Field-level capability is still Resolve's job against the ontology.
+type DraftOperator = enum {
+    Eq,
+    NotEq,
+    In,
+    Gt,
+    Gte,
+    Lt,
+    Lte,
+    Contains,
+    ContainsCi,
+    StartsWith,
+    EndsWith,
+    EqCi,
+    InCi,
+};
+import DraftOperator.{Contains, ContainsCi, EndsWith, Eq, EqCi, Gt, Gte, In, InCi, Lt, Lte, NotEq, StartsWith};
+
+# The closed predicate value (0014 §7.2): exactly one variant, never the v1
+# surface/values/time Option-union.
+type DraftTimeInstant = struct {
+    instant: String,
+};
+
+type DraftValue = enum {
+    Surface(String),
+    SurfaceList(Array(String)),
+    TimeInstant(DraftTimeInstant),
+};
+import DraftValue.{Surface, SurfaceList, TimeInstant};
+
+def draft_value_surfaces: Fn(DraftValue) -> Array(String) = fn(value) {
+    match value {
+        Surface(text) => [text],
+        SurfaceList(list) => list,
+        TimeInstant(_) => [],
+    }
+};
+
+type DraftFixedOffset = struct {
+    value: String,
+};
+
+type DraftIntervalBounds = enum {
+    ClosedOpen,
+};
+import DraftIntervalBounds.{ClosedOpen};
+
+# 0017 D7:
+# [start, end) only, bounds pinned to closed_open, timezone a fixed offset
+# (Z or +-HH:MM) consistent with both instants' own offsets - the engine
+# ships no IANA database and never guesses a DST transition.
+type DraftTimeRange = struct {
+    start: DraftTimeInstant,
+    end: DraftTimeInstant,
+    timezone: DraftFixedOffset,
+    bounds: DraftIntervalBounds,
+};
+
+type DraftMetricAggregation = enum {
+    Default,
+    Raw,
+    Avg,
+    Sum,
+    Min,
+    Max,
+};
+import DraftMetricAggregation.{Avg, Default, Max, Min, Raw, Sum};
+
+# ---------------------------------------------------------------------------
+# The v2 core ADT (0014 §4-9)
+# ---------------------------------------------------------------------------
+
+# Scope: root + ordered hops (0014 §5). Constructible means connected: no
+# dangling source/target aliases, no multi-root, no edge outside the chain,
+# hop order IS path order, zero hops is the natural single-entity query.
+# Nodes carry no `kind` - object_ref must resolve to a queryable EntitySet
+# at Resolve (an EntitySource/DataSet ref is a type mismatch there).
+type DraftEntityNode = struct {
+    alias: DraftNodeAlias,
+    object_ref: String,
+};
+
+type DraftHop = struct {
+    alias: DraftHopAlias,
+    relation_ref: String,
+    direction: DraftDirection,
+    target: DraftEntityNode,
+};
+
+type DraftEntityScope = struct {
+    root: DraftEntityNode,
+    hops: Array(DraftHop),
+};
+
+# The closed query entry (0014 §4.2/§5.1, 0017 D13): an Entity root keeps
+# object traversal + related-dataset bindings; a Dataset root is the
+# independent fact-dataset entry. The two variants are mutually exclusive -
+# an empty entity scope never simulates a Dataset root.
+type DraftQueryRoot = enum {
+    Entity(DraftEntityScope),
+    Dataset(DraftDatasetRoot),
+};
+
+# The Dataset root (0014 §5.1): alias / dataset_ref / optional time range -
+# NO subject, NO data_link_ref, NO hops. The alias registers in the dataset
+# alias namespace (with the bindings' aliases - a conflict is a normalize
+# failure); Resolve maps dataset_ref directly to a DatasetId and never
+# enumerates or synthesizes a DataLink.
+type DraftDatasetRoot = struct {
+    alias: DraftBindingAlias,
+    dataset_ref: String,
+    time_range: Option(DraftTimeRange),
+};
+
+# A dataset binding (0014 §6): subject node -> DataLink ref -> DataSet ref,
+# plus the binding's OWN optional time window. A binding never produces
+# result columns by itself; two bindings on one DataSet may carry different
+# windows and are never merged.
+type DraftDatasetBinding = struct {
+    alias: DraftBindingAlias,
+    subject: DraftNodeAlias,
+    data_link_ref: String,
+    dataset_ref: String,
+    time_range: Option(DraftTimeRange),
+};
+
+# Predicates (0014 §7): target variant decides the reference category - an
+# object field reads a scope node, a dataset item reads a binding. No
+# subject string is ever searched across two namespaces.
+type DraftObjectFieldRef = struct {
+    subject: DraftNodeAlias,
+    field_ref: String,
+};
+
+type DraftDatasetItemRef = struct {
+    binding: DraftBindingAlias,
+    item_ref: String,
+};
+
+type DraftPredicateTarget = enum {
+    ObjectField(DraftObjectFieldRef),
+    DatasetItem(DraftDatasetItemRef),
+};
+
+type DraftComparePredicate = struct {
+    clause_id: DraftClauseId,
+    target: DraftPredicateTarget,
+    operator: DraftOperator,
+    value: DraftValue,
+};
+
+type DraftPredicate = enum {
+    Compare(DraftComparePredicate),
+    And(Array(DraftPredicate)),
+    Or(Array(DraftPredicate)),
+    Not(DraftPredicate),
+};
+
+# Named outputs (0014 §8): one output is one row-preserving result set. The
+# row source fixes the grain (an entity node or a dataset binding's rows);
+# projections stay on one row; only multiple outputs derive a Bundle.
+type DraftRowSource = enum {
+    Entity(DraftNodeAlias),
+    Dataset(DraftBindingAlias),
+};
+
+type DraftEntityCountExpr = struct {
+    subject: DraftNodeAlias,
+    distinct: Bool,
+};
+
+type DraftDatasetCountExpr = struct {
+    binding: DraftBindingAlias,
+};
+
+type DraftMetricExpr = struct {
+    binding: DraftBindingAlias,
+    metric_ref: String,
+    aggregation: DraftMetricAggregation,
+};
+
+type DraftProjectionExpr = enum {
+    ObjectField(DraftObjectFieldRef),
+    DatasetField(DraftDatasetItemRef),
+    EntityCount(DraftEntityCountExpr),
+    DatasetCount(DraftDatasetCountExpr),
+    Metric(DraftMetricExpr),
+};
+
+type DraftProjection = struct {
+    alias: DraftProjectionAlias,
+    expr: DraftProjectionExpr,
+};
+
+type DraftGroupKey = enum {
+    ObjectField(DraftObjectFieldRef),
+    DatasetItem(DraftDatasetItemRef),
+};
+
+# A post-aggregation filter referencing one projection of ITS OWN output
+# (0014 §8.3).
+type DraftHaving = struct {
+    clause_id: DraftClauseId,
+    projection: DraftProjectionAlias,
+    operator: DraftOperator,
+    value: DraftValue,
+};
+
+type DraftOutputOrder = struct {
+    by: DraftProjectionAlias,
+    direction: DraftOrderDirection,
+};
+
+type DraftRanking = struct {
+    partition_by: Array(DraftGroupKey),
+    order_by: Array(DraftOutputOrder),
+    take: Int,
+};
+
+# The closed post-aggregation variant (0014 §8.3, 0017 D14): CountGroups
+# counts the group rows that survive group_by + having and collapses the
+# output to the single scalar column `alias` (a projection-namespace alias
+# of this output's choosing). First release ships exactly this variant.
+type DraftPostAggregate = enum {
+    CountGroups(DraftProjectionAlias),
+};
+
+type DraftOutput = struct {
+    id: DraftOutputId,
+    alias: DraftOutputAlias,
+    from: DraftRowSource,
+    projections: Array(DraftProjection),
+    group_by: Array(DraftGroupKey),
+    having: Array(DraftHaving),
+    ranking: Option(DraftRanking),
+    order: Array(DraftOutputOrder),
+    limit: Option(Int),
+    distinct: Bool,
+    post_aggregate: Option(DraftPostAggregate),
+};
+
+type QueryDraftV2 = struct {
+    root: DraftQueryRoot,
+    bindings: Array(DraftDatasetBinding),
+    predicates: Array(DraftPredicate),
+    outputs: Array(DraftOutput),
+};
+
+# ---------------------------------------------------------------------------
+# The v2 wire DTO (decode output; String references, pre-validation)
+# ---------------------------------------------------------------------------
+
+type NodeDto = struct {
+    alias: String,
+    object_ref: String,
+};
+
+type HopDto = struct {
+    alias: String,
+    relation_ref: String,
+    direction: DraftDirection,
+    target: NodeDto,
+};
+
+type ScopeDto = struct {
+    root: NodeDto,
+    hops: Array(HopDto),
+};
+
+# The wire root (internally tagged by "kind"): entity carries the scope,
+# dataset carries alias/dataset_ref/time_range and NOTHING else - any
+# subject/data_link_ref/hops key on the dataset variant is an unknown-field
+# decode error (0014 §5.1, the T1 frozen contract).
+type DatasetRootDto = struct {
+    alias: String,
+    dataset_ref: String,
+    time_range: Option(DraftTimeRange),
+};
+
+type RootDto = enum {
+    Entity(ScopeDto),
+    Dataset(DatasetRootDto),
+};
+
+type BindingDto = struct {
+    alias: String,
+    subject: String,
+    data_link_ref: String,
+    dataset_ref: String,
+    time_range: Option(DraftTimeRange),
+};
+
+type ObjectFieldRefDto = struct {
+    subject: String,
+    field_ref: String,
+};
+
+type DatasetItemRefDto = struct {
+    binding: String,
+    item_ref: String,
+};
+
+type PredicateTargetDto = enum {
+    ObjectField(ObjectFieldRefDto),
+    DatasetItem(DatasetItemRefDto),
+};
+
+type CompareDto = struct {
+    id: String,
+    target: PredicateTargetDto,
+    operator: DraftOperator,
+    value: DraftValue,
+};
+
+type PredicateDto = enum {
+    Compare(CompareDto),
+    And(Array(PredicateDto)),
+    Or(Array(PredicateDto)),
+    Not(PredicateDto),
+};
+
+type RowSourceDto = enum {
+    Entity(String),
+    Dataset(String),
+};
+
+type EntityCountDto = struct {
+    subject: String,
+    distinct: Bool,
+};
+
+type DatasetCountDto = struct {
+    binding: String,
+};
+
+type MetricDto = struct {
+    binding: String,
+    metric_ref: String,
+    aggregation: DraftMetricAggregation,
+};
+
+type ProjectionExprDto = enum {
+    ObjectField(ObjectFieldRefDto),
+    DatasetField(DatasetItemRefDto),
+    EntityCount(EntityCountDto),
+    DatasetCount(DatasetCountDto),
+    Metric(MetricDto),
+};
+
+type ProjectionDto = struct {
+    alias: String,
+    expr: ProjectionExprDto,
+};
+
+type GroupKeyDto = enum {
+    ObjectField(ObjectFieldRefDto),
+    DatasetItem(DatasetItemRefDto),
+};
+
+type HavingDto = struct {
+    id: String,
+    projection: String,
+    operator: DraftOperator,
+    value: DraftValue,
+};
+
+type OutputOrderDto = struct {
+    by: String,
+    direction: DraftOrderDirection,
+};
+
+type RankingDto = struct {
+    partition_by: Array(GroupKeyDto),
+    order_by: Array(OutputOrderDto),
+    take: Int,
+};
+
+# The wire post-aggregate (internally tagged by "kind"); count_groups is the
+# only first-release variant.
+type PostAggregateDto = enum {
+    CountGroups(String),
+};
+
+type OutputDto = struct {
+    id: String,
+    alias: String,
+    from: RowSourceDto,
+    projections: Array(ProjectionDto),
+    group_by: Array(GroupKeyDto),
+    having: Array(HavingDto),
+    ranking: Option(RankingDto),
+    order: Array(OutputOrderDto),
+    limit: Option(Int),
+    distinct: Bool,
+    post_aggregate: Option(PostAggregateDto),
+};
+
+type DraftDto = struct {
+    root: RootDto,
+    bindings: Array(BindingDto),
+    predicates: Array(PredicateDto),
+    outputs: Array(OutputDto),
+};
+
+type EnvelopeDto = struct {
+    request_id: Option(String),
+    source_text: Option(String),
+    ontology_revision: String,
+    draft: DraftDto,
+};
+
+# ---------------------------------------------------------------------------
+# Low-level Value observation (the sanctioned pre-decode boundary)
+# ---------------------------------------------------------------------------
+
+def raw_field: Fn(Value, String) -> Option(Value) = fn(raw, field) {
+    match raw {
+        Value.Object(fields) => dict.get(fields, field),
+        _ => Option.None,
+    }
+};
+
+def req_field: Fn(Value, String) -> Result(Value, DraftIssue) = fn(raw, name) {
+    match raw_field(raw, name) {
+        Option.None => Err(issue(MissingField, `missing field: \{name}`)),
+        Some(value) => Ok(value),
+    }
+};
+
+def req_string: Fn(Value, String) -> Result(String, DraftIssue) = fn(raw, name) {
+    match req_field(raw, name) {
+        Err(found_issue) => Err(found_issue),
+        Ok(value) =>
+            match value {
+                Value.String(text) => Ok(text),
+                _ => Err(issue(Decode, `\{name}: expected a string`)),
+            },
+    }
+};
+
+def opt_string: Fn(Value, String) -> Result(Option(String), DraftIssue) = fn(raw, name) {
+    match raw_field(raw, name) {
+        Option.None => Ok(Option.None),
+        Some(value) =>
+            match value {
+                Value.None => Ok(Option.None),
+                Value.String(text) => Ok(Some(text)),
+                _ => Err(issue(Decode, `\{name}: expected a string`)),
+            },
+    }
+};
+
+def req_bool: Fn(Value, String) -> Result(Bool, DraftIssue) = fn(raw, name) {
+    match req_field(raw, name) {
+        Err(found_issue) => Err(found_issue),
+        Ok(value) =>
+            match codec.decode(Bool.type, value) {
+                Ok(flag) => Ok(flag),
+                Err(_) => Err(issue(Decode, `\{name}: value does not match the declared type`)),
+            },
+    }
+};
+
+def req_int: Fn(Value, String) -> Result(Int, DraftIssue) = fn(raw, name) {
+    match req_field(raw, name) {
+        Err(found_issue) => Err(found_issue),
+        Ok(value) =>
+            match codec.decode(Int.type, value) {
+                Ok(number) => Ok(number),
+                Err(_) => Err(issue(Decode, `\{name}: value does not match the declared type`)),
+            },
+    }
+};
+
+def opt_int: Fn(Value, String) -> Result(Option(Int), DraftIssue) = fn(raw, name) {
+    match raw_field(raw, name) {
+        Option.None => Ok(Option.None),
+        Some(value) =>
+            match value {
+                Value.None => Ok(Option.None),
+                _ =>
+                    match codec.decode(Int.type, value) {
+                        Ok(number) => Ok(Some(number)),
+                        Err(_) => Err(issue(Decode, `\{name}: value does not match the declared type`)),
+                    },
+            },
+    }
+};
+
+def first_unknown_key: Fn(Value, Array(String)) -> Option(String) = fn(raw, allowed) {
+    match raw {
+        Value.Object(fields) =>
+            array.find(dict.keys(fields), fn(key) {
+                if array.any(allowed, fn(name) { name == key }) { False } else { True }
+            }),
+        _ => Option.None,
+    }
+};
+
+def reject_unknown: Fn(Value, Array(String), String) -> Result(Bool, DraftIssue) = fn(raw, allowed, label) {
+    match first_unknown_key(raw, allowed) {
+        Some(key) => Err(issue(Decode, `\{label}: unknown field: \{key}`)),
+        Option.None => Ok(True),
+    }
+};
+
+def req_string_array: Fn(Value, String) -> Result(Array(String), DraftIssue) = fn(raw, name) {
+    match raw {
+        Value.Array(items) =>
+            array.fold(items, Ok([]), fn(acc: Result(Array(String), DraftIssue), item) {
+                result.flat_map(acc, fn(done) {
+                    match item {
+                        Value.String(text) => Ok(array.push(done, text)),
+                        _ => Err(issue(Decode, `\{name}: expected String`)),
+                    }
+                })
+            }),
+        _ => Err(issue(Decode, `\{name}: expected Array(String)`)),
+    }
+};
+
+def req_decoded_list: for(A) Fn(Value, String, Fn(Value) -> Result(A, DraftIssue)) -> Result(Array(A), DraftIssue) = fn(raw, name, decode) {
+    match req_field(raw, name) {
+        Err(found_issue) => Err(found_issue),
+        Ok(value) =>
+            match value {
+                Value.Array(items) =>
+                    array.fold(items, Ok([]), fn(acc: Result(Array(A), DraftIssue), item) {
+                        result.flat_map(acc, fn(done) {
+                            result.map(decode(item), fn(decoded) { array.push(done, decoded) })
+                        })
+                    }),
+                _ => Err(issue(Decode, `\{name}: expected an array`)),
+            },
+    }
+};
+
+# ---------------------------------------------------------------------------
+# Vocabularies: the decode tables ARE the closed wire vocabularies
+# ---------------------------------------------------------------------------
+
+def decode_direction: Fn(String) -> Result(DraftDirection, DraftIssue) = fn(text) {
+    match text {
+        "forward" => Ok(Forward),
+        "reverse" => Ok(Reverse),
+        other => Err(issue(UnknownKind, `unknown direction: \{other}`)),
+    }
+};
+
+def decode_order_direction: Fn(String) -> Result(DraftOrderDirection, DraftIssue) = fn(text) {
+    match text {
+        "asc" => Ok(Asc),
+        "desc" => Ok(Desc),
+        other => Err(issue(UnknownKind, `unknown order direction: \{other}`)),
+    }
+};
+
+def decode_operator: Fn(String) -> Result(DraftOperator, DraftIssue) = fn(text) {
+    match text {
+        "eq" => Ok(Eq),
+        "neq" => Ok(NotEq),
+        "not_eq" => Ok(NotEq),
+        "in" => Ok(In),
+        "gt" => Ok(Gt),
+        "gte" => Ok(Gte),
+        "lt" => Ok(Lt),
+        "lte" => Ok(Lte),
+        "contains" => Ok(Contains),
+        "contains_ci" => Ok(ContainsCi),
+        "starts_with" => Ok(StartsWith),
+        "ends_with" => Ok(EndsWith),
+        "eq_ci" => Ok(EqCi),
+        "in_ci" => Ok(InCi),
+        other => Err(issue(UnknownKind, `unknown operator: \{other}`)),
+    }
+};
+
+def decode_aggregation: Fn(String) -> Result(DraftMetricAggregation, DraftIssue) = fn(text) {
+    match text {
+        "default" => Ok(Default),
+        "raw" => Ok(Raw),
+        "avg" => Ok(Avg),
+        "sum" => Ok(Sum),
+        "min" => Ok(Min),
+        "max" => Ok(Max),
+        other => Err(issue(UnknownKind, `unknown metric aggregation: \{other}`)),
+    }
+};
+
+def decode_value: Fn(Value) -> Result(DraftValue, DraftIssue) = fn(raw) {
+    match raw_field(raw, "kind") {
+        Option.None => Err(issue(NoKind, "value has no kind field")),
+        Some(kind_raw) =>
+            match kind_raw {
+                Value.String(kind) =>
+                    match kind {
+                        "surface" =>
+                            match reject_unknown(raw, ["kind", "value"], "value") {
+                                Err(found_issue) => Err(found_issue),
+                                Ok(_) => result.map(req_string(raw, "value"), fn(text) { Surface(text) }),
+                            },
+                        "surface_list" =>
+                            match reject_unknown(raw, ["kind", "values"], "value") {
+                                Err(found_issue) => Err(found_issue),
+                                Ok(_) =>
+                                    match req_field(raw, "values") {
+                                        Err(found_issue) => Err(found_issue),
+                                        Ok(values_raw) => result.map(req_string_array(values_raw, "value.values"), fn(list) { SurfaceList(list) }),
+                                    },
+                            },
+                        "time" =>
+                            match reject_unknown(raw, ["kind", "instant"], "value") {
+                                Err(found_issue) => Err(found_issue),
+                                Ok(_) => result.map(req_string(raw, "instant"), fn(instant) { TimeInstant({ instant: instant }) }),
+                            },
+                        other => Err(issue(UnknownKind, `unknown value kind: \{other}`)),
+                    },
+                _ => Err(issue(KindNotString, "value kind is not a string")),
+            },
+    }
+};
+
+# 0017 D7: bounds is pinned to closed_open at decode - any other spelling is
+# a decode error, never a silently reinterpreted interval.
+def decode_time_range: Fn(Value) -> Result(DraftTimeRange, DraftIssue) = fn(raw) {
+    match reject_unknown(raw, ["start", "end", "timezone", "bounds"], "time_range") {
+        Err(found_issue) => Err(found_issue),
+        Ok(_) =>
+            match req_string(raw, "bounds") {
+                Err(found_issue) => Err(found_issue),
+                Ok("closed_open") =>
+                    match req_string(raw, "start") {
+                        Err(found_issue) => Err(found_issue),
+                        Ok(start) =>
+                            match req_string(raw, "end") {
+                                Err(found_issue) => Err(found_issue),
+                                Ok(end) =>
+                                    match req_string(raw, "timezone") {
+                                        Err(found_issue) => Err(found_issue),
+                                        Ok(timezone) => Ok({
+                                            start: { instant: start },
+                                            end: { instant: end },
+                                            timezone: { value: timezone },
+                                            bounds: ClosedOpen,
+                                        }),
+                                    },
+                            },
+                    },
+                Ok(other) => Err(issue(Decode, `time_range.bounds must be "closed_open", got \{other}`)),
+            },
+    }
+};
+
+def opt_time_range: Fn(Value, String) -> Result(Option(DraftTimeRange), DraftIssue) = fn(raw, name) {
+    match raw_field(raw, name) {
+        Option.None => Ok(Option.None),
+        Some(value) =>
+            match value {
+                Value.None => Ok(Option.None),
+                _ => result.map(decode_time_range(value), fn(range) { Some(range) }),
+            },
+    }
+};
+
+# ---------------------------------------------------------------------------
+# DTO decoders (per field; unknown external keys are decode errors)
+# ---------------------------------------------------------------------------
+
+def decode_node: Fn(Value) -> Result(NodeDto, DraftIssue) = fn(raw) {
+    match reject_unknown(raw, ["alias", "object_ref"], "scope node") {
+        Err(found_issue) => Err(found_issue),
+        Ok(_) =>
+            match req_string(raw, "alias") {
+                Err(found_issue) => Err(found_issue),
+                Ok(alias) => result.map(req_string(raw, "object_ref"), fn(object_ref) {
+                    { alias: alias, object_ref: object_ref }
+                }),
+            },
+    }
+};
+
+def decode_hop: Fn(Value) -> Result(HopDto, DraftIssue) = fn(raw) {
+    match reject_unknown(raw, ["alias", "relation_ref", "direction", "target"], "scope hop") {
+        Err(found_issue) => Err(found_issue),
+        Ok(_) =>
+            match req_string(raw, "alias") {
+                Err(found_issue) => Err(found_issue),
+                Ok(alias) =>
+                    match req_string(raw, "relation_ref") {
+                        Err(found_issue) => Err(found_issue),
+                        Ok(relation_ref) =>
+                            match req_string(raw, "direction") {
+                                Err(found_issue) => Err(found_issue),
+                                Ok(direction_text) =>
+                                    match decode_direction(direction_text) {
+                                        Err(found_issue) => Err(found_issue),
+                                        Ok(direction) =>
+                                            match req_field(raw, "target") {
+                                                Err(found_issue) => Err(found_issue),
+                                                Ok(target_raw) => result.map(decode_node(target_raw), fn(target) {
+                                                    { alias: alias, relation_ref: relation_ref, direction: direction, target: target }
+                                                }),
+                                            },
+                                    },
+                            },
+                    },
+            },
+    }
+};
+
+def decode_scope: Fn(Value) -> Result(ScopeDto, DraftIssue) = fn(raw) {
+    match reject_unknown(raw, ["root", "hops"], "scope") {
+        Err(found_issue) => Err(found_issue),
+        Ok(_) =>
+            match req_field(raw, "root") {
+                Err(found_issue) => Err(found_issue),
+                Ok(root_raw) =>
+                    match decode_node(root_raw) {
+                        Err(found_issue) => Err(found_issue),
+                        Ok(root) =>
+                            match req_decoded_list(raw, "hops", decode_hop) {
+                                Err(found_issue) => Err(found_issue),
+                                Ok(hops) => Ok({ root: root, hops: hops }),
+                            },
+                    },
+            },
+    }
+};
+
+# The query root: internally tagged by "kind" (entity | dataset). The
+# dataset variant rejects subject/data_link_ref/hops structurally - those
+# keys are not in its allowed list, so a Dataset root can never carry them
+# past decode (0014 §5.1, the T1 frozen contract).
+def decode_root: Fn(Value) -> Result(RootDto, DraftIssue) = fn(raw) {
+    match raw_field(raw, "kind") {
+        Option.None => Err(issue(NoKind, "query root has no kind field")),
+        Some(kind_raw) =>
+            match kind_raw {
+                Value.String(kind) =>
+                    match kind {
+                        "entity" =>
+                            match reject_unknown(raw, ["kind", "scope"], "entity root") {
+                                Err(found_issue) => Err(found_issue),
+                                Ok(_) =>
+                                    match req_field(raw, "scope") {
+                                        Err(found_issue) => Err(found_issue),
+                                        Ok(scope_raw) => result.map(decode_scope(scope_raw), fn(scope) { RootDto.Entity(scope) }),
+                                    },
+                            },
+                        "dataset" =>
+                            match reject_unknown(raw, ["kind", "alias", "dataset_ref", "time_range"], "dataset root") {
+                                Err(found_issue) => Err(found_issue),
+                                Ok(_) =>
+                                    match req_string(raw, "alias") {
+                                        Err(found_issue) => Err(found_issue),
+                                        Ok(alias) =>
+                                            match req_string(raw, "dataset_ref") {
+                                                Err(found_issue) => Err(found_issue),
+                                                Ok(dataset_ref) =>
+                                                    match opt_time_range(raw, "time_range") {
+                                                        Err(found_issue) => Err(found_issue),
+                                                        Ok(time_range) => Ok(RootDto.Dataset({
+                                                            alias: alias,
+                                                            dataset_ref: dataset_ref,
+                                                            time_range: time_range,
+                                                        })),
+                                                    },
+                                            },
+                                    },
+                            },
+                        other => Err(issue(UnknownKind, `unknown query root kind: \{other}`)),
+                    },
+                _ => Err(issue(KindNotString, "query root kind is not a string")),
+            },
+    }
+};
+
+def decode_binding: Fn(Value) -> Result(BindingDto, DraftIssue) = fn(raw) {
+    match reject_unknown(raw, ["alias", "subject", "data_link_ref", "dataset_ref", "time_range"], "binding") {
+        Err(found_issue) => Err(found_issue),
+        Ok(_) =>
+            match req_string(raw, "alias") {
+                Err(found_issue) => Err(found_issue),
+                Ok(alias) =>
+                    match req_string(raw, "subject") {
+                        Err(found_issue) => Err(found_issue),
+                        Ok(subject) =>
+                            match req_string(raw, "data_link_ref") {
+                                Err(found_issue) => Err(found_issue),
+                                Ok(data_link_ref) =>
+                                    match req_string(raw, "dataset_ref") {
+                                        Err(found_issue) => Err(found_issue),
+                                        Ok(dataset_ref) =>
+                                            match opt_time_range(raw, "time_range") {
+                                                Err(found_issue) => Err(found_issue),
+                                                Ok(time_range) => Ok({
+                                                    alias: alias,
+                                                    subject: subject,
+                                                    data_link_ref: data_link_ref,
+                                                    dataset_ref: dataset_ref,
+                                                    time_range: time_range,
+                                                }),
+                                            },
+                                    },
+                            },
+                    },
+            },
+    }
+};
+
+def decode_object_field_ref: Fn(Value) -> Result(ObjectFieldRefDto, DraftIssue) = fn(raw) {
+    # "kind" is the tag key of every enclosing tagged shape (predicate
+    # target / projection expr / group key) - tolerated here.
+    match reject_unknown(raw, ["kind", "subject", "field_ref"], "object field reference") {
+        Err(found_issue) => Err(found_issue),
+        Ok(_) =>
+            match req_string(raw, "subject") {
+                Err(found_issue) => Err(found_issue),
+                Ok(subject) => result.map(req_string(raw, "field_ref"), fn(field_ref) {
+                    { subject: subject, field_ref: field_ref }
+                }),
+            },
+    }
+};
+
+def decode_dataset_item_ref: Fn(Value) -> Result(DatasetItemRefDto, DraftIssue) = fn(raw) {
+    # "kind" is the tag key of every enclosing tagged shape.
+    match reject_unknown(raw, ["kind", "binding", "item_ref"], "dataset item reference") {
+        Err(found_issue) => Err(found_issue),
+        Ok(_) =>
+            match req_string(raw, "binding") {
+                Err(found_issue) => Err(found_issue),
+                Ok(binding) => result.map(req_string(raw, "item_ref"), fn(item_ref) {
+                    { binding: binding, item_ref: item_ref }
+                }),
+            },
+    }
+};
+
+def decode_target: Fn(Value) -> Result(PredicateTargetDto, DraftIssue) = fn(raw) {
+    match raw_field(raw, "kind") {
+        Option.None => Err(issue(NoKind, "predicate target has no kind field")),
+        Some(kind_raw) =>
+            match kind_raw {
+                Value.String(kind) =>
+                    match kind {
+                        "object_field" => result.map(decode_object_field_ref(raw), fn(inner) { PredicateTargetDto.ObjectField(inner) }),
+                        "dataset_item" => result.map(decode_dataset_item_ref(raw), fn(inner) { PredicateTargetDto.DatasetItem(inner) }),
+                        other => Err(issue(UnknownKind, `unknown predicate target kind: \{other}`)),
+                    },
+                _ => Err(issue(KindNotString, "predicate target kind is not a string")),
+            },
+    }
+};
+
+def decode_compare: Fn(Value) -> Result(CompareDto, DraftIssue) = fn(raw) {
+    match reject_unknown(raw, ["kind", "id", "target", "operator", "value"], "compare predicate") {
+        Err(found_issue) => Err(found_issue),
+        Ok(_) =>
+            match req_string(raw, "id") {
+                Err(found_issue) => Err(found_issue),
+                Ok(id) =>
+                    match req_field(raw, "target") {
+                        Err(found_issue) => Err(found_issue),
+                        Ok(target_raw) =>
+                            match decode_target(target_raw) {
+                                Err(found_issue) => Err(found_issue),
+                                Ok(target) =>
+                                    match req_string(raw, "operator") {
+                                        Err(found_issue) => Err(found_issue),
+                                        Ok(operator_text) =>
+                                            match decode_operator(operator_text) {
+                                                Err(found_issue) => Err(found_issue),
+                                                Ok(operator) =>
+                                                    match req_field(raw, "value") {
+                                                        Err(found_issue) => Err(found_issue),
+                                                        Ok(value_raw) => result.map(decode_value(value_raw), fn(value) {
+                                                            { id: id, target: target, operator: operator, value: value }
+                                                        }),
+                                                    },
+                                            },
+                                    },
+                            },
+                    },
+            },
+    }
+};
+
+def decode_predicate: Fn(Value) -> Result(PredicateDto, DraftIssue) = fn(raw) {
+    match raw_field(raw, "kind") {
+        Option.None => Err(issue(NoKind, "predicate has no kind field")),
+        Some(kind_raw) =>
+            match kind_raw {
+                Value.String(kind) =>
+                    match kind {
+                        "compare" => result.map(decode_compare(raw), fn(inner) { PredicateDto.Compare(inner) }),
+                        "and" =>
+                            match reject_unknown(raw, ["kind", "parts"], "and predicate") {
+                                Err(found_issue) => Err(found_issue),
+                                Ok(_) => result.map(req_decoded_list(raw, "parts", decode_predicate), fn(parts) { PredicateDto.And(parts) }),
+                            },
+                        "or" =>
+                            match reject_unknown(raw, ["kind", "parts"], "or predicate") {
+                                Err(found_issue) => Err(found_issue),
+                                Ok(_) => result.map(req_decoded_list(raw, "parts", decode_predicate), fn(parts) { PredicateDto.Or(parts) }),
+                            },
+                        "not" =>
+                            match reject_unknown(raw, ["kind", "part"], "not predicate") {
+                                Err(found_issue) => Err(found_issue),
+                                Ok(_) =>
+                                    match req_field(raw, "part") {
+                                        Err(found_issue) => Err(found_issue),
+                                        Ok(part_raw) => result.map(decode_predicate(part_raw), fn(part) { PredicateDto.Not(part) }),
+                                    },
+                            },
+                        other => Err(issue(UnknownKind, `unknown predicate kind: \{other}`)),
+                    },
+                _ => Err(issue(KindNotString, "predicate kind is not a string")),
+            },
+    }
+};
+
+def decode_row_source: Fn(Value) -> Result(RowSourceDto, DraftIssue) = fn(raw) {
+    match raw_field(raw, "kind") {
+        Option.None => Err(issue(NoKind, "row source has no kind field")),
+        Some(kind_raw) =>
+            match kind_raw {
+                Value.String(kind) =>
+                    match kind {
+                        "entity" =>
+                            match reject_unknown(raw, ["kind", "subject"], "entity row source") {
+                                Err(found_issue) => Err(found_issue),
+                                Ok(_) => result.map(req_string(raw, "subject"), fn(subject) { RowSourceDto.Entity(subject) }),
+                            },
+                        "dataset" =>
+                            match reject_unknown(raw, ["kind", "binding"], "dataset row source") {
+                                Err(found_issue) => Err(found_issue),
+                                Ok(_) => result.map(req_string(raw, "binding"), fn(binding) { RowSourceDto.Dataset(binding) }),
+                            },
+                        other => Err(issue(UnknownKind, `unknown row source kind: \{other}`)),
+                    },
+                _ => Err(issue(KindNotString, "row source kind is not a string")),
+            },
+    }
+};
+
+def decode_projection_expr: Fn(Value) -> Result(ProjectionExprDto, DraftIssue) = fn(raw) {
+    match raw_field(raw, "kind") {
+        Option.None => Err(issue(NoKind, "projection expr has no kind field")),
+        Some(kind_raw) =>
+            match kind_raw {
+                Value.String(kind) =>
+                    match kind {
+                        "object_field" => result.map(decode_object_field_ref(raw), fn(inner) { ProjectionExprDto.ObjectField(inner) }),
+                        "dataset_field" => result.map(decode_dataset_item_ref(raw), fn(inner) { ProjectionExprDto.DatasetField(inner) }),
+                        "entity_count" =>
+                            match reject_unknown(raw, ["kind", "subject", "distinct"], "entity_count projection") {
+                                Err(found_issue) => Err(found_issue),
+                                Ok(_) =>
+                                    match req_string(raw, "subject") {
+                                        Err(found_issue) => Err(found_issue),
+                                        Ok(subject) => result.map(req_bool(raw, "distinct"), fn(distinct) {
+                                            ProjectionExprDto.EntityCount({ subject: subject, distinct: distinct })
+                                        }),
+                                    },
+                            },
+                        "dataset_count" =>
+                            match reject_unknown(raw, ["kind", "binding"], "dataset_count projection") {
+                                Err(found_issue) => Err(found_issue),
+                                Ok(_) => result.map(req_string(raw, "binding"), fn(binding) {
+                                    ProjectionExprDto.DatasetCount({ binding: binding })
+                                }),
+                            },
+                        "metric" =>
+                            match reject_unknown(raw, ["kind", "binding", "metric_ref", "aggregation"], "metric projection") {
+                                Err(found_issue) => Err(found_issue),
+                                Ok(_) =>
+                                    match req_string(raw, "binding") {
+                                        Err(found_issue) => Err(found_issue),
+                                        Ok(binding) =>
+                                            match req_string(raw, "metric_ref") {
+                                                Err(found_issue) => Err(found_issue),
+                                                Ok(metric_ref) =>
+                                                    match req_string(raw, "aggregation") {
+                                                        Err(found_issue) => Err(found_issue),
+                                                        Ok(aggregation_text) =>
+                                                            match decode_aggregation(aggregation_text) {
+                                                                Err(found_issue) => Err(found_issue),
+                                                                Ok(aggregation) => Ok(ProjectionExprDto.Metric({
+                                                                    binding: binding,
+                                                                    metric_ref: metric_ref,
+                                                                    aggregation: aggregation,
+                                                                })),
+                                                            },
+                                                    },
+                                            },
+                                    },
+                            },
+                        other => Err(issue(UnknownKind, `unknown projection kind: \{other}`)),
+                    },
+                _ => Err(issue(KindNotString, "projection kind is not a string")),
+            },
+    }
+};
+
+def decode_projection: Fn(Value) -> Result(ProjectionDto, DraftIssue) = fn(raw) {
+    match reject_unknown(raw, ["alias", "expr"], "projection") {
+        Err(found_issue) => Err(found_issue),
+        Ok(_) =>
+            match req_string(raw, "alias") {
+                Err(found_issue) => Err(found_issue),
+                Ok(alias) =>
+                    match req_field(raw, "expr") {
+                        Err(found_issue) => Err(found_issue),
+                        Ok(expr_raw) => result.map(decode_projection_expr(expr_raw), fn(expr) {
+                            { alias: alias, expr: expr }
+                        }),
+                    },
+            },
+    }
+};
+
+def decode_group_key: Fn(Value) -> Result(GroupKeyDto, DraftIssue) = fn(raw) {
+    match raw_field(raw, "kind") {
+        Option.None => Err(issue(NoKind, "group key has no kind field")),
+        Some(kind_raw) =>
+            match kind_raw {
+                Value.String(kind) =>
+                    match kind {
+                        "object_field" => result.map(decode_object_field_ref(raw), fn(inner) { GroupKeyDto.ObjectField(inner) }),
+                        "dataset_item" => result.map(decode_dataset_item_ref(raw), fn(inner) { GroupKeyDto.DatasetItem(inner) }),
+                        other => Err(issue(UnknownKind, `unknown group key kind: \{other}`)),
+                    },
+                _ => Err(issue(KindNotString, "group key kind is not a string")),
+            },
+    }
+};
+
+def decode_having: Fn(Value) -> Result(HavingDto, DraftIssue) = fn(raw) {
+    match reject_unknown(raw, ["id", "projection", "operator", "value"], "having") {
+        Err(found_issue) => Err(found_issue),
+        Ok(_) =>
+            match req_string(raw, "id") {
+                Err(found_issue) => Err(found_issue),
+                Ok(id) =>
+                    match req_string(raw, "projection") {
+                        Err(found_issue) => Err(found_issue),
+                        Ok(projection) =>
+                            match req_string(raw, "operator") {
+                                Err(found_issue) => Err(found_issue),
+                                Ok(operator_text) =>
+                                    match decode_operator(operator_text) {
+                                        Err(found_issue) => Err(found_issue),
+                                        Ok(operator) =>
+                                            match req_field(raw, "value") {
+                                                Err(found_issue) => Err(found_issue),
+                                                Ok(value_raw) => result.map(decode_value(value_raw), fn(value) {
+                                                    { id: id, projection: projection, operator: operator, value: value }
+                                                }),
+                                            },
+                                    },
+                            },
+                    },
+            },
+    }
+};
+
+def decode_output_order: Fn(Value) -> Result(OutputOrderDto, DraftIssue) = fn(raw) {
+    match reject_unknown(raw, ["by", "direction"], "output order") {
+        Err(found_issue) => Err(found_issue),
+        Ok(_) =>
+            match req_string(raw, "by") {
+                Err(found_issue) => Err(found_issue),
+                Ok(by) =>
+                    match req_string(raw, "direction") {
+                        Err(found_issue) => Err(found_issue),
+                        Ok(direction_text) => result.map(decode_order_direction(direction_text), fn(direction) {
+                            { by: by, direction: direction }
+                        }),
+                    },
+            },
+    }
+};
+
+def decode_ranking: Fn(Value) -> Result(RankingDto, DraftIssue) = fn(raw) {
+    match reject_unknown(raw, ["partition_by", "order_by", "take"], "ranking") {
+        Err(found_issue) => Err(found_issue),
+        Ok(_) =>
+            match req_decoded_list(raw, "partition_by", decode_group_key) {
+                Err(found_issue) => Err(found_issue),
+                Ok(partition_by) =>
+                    match req_decoded_list(raw, "order_by", decode_output_order) {
+                        Err(found_issue) => Err(found_issue),
+                        Ok(order_by) =>
+                            match req_int(raw, "take") {
+                                Err(found_issue) => Err(found_issue),
+                                Ok(take) => Ok({ partition_by: partition_by, order_by: order_by, take: take }),
+                            },
+                    },
+            },
+    }
+};
+
+def opt_ranking: Fn(Value) -> Result(Option(RankingDto), DraftIssue) = fn(raw) {
+    match raw_field(raw, "ranking") {
+        Option.None => Ok(Option.None),
+        Some(value) =>
+            match value {
+                Value.None => Ok(Option.None),
+                _ => result.map(decode_ranking(value), fn(ranking) { Some(ranking) }),
+            },
+    }
+};
+
+# The post-aggregate: internally tagged by "kind"; count_groups is the only
+# first-release variant (0014 §8.3, D14).
+def decode_post_aggregate: Fn(Value) -> Result(PostAggregateDto, DraftIssue) = fn(raw) {
+    match raw_field(raw, "kind") {
+        Option.None => Err(issue(NoKind, "post_aggregate has no kind field")),
+        Some(kind_raw) =>
+            match kind_raw {
+                Value.String(kind) =>
+                    match kind {
+                        "count_groups" =>
+                            match reject_unknown(raw, ["kind", "alias"], "post_aggregate") {
+                                Err(found_issue) => Err(found_issue),
+                                Ok(_) => result.map(req_string(raw, "alias"), fn(alias) { PostAggregateDto.CountGroups(alias) }),
+                            },
+                        other => Err(issue(UnknownKind, `unknown post_aggregate kind: \{other}`)),
+                    },
+                _ => Err(issue(KindNotString, "post_aggregate kind is not a string")),
+            },
+    }
+};
+
+def opt_post_aggregate: Fn(Value) -> Result(Option(PostAggregateDto), DraftIssue) = fn(raw) {
+    match raw_field(raw, "post_aggregate") {
+        Option.None => Ok(Option.None),
+        Some(value) =>
+            match value {
+                Value.None => Ok(Option.None),
+                _ => result.map(decode_post_aggregate(value), fn(post) { Some(post) }),
+            },
+    }
+};
+
+def decode_output: Fn(Value) -> Result(OutputDto, DraftIssue) = fn(raw) {
+    match reject_unknown(raw, ["id", "alias", "from", "projections", "group_by", "having", "ranking", "order", "limit", "distinct", "post_aggregate"], "output") {
+        Err(found_issue) => Err(found_issue),
+        Ok(_) =>
+            match req_string(raw, "id") {
+                Err(found_issue) => Err(found_issue),
+                Ok(id) =>
+                    match req_string(raw, "alias") {
+                        Err(found_issue) => Err(found_issue),
+                        Ok(alias) =>
+                            match req_field(raw, "from") {
+                                Err(found_issue) => Err(found_issue),
+                                Ok(from_raw) =>
+                                    match decode_row_source(from_raw) {
+                                        Err(found_issue) => Err(found_issue),
+                                        Ok(from) =>
+                                            match req_decoded_list(raw, "projections", decode_projection) {
+                                                Err(found_issue) => Err(found_issue),
+                                                Ok(projections) =>
+                                                    match req_decoded_list(raw, "group_by", decode_group_key) {
+                                                        Err(found_issue) => Err(found_issue),
+                                                        Ok(group_by) =>
+                                                            match req_decoded_list(raw, "having", decode_having) {
+                                                                Err(found_issue) => Err(found_issue),
+                                                                Ok(having) =>
+                                                                    match opt_ranking(raw) {
+                                                                        Err(found_issue) => Err(found_issue),
+                                                                        Ok(ranking) =>
+                                                                            match req_decoded_list(raw, "order", decode_output_order) {
+                                                                                Err(found_issue) => Err(found_issue),
+                                                                                Ok(order) =>
+                                                                                    match opt_int(raw, "limit") {
+                                                                                        Err(found_issue) => Err(found_issue),
+                                                                                        Ok(limit) =>
+                                                                                            match req_bool(raw, "distinct") {
+                                                                                                Err(found_issue) => Err(found_issue),
+                                                                                                Ok(distinct) =>
+                                                                                                    match opt_post_aggregate(raw) {
+                                                                                                        Err(found_issue) => Err(found_issue),
+                                                                                                        Ok(post_aggregate) => Ok({
+                                                                                                            id: id,
+                                                                                                            alias: alias,
+                                                                                                            from: from,
+                                                                                                            projections: projections,
+                                                                                                            group_by: group_by,
+                                                                                                            having: having,
+                                                                                                            ranking: ranking,
+                                                                                                            order: order,
+                                                                                                            limit: limit,
+                                                                                                            distinct: distinct,
+                                                                                                            post_aggregate: post_aggregate,
+                                                                                                        }),
+                                                                                                    },
+                                                                                            },
+                                                                                    },
+                                                                            },
+                                                                    },
+                                                            },
+                                                    },
+                                            },
+                                    },
+                            },
+                    },
+            },
+    }
+};
+
+def decode_draft_dto: Fn(Value) -> Result(DraftDto, DraftIssue) = fn(raw) {
+    match reject_unknown(raw, ["root", "bindings", "predicates", "outputs"], "draft") {
+        Err(found_issue) => Err(found_issue),
+        Ok(_) =>
+            match req_field(raw, "root") {
+                Err(found_issue) => Err(found_issue),
+                Ok(root_raw) =>
+                    match decode_root(root_raw) {
+                        Err(found_issue) => Err(found_issue),
+                        Ok(root) =>
+                            match req_decoded_list(raw, "bindings", decode_binding) {
+                                Err(found_issue) => Err(found_issue),
+                                Ok(bindings) =>
+                                    match req_decoded_list(raw, "predicates", decode_predicate) {
+                                        Err(found_issue) => Err(found_issue),
+                                        Ok(predicates) =>
+                                            match req_decoded_list(raw, "outputs", decode_output) {
+                                                Err(found_issue) => Err(found_issue),
+                                                Ok(outputs) => Ok({
+                                                    root: root,
+                                                    bindings: bindings,
+                                                    predicates: predicates,
+                                                    outputs: outputs,
+                                                }),
+                                            },
+                                    },
+                            },
+                    },
+            },
+    }
+};
+
+def decode_envelope: Fn(Value) -> Result(EnvelopeDto, DraftIssue) = fn(raw) {
+    match reject_unknown(raw, ["schema", "request_id", "ontology_revision", "source_text", "draft"], "envelope") {
+        Err(found_issue) => Err(found_issue),
+        Ok(_) =>
+            match req_string(raw, "ontology_revision") {
+                Err(found_issue) => Err(found_issue),
+                Ok(revision) =>
+                    match req_field(raw, "draft") {
+                        Err(found_issue) => Err(found_issue),
+                        Ok(draft_raw) =>
+                            match decode_draft_dto(draft_raw) {
+                                Err(found_issue) => Err(found_issue),
+                                Ok(draft) =>
+                                    match opt_string(raw, "request_id") {
+                                        Err(found_issue) => Err(found_issue),
+                                        Ok(request_id) =>
+                                            match opt_string(raw, "source_text") {
+                                                Err(found_issue) => Err(found_issue),
+                                                Ok(source_text) => Ok({
+                                                    request_id: request_id,
+                                                    source_text: source_text,
+                                                    ontology_revision: revision,
+                                                    draft: draft,
+                                                }),
+                                            },
+                                    },
+                            },
+                    },
+            },
+    }
+};
+
+# ---------------------------------------------------------------------------
+# Normalization (0014 §11.1): the structural invariants of the closed core
+# ---------------------------------------------------------------------------
+
+def member: Fn(Array(String), String) -> Bool = fn(list, name) {
+    array.any(list, fn(item) { item == name })
+};
+
+def find_duplicates: Fn(Array(String)) -> Array(String) = fn(names) {
+    array.fold(names, [], fn(acc, name) {
+        if member(acc, name) {
+            acc
+        } else {
+            let filtered = array.filter(names, fn(n) { n == name });
+            if array.length(filtered) > 1 { array.push(acc, name) } else { acc }
+        }
+    })
+};
+
+def duplicate_issues: Fn(Array(String), String, String) -> Array(DraftIssue) = fn(names, path_prefix, label) {
+    array.map(find_duplicates(names), fn(name) {
+        at(DuplicateAlias, `duplicate \{label}: \{name}`, `\{path_prefix}`)
+    })
+};
+
+# The node namespace: the root plus every hop arrival (hop aliases are a
+# SEPARATE namespace - a hop may share a node's text without conflict).
+def dto_node_names: Fn(ScopeDto) -> Array(String) = fn(scope) {
+    array.concat([
+        [scope.root.alias],
+        array.map(scope.hops, fn(hop) { hop.target.alias }),
+    ])
+};
+
+def dto_hop_names: Fn(ScopeDto) -> Array(String) = fn(scope) {
+    array.map(scope.hops, fn(hop) { hop.alias })
+};
+
+def dto_binding_names: Fn(Array(BindingDto)) -> Array(String) = fn(bindings) {
+    array.map(bindings, fn(binding) { binding.alias })
+};
+
+# The global projection namespace (0014 §11.1.2: each namespace is unique
+# across the whole draft, so a projection alias is unambiguous everywhere).
+def dto_projection_names: Fn(Array(OutputDto)) -> Array(String) = fn(outputs) {
+    array.flat_map(outputs, fn(output) {
+        array.map(output.projections, fn(projection) { projection.alias })
+    })
+};
+
+def dto_output_aliases: Fn(Array(OutputDto)) -> Array(String) = fn(outputs) {
+    array.map(outputs, fn(output) { output.alias })
+};
+
+def dto_output_ids: Fn(Array(OutputDto)) -> Array(String) = fn(outputs) {
+    array.map(outputs, fn(output) { output.id })
+};
+
+# The clause namespace: compare clause ids plus having ids.
+def dto_clause_ids: Fn(DraftDto) -> Array(String) = fn(dto) {
+    let predicate_ids = array.flat_map(dto.predicates, fn(pred) { predicate_clause_ids(pred) });
+    let having_ids = array.flat_map(dto.outputs, fn(output) {
+        array.map(output.having, fn(having) { having.id })
+    });
+    array.concat([predicate_ids, having_ids])
+};
+
+def predicate_clause_ids: Fn(PredicateDto) -> Array(String) = fn(pred) {
+    match pred {
+        PredicateDto.Compare(inner) => [inner.id],
+        PredicateDto.And(parts) => array.flat_map(parts, predicate_clause_ids),
+        PredicateDto.Or(parts) => array.flat_map(parts, predicate_clause_ids),
+        PredicateDto.Not(part) => predicate_clause_ids(part),
+    }
+};
+
+def fixed_offset_ok: Fn(String) -> Bool = fn(timezone) {
+    if timezone == "Z" {
+        True
+    } else {
+        re.is_match(re.compile("^[+-][0-9]{2}:[0-9]{2}$"), timezone)
+    }
+};
+
+def offset_consistent: Fn(String, String) -> Bool = fn(instant, timezone) {
+    if timezone == "Z" {
+        string.ends_with(instant, "Z")
+    } else {
+        string.ends_with(instant, timezone)
+    }
+};
+
+# 0017 D7 + the 2026-08-31 revision: the fixed-offset window check shared by
+# related bindings and the Dataset root (the label names the access, the path
+# locates it in the draft).
+def check_time_range: Fn(String, DraftTimeRange, String) -> Array(DraftIssue) = fn(alias_label, range, path) {
+    if fixed_offset_ok(range.timezone.value) {
+        if offset_consistent(range.start.instant, range.timezone.value)
+            && offset_consistent(range.end.instant, range.timezone.value) {
+            []
+        } else {
+            [ref(
+                BadTimeRange,
+                `\{alias_label} time range offsets do not match timezone \{range.timezone.value}`,
+                path,
+                range.timezone.value,
+                Option.None,
+                Option.None,
+            )]
+        }
+    } else {
+        [ref(
+            BadTimeRange,
+            `\{alias_label} timezone must be Z or a fixed +-HH:MM offset`,
+            path,
+            range.timezone.value,
+            Some("Z or +-HH:MM"),
+            Some(range.timezone.value),
+        )]
+    }
+};
+
+def check_binding_time_range: Fn(BindingDto, Int) -> Array(DraftIssue) = fn(binding, index) {
+    match binding.time_range {
+        Option.None => [],
+        Some(range) => check_time_range(`binding \{binding.alias}`, range, `draft.bindings[\{index}].time_range`),
+    }
+};
+
+def check_root_time_range: Fn(DatasetRootDto) -> Array(DraftIssue) = fn(root) {
+    match root.time_range {
+        Option.None => [],
+        Some(range) => check_time_range(`dataset root \{root.alias}`, range, "draft.root.time_range"),
+    }
+};
+
+def check_predicates: Fn(Array(PredicateDto), Array(String), Array(String)) -> Array(DraftIssue) = fn(predicates, node_names, binding_names) {
+    array.flat_map(array.enumerate(predicates), fn(pair) {
+        match pair {
+            (index, pred) => check_predicate(pred, `draft.predicates[\{index}]`, node_names, binding_names),
+        }
+    })
+};
+
+def check_predicate: Fn(PredicateDto, String, Array(String), Array(String)) -> Array(DraftIssue) = fn(pred, path, node_names, binding_names) {
+    match pred {
+        PredicateDto.Compare(inner) =>
+            array.concat([
+                match inner.target {
+                    PredicateTargetDto.ObjectField(ref_dto) =>
+                        if member(node_names, ref_dto.subject) {
+                            []
+                        } else {
+                            [ref(UnknownAlias, `predicate \{inner.id} object field subject \{ref_dto.subject} is not a scope node`, `\{path}.target.subject`, ref_dto.subject, Option.None, Option.None)]
+                        },
+                    PredicateTargetDto.DatasetItem(ref_dto) =>
+                        if member(binding_names, ref_dto.binding) {
+                            []
+                        } else {
+                            [ref(UnknownAlias, `predicate \{inner.id} dataset item binding \{ref_dto.binding} is not a declared dataset access (binding or dataset root)`, `\{path}.target.binding`, ref_dto.binding, Option.None, Option.None)]
+                        },
+                },
+            ]),
+        PredicateDto.And(parts) => array.flat_map(array.enumerate(parts), fn(pair) {
+            match pair {
+                (index, part) => check_predicate(part, `\{path}.parts[\{index}]`, node_names, binding_names),
+            }
+        }),
+        PredicateDto.Or(parts) => array.flat_map(array.enumerate(parts), fn(pair) {
+            match pair {
+                (index, part) => check_predicate(part, `\{path}.parts[\{index}]`, node_names, binding_names),
+            }
+        }),
+        PredicateDto.Not(part) => check_predicate(part, `\{path}.part`, node_names, binding_names),
+    }
+};
+
+def check_group_key: Fn(GroupKeyDto, String, Array(String), Array(String)) -> Array(DraftIssue) = fn(key, path, node_names, binding_names) {
+    match key {
+        GroupKeyDto.ObjectField(ref_dto) =>
+            if member(node_names, ref_dto.subject) {
+                []
+            } else {
+                [ref(UnknownAlias, `group key subject \{ref_dto.subject} is not a scope node`, `\{path}.subject`, ref_dto.subject, Option.None, Option.None)]
+            },
+        GroupKeyDto.DatasetItem(ref_dto) =>
+            if member(binding_names, ref_dto.binding) {
+                []
+            } else {
+                [ref(UnknownAlias, `group key binding \{ref_dto.binding} is not a declared dataset access (binding or dataset root)`, `\{path}.binding`, ref_dto.binding, Option.None, Option.None)]
+            },
+    }
+};
+
+def output_projection_names: Fn(OutputDto) -> Array(String) = fn(output) {
+    array.map(output.projections, fn(projection) { projection.alias })
+};
+
+def check_output: Fn(OutputDto, Int, Array(String), Array(String)) -> Array(DraftIssue) = fn(output, index, node_names, binding_names) {
+    let path = `draft.outputs[\{index}]`;
+    let own_projections = output_projection_names(output);
+    let from_issues = match output.from {
+        RowSourceDto.Entity(subject) =>
+            if member(node_names, subject) {
+                []
+            } else {
+                [ref(UnknownAlias, `output \{output.alias} row source subject \{subject} is not a scope node`, `\{path}.from.subject`, subject, Option.None, Option.None)]
+            },
+        RowSourceDto.Dataset(binding) =>
+            if member(binding_names, binding) {
+                []
+            } else {
+                [ref(UnknownAlias, `output \{output.alias} row source binding \{binding} is not a declared dataset access (binding or dataset root)`, `\{path}.from.binding`, binding, Option.None, Option.None)]
+            },
+    };
+    let empty_issues = if array.length(output.projections) == 0 {
+        [at(EmptyOutput, `output \{output.alias} declares no projections`, `\{path}.projections`)]
+    } else {
+        []
+    };
+    let projection_issues = array.flat_map(array.enumerate(output.projections), fn(pair) {
+        match pair {
+            (proj_index, projection) => {
+                let proj_path = `\{path}.projections[\{proj_index}]`;
+                match projection.expr {
+                    ProjectionExprDto.ObjectField(ref_dto) =>
+                        if member(node_names, ref_dto.subject) {
+                            []
+                        } else {
+                            [ref(UnknownAlias, `projection \{projection.alias} subject \{ref_dto.subject} is not a scope node`, `\{proj_path}.expr.subject`, ref_dto.subject, Option.None, Option.None)]
+                        },
+                    ProjectionExprDto.DatasetField(ref_dto) =>
+                        if member(binding_names, ref_dto.binding) {
+                            []
+                        } else {
+                            [ref(UnknownAlias, `projection \{projection.alias} binding \{ref_dto.binding} is not a declared dataset access (binding or dataset root)`, `\{proj_path}.expr.binding`, ref_dto.binding, Option.None, Option.None)]
+                        },
+                    ProjectionExprDto.EntityCount(inner) =>
+                        if member(node_names, inner.subject) {
+                            []
+                        } else {
+                            [ref(UnknownAlias, `projection \{projection.alias} subject \{inner.subject} is not a scope node`, `\{proj_path}.expr.subject`, inner.subject, Option.None, Option.None)]
+                        },
+                    ProjectionExprDto.DatasetCount(inner) =>
+                        if member(binding_names, inner.binding) {
+                            []
+                        } else {
+                            [ref(UnknownAlias, `projection \{projection.alias} binding \{inner.binding} is not a declared dataset access (binding or dataset root)`, `\{proj_path}.expr.binding`, inner.binding, Option.None, Option.None)]
+                        },
+                    ProjectionExprDto.Metric(inner) =>
+                        if member(binding_names, inner.binding) {
+                            []
+                        } else {
+                            [ref(UnknownAlias, `projection \{projection.alias} binding \{inner.binding} is not a declared dataset access (binding or dataset root)`, `\{proj_path}.expr.binding`, inner.binding, Option.None, Option.None)]
+                        },
+                }
+            },
+        }
+    });
+    let group_issues = array.flat_map(array.enumerate(output.group_by), fn(pair) {
+        match pair {
+            (key_index, key) => check_group_key(key, `\{path}.group_by[\{key_index}]`, node_names, binding_names),
+        }
+    });
+    let having_issues = array.flat_map(array.enumerate(output.having), fn(pair) {
+        match pair {
+            (having_index, having) =>
+                if member(own_projections, having.projection) {
+                    []
+                } else {
+                    [ref(UnknownProjection, `having \{having.id} projection \{having.projection} is not a projection of output \{output.alias}`, `\{path}.having[\{having_index}].projection`, having.projection, Option.None, Option.None)]
+                },
+        }
+    });
+    let order_issues = array.flat_map(array.enumerate(output.order), fn(pair) {
+        match pair {
+            (order_index, entry) =>
+                if member(own_projections, entry.by) {
+                    []
+                } else {
+                    [ref(UnknownProjection, `order.by \{entry.by} is not a projection of output \{output.alias}`, `\{path}.order[\{order_index}].by`, entry.by, Option.None, Option.None)]
+                },
+        }
+    });
+    let ranking_issues = match output.ranking {
+        Option.None => [],
+        Some(ranking) => {
+            let take_issues = if ranking.take > 0 {
+                []
+            } else {
+                [ref(BadRankingTake, `ranking take must be a positive integer, got \{ranking.take}`, `\{path}.ranking.take`, "take", Some("positive integer"), Some(`\{ranking.take}`))]
+            };
+            let partition_issues = array.flat_map(array.enumerate(ranking.partition_by), fn(pair) {
+                match pair {
+                    (key_index, key) => check_group_key(key, `\{path}.ranking.partition_by[\{key_index}]`, node_names, binding_names),
+                }
+            });
+            let ranking_order_issues = array.flat_map(array.enumerate(ranking.order_by), fn(pair) {
+                match pair {
+                    (order_index, entry) =>
+                        if member(own_projections, entry.by) {
+                            []
+                        } else {
+                            [ref(UnknownProjection, `ranking order.by \{entry.by} is not a projection of output \{output.alias}`, `\{path}.ranking.order_by[\{order_index}].by`, entry.by, Option.None, Option.None)]
+                        },
+                }
+            });
+            array.concat([take_issues, partition_issues, ranking_order_issues])
+        },
+    };
+    let limit_issues = match output.limit {
+        Option.None => [],
+        Some(limit) =>
+            if limit > 0 {
+                []
+            } else {
+                [ref(BadLimit, `output \{output.alias} limit must be a positive integer, got \{limit}`, `\{path}.limit`, "limit", Some("positive integer"), Some(`\{limit}`))]
+            },
+    };
+    # CountGroups (D14): requires a non-empty group_by and excludes
+    # ranking/order/limit/distinct - two row grains never share one output.
+    let post_aggregate_issues = match output.post_aggregate {
+        Option.None => [],
+        Some(PostAggregateDto.CountGroups(final_alias)) => {
+            # NOTE(migration R0.1): the engine mis-reports `missing Else` when
+            # a single expression carries two adjacent template literals under
+            # an if/else inside a match arm. The two templates are bound to
+            # named lets first; the strings are byte-identical.
+            let post_aggregate_path = `\{path}.post_aggregate`;
+            let no_group_message = `output \{output.alias} declares count_groups \{final_alias} but no group_by`;
+            let no_group = if array.length(output.group_by) == 0 {
+                [at(BadPostAggregate, no_group_message, post_aggregate_path)]
+            } else {
+                []
+            };
+            let ranking_message = `output \{output.alias} combines count_groups with ranking; the post-aggregate result is a single scalar row`;
+            let ranking_conflict = match output.ranking {
+                Option.None => [],
+                Some(_) => [at(BadPostAggregate, ranking_message, post_aggregate_path)],
+            };
+            let order_message = `output \{output.alias} combines count_groups with order; the post-aggregate result is a single scalar row`;
+            let order_conflict = if array.length(output.order) > 0 {
+                [at(BadPostAggregate, order_message, post_aggregate_path)]
+            } else {
+                []
+            };
+            let limit_message = `output \{output.alias} combines count_groups with limit; the post-aggregate result is a single scalar row`;
+            let limit_conflict = match output.limit {
+                Option.None => [],
+                Some(_) => [at(BadPostAggregate, limit_message, post_aggregate_path)],
+            };
+            let distinct_message = `output \{output.alias} combines count_groups with distinct; the post-aggregate result is a single scalar row`;
+            let distinct_conflict = if output.distinct {
+                [at(BadPostAggregate, distinct_message, post_aggregate_path)]
+            } else {
+                []
+            };
+            array.concat([array.concat([no_group, ranking_conflict]), array.concat([order_conflict, limit_conflict]), distinct_conflict])
+        },
+    };
+    array.concat([
+        from_issues,
+        empty_issues,
+        projection_issues,
+        group_issues,
+        having_issues,
+        order_issues,
+        ranking_issues,
+        limit_issues,
+        post_aggregate_issues,
+    ])
+};
+
+# 0014 §11.1.4: a dataset access (related binding or Dataset root) is
+# consumed when ANY predicate target, output row source, projection, group
+# key or ranking partition references its alias.
+def dataset_alias_consumed: Fn(String, DraftDto) -> Bool = fn(dataset_alias, dto) {
+    let predicate_hit = array.any(dto.predicates, fn(pred) { predicate_references_binding(pred, dataset_alias) });
+    let output_hit = array.any(dto.outputs, fn(output) {
+        let from_hit = match output.from {
+            RowSourceDto.Entity(_) => False,
+            RowSourceDto.Dataset(from_binding) => from_binding == dataset_alias,
+        };
+        let projection_hit = array.any(output.projections, fn(projection) {
+            match projection.expr {
+                ProjectionExprDto.ObjectField(_) => False,
+                ProjectionExprDto.DatasetField(ref_dto) => ref_dto.binding == dataset_alias,
+                ProjectionExprDto.EntityCount(_) => False,
+                ProjectionExprDto.DatasetCount(inner) => inner.binding == dataset_alias,
+                ProjectionExprDto.Metric(inner) => inner.binding == dataset_alias,
+            }
+        });
+        let group_hit = array.any(output.group_by, fn(key) {
+            match key {
+                GroupKeyDto.ObjectField(_) => False,
+                GroupKeyDto.DatasetItem(ref_dto) => ref_dto.binding == dataset_alias,
+            }
+        });
+        let ranking_hit = match output.ranking {
+            Option.None => False,
+            Some(ranking) => array.any(ranking.partition_by, fn(key) {
+                match key {
+                    GroupKeyDto.ObjectField(_) => False,
+                    GroupKeyDto.DatasetItem(ref_dto) => ref_dto.binding == dataset_alias,
+                }
+            }),
+        };
+        from_hit || projection_hit || group_hit || ranking_hit
+    });
+    predicate_hit || output_hit
+};
+
+def predicate_references_binding: Fn(PredicateDto, String) -> Bool = fn(pred, binding_alias) {
+    match pred {
+        PredicateDto.Compare(inner) =>
+            match inner.target {
+                PredicateTargetDto.ObjectField(_) => False,
+                PredicateTargetDto.DatasetItem(ref_dto) => ref_dto.binding == binding_alias,
+            },
+        PredicateDto.And(parts) => array.any(parts, fn(part) { predicate_references_binding(part, binding_alias) }),
+        PredicateDto.Or(parts) => array.any(parts, fn(part) { predicate_references_binding(part, binding_alias) }),
+        PredicateDto.Not(part) => predicate_references_binding(part, binding_alias),
+    }
+};
+
+def normalize_issues: Fn(DraftDto) -> Array(DraftIssue) = fn(dto) {
+    # The node namespace exists only under an Entity root: a Dataset-root
+    # query has NO scope nodes, so every object-field reference (predicate
+    # target, projection, group key, ranking partition, entity row source)
+    # fails here with UNKNOWN_ALIAS and a json_path.
+    let node_names: Array(String) = match dto.root {
+        RootDto.Entity(scope) => dto_node_names(scope),
+        RootDto.Dataset(_) => [],
+    };
+    let binding_names = dto_binding_names(dto.bindings);
+    # The dataset alias namespace (0014 §11.1.2, D13): the bindings' aliases
+    # plus, under a Dataset root, the root alias.
+    let dataset_names: Array(String) = match dto.root {
+        RootDto.Entity(_) => binding_names,
+        RootDto.Dataset(root) => array.concat([binding_names, [root.alias]]),
+    };
+    let root_issues: Array(DraftIssue) = match dto.root {
+        RootDto.Entity(scope) => array.concat([
+            duplicate_issues(node_names, "draft.root.scope", "node alias"),
+            duplicate_issues(dto_hop_names(scope), "draft.root.scope.hops", "hop alias"),
+        ]),
+        RootDto.Dataset(root) => {
+            # D13: the Dataset root is a closed entry - bindings are
+            # Entity-root-only, and the root alias shares the dataset alias
+            # namespace with them.
+            let conflict = if member(binding_names, root.alias) {
+                [ref(DuplicateAlias, `dataset root alias \{root.alias} conflicts with a binding alias`, "draft.root.alias", root.alias, Option.None, Option.None)]
+            } else {
+                []
+            };
+            let forbidden = if array.length(dto.bindings) > 0 {
+                [at(RootBindingsForbidden, "a dataset-root query declares bindings; dataset bindings are only valid under an entity root", "draft.bindings")]
+            } else {
+                []
+            };
+            array.concat([conflict, array.concat([forbidden, check_root_time_range(root)])])
+        },
+    };
+    # Under a Dataset root the bindings are rejected wholesale above; the
+    # per-binding subject/duplicate noise would only obscure the
+    # ROOT_BINDINGS_FORBIDDEN locator.
+    let binding_issues = match dto.root {
+        RootDto.Dataset(_) => [],
+        RootDto.Entity(_) => array.concat([
+            duplicate_issues(binding_names, "draft.bindings", "binding alias"),
+            array.flat_map(array.enumerate(dto.bindings), fn(pair) {
+                match pair {
+                    (index, binding) =>
+                        if member(node_names, binding.subject) {
+                            check_binding_time_range(binding, index)
+                        } else {
+                            array.concat([
+                                check_binding_time_range(binding, index),
+                                [ref(UnknownAlias, `binding \{binding.alias} subject \{binding.subject} is not a scope node`, `draft.bindings[\{index}].subject`, binding.subject, Option.None, Option.None)],
+                            ])
+                        },
+                }
+            }),
+        ]),
+    };
+    let clause_issues = duplicate_issues(dto_clause_ids(dto), "draft", "clause id");
+    let output_alias_issues = duplicate_issues(dto_output_aliases(dto.outputs), "draft.outputs", "output alias");
+    let output_id_issues = duplicate_issues(dto_output_ids(dto.outputs), "draft.outputs", "output id");
+    let no_output_issues = if array.length(dto.outputs) == 0 {
+        [at(NoOutputs, "draft declares no outputs", "draft.outputs")]
+    } else {
+        []
+    };
+    let projection_issues = duplicate_issues(dto_projection_names(dto.outputs), "draft.outputs", "projection alias");
+    let output_issues = array.flat_map(array.enumerate(dto.outputs), fn(pair) {
+        match pair {
+            (index, output) => check_output(output, index, node_names, dataset_names),
+        }
+    });
+    let predicate_issues = check_predicates(dto.predicates, node_names, dataset_names);
+    let consumption_issues = array.concat([
+        # Related bindings: consumed by any predicate / row source /
+        # projection / group key / ranking partition (0014 §11.1.4).
+        array.flat_map(array.enumerate(dto.bindings), fn(pair) {
+            match pair {
+                (index, binding) =>
+                    if dataset_alias_consumed(binding.alias, dto) {
+                        []
+                    } else {
+                        [at(UnconsumedBinding, `binding \{binding.alias} is never consumed by a predicate or output`, `draft.bindings[\{index}]`)]
+                    },
+            }
+        }),
+        # The Dataset root: the same consumption rule. Constructed-state
+        # defense in practice - an output row source must name the only
+        # dataset access, so a wire-reachable draft always consumes the root.
+        match dto.root {
+            RootDto.Entity(_) => [],
+            RootDto.Dataset(root) =>
+                if dataset_alias_consumed(root.alias, dto) {
+                    []
+                } else {
+                    [at(UnconsumedDatasetRoot, `dataset root \{root.alias} is never consumed by a predicate or output`, "draft.root")]
+                },
+        },
+    ]);
+    array.concat([
+        root_issues,
+        binding_issues,
+        clause_issues,
+        output_alias_issues,
+        output_id_issues,
+        no_output_issues,
+        projection_issues,
+        output_issues,
+        predicate_issues,
+        consumption_issues,
+    ])
+};
+
+# ---------------------------------------------------------------------------
+# Core construction (only reachable with an empty issue list)
+# ---------------------------------------------------------------------------
+
+def core_object_field_ref: Fn(ObjectFieldRefDto) -> DraftObjectFieldRef = fn(ref_dto) {
+    { subject: node_alias(ref_dto.subject), field_ref: ref_dto.field_ref }
+};
+
+def core_dataset_item_ref: Fn(DatasetItemRefDto) -> DraftDatasetItemRef = fn(ref_dto) {
+    { binding: binding_alias(ref_dto.binding), item_ref: ref_dto.item_ref }
+};
+
+def core_target: Fn(PredicateTargetDto) -> DraftPredicateTarget = fn(target) {
+    match target {
+        PredicateTargetDto.ObjectField(ref_dto) => DraftPredicateTarget.ObjectField(core_object_field_ref(ref_dto)),
+        PredicateTargetDto.DatasetItem(ref_dto) => DraftPredicateTarget.DatasetItem(core_dataset_item_ref(ref_dto)),
+    }
+};
+
+def core_predicate: Fn(PredicateDto) -> DraftPredicate = fn(pred) {
+    match pred {
+        PredicateDto.Compare(inner) => DraftPredicate.Compare({
+            clause_id: clause_id(inner.id),
+            target: core_target(inner.target),
+            operator: inner.operator,
+            value: inner.value,
+        }),
+        PredicateDto.And(parts) => DraftPredicate.And(array.map(parts, core_predicate)),
+        PredicateDto.Or(parts) => DraftPredicate.Or(array.map(parts, core_predicate)),
+        PredicateDto.Not(part) => DraftPredicate.Not(core_predicate(part)),
+    }
+};
+
+def core_projection_expr: Fn(ProjectionExprDto) -> DraftProjectionExpr = fn(expr) {
+    match expr {
+        ProjectionExprDto.ObjectField(ref_dto) => DraftProjectionExpr.ObjectField(core_object_field_ref(ref_dto)),
+        ProjectionExprDto.DatasetField(ref_dto) => DraftProjectionExpr.DatasetField(core_dataset_item_ref(ref_dto)),
+        ProjectionExprDto.EntityCount(inner) => DraftProjectionExpr.EntityCount({
+            subject: node_alias(inner.subject),
+            distinct: inner.distinct,
+        }),
+        ProjectionExprDto.DatasetCount(inner) => DraftProjectionExpr.DatasetCount({
+            binding: binding_alias(inner.binding),
+        }),
+        ProjectionExprDto.Metric(inner) => DraftProjectionExpr.Metric({
+            binding: binding_alias(inner.binding),
+            metric_ref: inner.metric_ref,
+            aggregation: inner.aggregation,
+        }),
+    }
+};
+
+def core_group_key: Fn(GroupKeyDto) -> DraftGroupKey = fn(key) {
+    match key {
+        GroupKeyDto.ObjectField(ref_dto) => DraftGroupKey.ObjectField(core_object_field_ref(ref_dto)),
+        GroupKeyDto.DatasetItem(ref_dto) => DraftGroupKey.DatasetItem(core_dataset_item_ref(ref_dto)),
+    }
+};
+
+def core_row_source: Fn(RowSourceDto) -> DraftRowSource = fn(from) {
+    match from {
+        RowSourceDto.Entity(subject) => DraftRowSource.Entity(node_alias(subject)),
+        RowSourceDto.Dataset(binding) => DraftRowSource.Dataset(binding_alias(binding)),
+    }
+};
+
+def core_output: Fn(OutputDto) -> DraftOutput = fn(output) {
+    {
+        id: output_id(output.id),
+        alias: output_alias(output.alias),
+        from: core_row_source(output.from),
+        projections: array.map(output.projections, fn(projection) {
+            {
+                alias: projection_alias(projection.alias),
+                expr: core_projection_expr(projection.expr),
+            }
+        }),
+        group_by: array.map(output.group_by, core_group_key),
+        having: array.map(output.having, fn(having) {
+            {
+                clause_id: clause_id(having.id),
+                projection: projection_alias(having.projection),
+                operator: having.operator,
+                value: having.value,
+            }
+        }),
+        ranking: match output.ranking {
+            Option.None => Option.None,
+            Some(ranking) => Some({
+                partition_by: array.map(ranking.partition_by, core_group_key),
+                order_by: array.map(ranking.order_by, fn(entry) {
+                    { by: projection_alias(entry.by), direction: entry.direction }
+                }),
+                take: ranking.take,
+            }),
+        },
+        order: array.map(output.order, fn(entry) {
+            { by: projection_alias(entry.by), direction: entry.direction }
+        }),
+        limit: output.limit,
+        distinct: output.distinct,
+        post_aggregate: match output.post_aggregate {
+            Option.None => Option.None,
+            Some(PostAggregateDto.CountGroups(alias)) => Some(DraftPostAggregate.CountGroups(projection_alias(alias))),
+        },
+    }
+};
+
+def core_entity_scope: Fn(ScopeDto) -> DraftEntityScope = fn(scope) {
+    {
+        root: { alias: node_alias(scope.root.alias), object_ref: scope.root.object_ref },
+        hops: array.map(scope.hops, fn(hop) {
+            {
+                alias: hop_alias(hop.alias),
+                relation_ref: hop.relation_ref,
+                direction: hop.direction,
+                target: { alias: node_alias(hop.target.alias), object_ref: hop.target.object_ref },
+            }
+        }),
+    }
+};
+
+def construct_core: Fn(DraftDto) -> QueryDraftV2 = fn(dto) {
+    {
+        root: match dto.root {
+            RootDto.Entity(scope) => DraftQueryRoot.Entity(core_entity_scope(scope)),
+            RootDto.Dataset(root) => DraftQueryRoot.Dataset({
+                alias: binding_alias(root.alias),
+                dataset_ref: root.dataset_ref,
+                time_range: root.time_range,
+            }),
+        },
+        bindings: array.map(dto.bindings, fn(binding) {
+            {
+                alias: binding_alias(binding.alias),
+                subject: node_alias(binding.subject),
+                data_link_ref: binding.data_link_ref,
+                dataset_ref: binding.dataset_ref,
+                time_range: binding.time_range,
+            }
+        }),
+        predicates: array.map(dto.predicates, core_predicate),
+        outputs: array.map(dto.outputs, core_output),
+    }
+};
+
+# normalize_v2: DTO -> closed core. Success proves every 0014 §11.1
+# invariant (namespaces unique, reference categories correct, non-empty
+# outputs/projections, bindings consumed, positive limits/ranking takes,
+# fixed-offset time ranges).
+def normalize_v2: Fn(DraftDto) -> Result(QueryDraftV2, Array(DraftIssue)) = fn(dto) {
+    let issues = normalize_issues(dto);
+    if array.length(issues) > 0 {
+        Err(issues)
+    } else {
+        Ok(construct_core(dto))
+    }
+};
+
+# ---------------------------------------------------------------------------
+# The unified entry (0017 T2.6): schema dispatch + revision reconciliation
+# ---------------------------------------------------------------------------
+
+# Advisory (non-fatal) diagnostics that ride the planned summary; empty for
+# every v2 decode (the v1 deprecation producer was removed with the v1
+# adapter in 0017 T8).
+type DraftDiagnostic = struct {
+    code: String,
+    message: String,
+};
+
+type NormalizedDraft = struct {
+    draft: QueryDraftV2,
+    diagnostics: Array(DraftDiagnostic),
+};
+
+type DraftFailure = enum {
+    Error(DraftIssue),
+    Invalid(Array(DraftIssue)),
+};
+import DraftFailure.{Error, Invalid};
+
+def schema_of: Fn(Value) -> Result(Option(String), DraftIssue) = fn(raw) {
+    match raw_field(raw, "schema") {
+        Option.None => Ok(Option.None),
+        Some(value) =>
+            match value {
+                Value.String(schema) => Ok(Some(schema)),
+                _ => Err(issue(UnsupportedDraftSchema, "draft schema field must be a string")),
+            },
+    }
+};
+
+# ---------------------------------------------------------------------------
+# The single entry: schema dispatch + revision reconciliation + normalize
+# ---------------------------------------------------------------------------
+
+def decode_v2_path: Fn(Value, String) -> Result(NormalizedDraft, DraftFailure) = fn(raw, host_revision) {
+    match decode_envelope(raw) {
+        Err(found_issue) => Err(Error(found_issue)),
+        Ok(envelope) =>
+            if envelope.ontology_revision == host_revision {
+                match normalize_v2(envelope.draft) {
+                    Err(issues) => Err(Invalid(issues)),
+                    Ok(core) => Ok({ draft: core, diagnostics: [] }),
+                }
+            } else {
+                Err(Error(ref(
+                    OntologyRevisionMismatch,
+                    `draft envelope ontology_revision \{envelope.ontology_revision} does not match the Host revision \{host_revision}`,
+                    "ontology_revision",
+                    envelope.ontology_revision,
+                    Some(host_revision),
+                    Some(envelope.ontology_revision),
+                )))
+            },
+    }
+};
+
+# decode_and_normalize_json: the ONE decode/normalize entry the Host query
+# pipeline calls (0017 T2.6; tightened by T8). `host_revision` is the
+# revision the Host froze for this run; a v2 envelope carrying any other
+# revision rejects with draft_error/ONTOLOGY_REVISION_MISMATCH before
+# Resolve ever runs (D2). A draft string WITHOUT a schema key is v1 wire and
+# rejects with UNSUPPORTED_DRAFT_SCHEMA (0017 D1/T8: canonical input is the
+# v2 envelope only - the engine never re-derives the version from field
+# shapes).
+def decode_and_normalize_json: Fn(String, String) -> Result(NormalizedDraft, DraftFailure) = fn(text, host_revision) {
+    match json.parse(text) {
+        Err(_) => Err(Error(issue(Parse, "invalid JSON text"))),
+        Ok(raw) =>
+            match schema_of(raw) {
+                Err(found_issue) => Err(Error(found_issue)),
+                Ok(maybe_schema) =>
+                    match maybe_schema {
+                        Option.None => Err(Error(ref(
+                            UnsupportedDraftSchema,
+                            "the draft carries no schema; the only supported schema is umodel.query-draft/v2",
+                            "schema",
+                            "",
+                            Some("umodel.query-draft/v2"),
+                            Option.None,
+                        ))),
+                        Some(schema) =>
+                            if schema == "umodel.query-draft/v2" {
+                                decode_v2_path(raw, host_revision)
+                            } else {
+                                Err(Error(ref(
+                                    UnsupportedDraftSchema,
+                                    `unsupported draft schema \{schema}; the only supported schema is umodel.query-draft/v2`,
+                                    "schema",
+                                    schema,
+                                    Some("umodel.query-draft/v2"),
+                                    Some(schema),
+                                )))
+                            },
+                    },
+            },
+    }
+};
+
+export { decode_hop };

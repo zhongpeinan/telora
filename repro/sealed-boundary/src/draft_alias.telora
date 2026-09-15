@@ -1,0 +1,64 @@
+# draft_alias.telora - the nominal alias type of the QueryDraft wire boundary
+# (RFC 0001 L285, L426), isolated in its own module.
+#
+# Why a separate module: importing std/fmt in a module that ALSO uses
+# `\{...}` interpolated string templates trips a toolchain bug - the template
+# lowering reports `unknown binding "\0trait_impl:26:1024"` (the Display
+# trait-impl binding generated from std/fmt is not resolvable from the
+# importing module). Moving the fmt-consuming decorator application (and only
+# it) behind a module boundary keeps draft.telora - which interpolates issue
+# messages everywhere - free of a direct std/fmt import, while the type
+# properties ride the declaration wherever the type is decoded.
+#
+# Query-wide unique readable reference name. Nominal on the Telora side; the
+# wire JSON carries it as a bare string, so the RFC 0156 bridge declares the
+# String <-> struct conversion (parse: any string wraps; display: unwrap).
+
+import "std/fmt" as fmt;
+import "std/regex" as re;
+import "std/string" as string;
+
+@string.decode_by_parse
+@string.encode_by_display
+@re.parse_by(re.compile(r"^(?P<value>.*)$"))
+@fmt.display_by("{value}")
+type DraftAlias = struct { value: String };
+
+def draft_alias: Fn(String) -> DraftAlias = fn(value) { { value: value } };
+
+# ---------------------------------------------------------------------------
+# 0014 §9.1 / 0017 D4: the v2 alias namespaces. Each category gets its own
+# nominal wrapper so a reference's CATEGORY is decided by its type, never by
+# searching several string namespaces: a node alias never binds a dataset
+# binding, a projection alias never names an output. The wire encodes every
+# one of them as a bare string; decode reads the string and normalize wraps
+# it into the correct nominal type (the only construction site). Same TEXT
+# in two namespaces is two distinct names and never conflicts.
+#
+# No codec bridge decorators here: these wrappers are constructed by the
+# normalizer, never decoded straight from JSON by the struct codec.
+# ---------------------------------------------------------------------------
+
+type DraftNodeAlias = struct { value: String };
+type DraftHopAlias = struct { value: String };
+type DraftBindingAlias = struct { value: String };
+type DraftOutputAlias = struct { value: String };
+type DraftProjectionAlias = struct { value: String };
+type DraftClauseId = struct { value: String };
+type DraftOutputId = struct { value: String };
+
+def node_alias: Fn(String) -> DraftNodeAlias = fn(value) { { value: value } };
+def hop_alias: Fn(String) -> DraftHopAlias = fn(value) { { value: value } };
+def binding_alias: Fn(String) -> DraftBindingAlias = fn(value) { { value: value } };
+def output_alias: Fn(String) -> DraftOutputAlias = fn(value) { { value: value } };
+def projection_alias: Fn(String) -> DraftProjectionAlias = fn(value) { { value: value } };
+def clause_id: Fn(String) -> DraftClauseId = fn(value) { { value: value } };
+def output_id: Fn(String) -> DraftOutputId = fn(value) { { value: value } };
+
+export {
+    DraftAlias, draft_alias,
+    DraftNodeAlias, DraftHopAlias, DraftBindingAlias, DraftOutputAlias,
+    DraftProjectionAlias, DraftClauseId, DraftOutputId,
+    node_alias, hop_alias, binding_alias, output_alias, projection_alias,
+    clause_id, output_id,
+};

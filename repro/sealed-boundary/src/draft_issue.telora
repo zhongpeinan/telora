@@ -1,0 +1,137 @@
+# draft_issue.telora - the closed diagnostic vocabulary and the structured
+# DraftIssue shared by every decode/normalize/adapter boundary of the
+# QueryDraft layer (0014 §9.2, 0017 D6).
+#
+# Why a separate module: the issue type is shared by the decode boundary
+# (draft.telora) and any future validator module without import cycles;
+# it stays a leaf so message templates never fight std/fmt (the
+# draft_alias.telora toolchain note).
+#
+# Structured locator fields (D6): `json_path` points at the draft element
+# that failed (e.g. "draft.outputs[1].having[0].projection"), `clause_id`
+# at the authored clause, `reference` at the name that could not be
+# resolved, and `expected`/`actual` at vocabulary mismatches. Non-applicable
+# fields are 'None and render as JSON null - ONE object schema for every
+# error shape, never a per-error shape. `message` stays human-oriented;
+# tests and repair agents key on `code` plus the locator fields.
+#
+# This module deliberately imports no std/fmt (the draft_alias.telora
+# toolchain note): messages are `\{...}` templates.
+
+import "./draft_alias" { DraftClauseId };
+
+type DraftIssueCode = enum {
+    # --- decode phase (JSON shape / wire vocabulary) ---
+    Parse,
+    Decode,
+    MissingField,
+    NoKind,
+    KindNotString,
+    UnknownKind,
+    # --- v2 structural normalize (0014 §11.1, 0017 D7) ---
+    DuplicateAlias,
+    UnknownAlias,
+    # --- envelope dispatch (0017 D1/D2) ---
+    UnsupportedDraftSchema,
+    OntologyRevisionMismatch,
+    # --- v2 structural normalize (continued) ---
+    UnknownProjection,
+    NoOutputs,
+    EmptyOutput,
+    UnconsumedBinding,
+    BadLimit,
+    BadRankingTake,
+    BadTimeRange,
+    # --- 2026-08-31 revision (D13/D14: Dataset root + CountGroups) ---
+    # A Dataset root is a closed query entry: bindings are Entity-root-only.
+    RootBindingsForbidden,
+    # A Dataset root alias no predicate/row source/projection/group key or
+    # ranking partition ever references (constructed-state defense: the
+    # output row source must name the only dataset access).
+    UnconsumedDatasetRoot,
+    # CountGroups requires a non-empty group_by and excludes ranking/order/
+    # limit/distinct (one code, located per failed clause).
+    BadPostAggregate,
+};
+import DraftIssueCode.{BadLimit, BadPostAggregate, BadRankingTake, BadTimeRange, Decode, DuplicateAlias, EmptyOutput, KindNotString, MissingField, NoKind, NoOutputs, OntologyRevisionMismatch, Parse, RootBindingsForbidden, UnconsumedBinding, UnconsumedDatasetRoot, UnknownAlias, UnknownKind, UnknownProjection, UnsupportedDraftSchema};
+
+type DraftIssue = struct {
+    code: DraftIssueCode,
+    message: String,
+    json_path: Option(String),
+    clause_id: Option(DraftClauseId),
+    reference: Option(String),
+    expected: Option(String),
+    actual: Option(String),
+};
+
+# A bare issue (no locator): decode-shape failures that have no meaningful
+# draft position.
+def issue: Fn(DraftIssueCode, String) -> DraftIssue = fn(code, message) {
+    {
+        code: code,
+        message: message,
+        json_path: None,
+        clause_id: None,
+        reference: None,
+        expected: None,
+        actual: None,
+    }
+};
+
+# An issue located at a draft JSON path.
+def at: Fn(DraftIssueCode, String, String) -> DraftIssue = fn(code, message, json_path) {
+    {
+        code: code,
+        message: message,
+        json_path: Some(json_path),
+        clause_id: None,
+        reference: None,
+        expected: None,
+        actual: None,
+    }
+};
+
+# An issue located at a draft JSON path and naming the reference that could
+# not be resolved (with optional expected/actual vocabulary fields).
+def ref: Fn(DraftIssueCode, String, String, String, Option(String), Option(String)) -> DraftIssue = fn(code, message, json_path, reference, expected, actual) {
+    {
+        code: code,
+        message: message,
+        json_path: Some(json_path),
+        clause_id: None,
+        reference: Some(reference),
+        expected: expected,
+        actual: actual,
+    }
+};
+
+# The closed wire vocabulary: every variant maps to one stable uppercase
+# string (the historical v1 spellings are preserved so existing consumers
+# keep reading them; new codes are additive per the 0017 README §3 register).
+def draft_issue_code_name: Fn(DraftIssueCode) -> String = fn(code) {
+    match code {
+        Parse => "PARSE",
+        Decode => "DECODE",
+        MissingField => "MISSING_FIELD",
+        NoKind => "NO_KIND",
+        KindNotString => "KIND_NOT_STRING",
+        UnknownKind => "UNKNOWN_KIND",
+        DuplicateAlias => "DUPLICATE_ALIAS",
+        UnknownAlias => "UNKNOWN_ALIAS",
+        UnsupportedDraftSchema => "UNSUPPORTED_DRAFT_SCHEMA",
+        OntologyRevisionMismatch => "ONTOLOGY_REVISION_MISMATCH",
+        UnknownProjection => "UNKNOWN_PROJECTION",
+        NoOutputs => "NO_OUTPUTS",
+        EmptyOutput => "EMPTY_OUTPUT",
+        UnconsumedBinding => "UNCONSUMED_BINDING",
+        BadLimit => "BAD_LIMIT",
+        BadRankingTake => "BAD_RANKING_TAKE",
+        BadTimeRange => "BAD_TIME_RANGE",
+        RootBindingsForbidden => "ROOT_BINDINGS_FORBIDDEN",
+        UnconsumedDatasetRoot => "UNCONSUMED_DATASET_ROOT",
+        BadPostAggregate => "BAD_POST_AGGREGATE",
+    }
+};
+
+export { DraftIssue, DraftIssueCode, issue, at, ref, draft_issue_code_name };

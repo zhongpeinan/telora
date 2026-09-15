@@ -1,0 +1,1 @@
+{"name": "sealed-min", "modules": ["@src/draft", "@src/draft_issue", "@src/draft_alias"], "dependencies": []}
