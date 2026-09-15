@@ -1,12 +1,11 @@
 //! Session-owned, partially solved IR. No resolver, type checker or VM lives here.
-use crate::ast::{
+use crate::syntax::kinds::{
     BinaryOperator, BindingKind, BlameAction, DeclaredInitializerKind, UnaryOperator,
 };
 use crate::source::{Diagnostic, Location, SourceDatabase, SourceId};
-use crate::syntax::telora::parser::CstData;
+use crate::syntax::telora::parser::{CstData, NodeRef};
 use std::fmt::Write;
 
-pub(crate) mod lower;
 mod seal;
 mod executable;
 mod type_schemes;
@@ -14,6 +13,10 @@ mod properties;
 mod materializations;
 mod declaration_contracts;
 mod constraint_outcomes;
+mod resolution;
+mod substitution;
+pub use resolution::{ResolutionFacts, ResolveTask};
+pub use substitution::TypeSubstitution;
 pub use declaration_contracts::{DeclarationContract, DeclarationContractState};
 pub use seal::SealedMir;
 pub use executable::{ExecutionClosure, ExecutionRoot, SealedExecutable};
@@ -490,10 +493,19 @@ pub enum ResolveFailure {
 #[derive(Debug)]
 pub struct HirNode {
     pub module: ModuleId,
+    /// Logical reference into this module's CST; synthesized nodes can share
+    /// a source node. Compiler-only nodes need not have a syntax origin.
+    pub origin: Option<HirOrigin>,
     pub location: Location,
     pub kind: HirKind,
     pub children: Vec<Edge>,
     pub resolution: Option<ResolveSlotId>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HirOrigin {
+    Source(NodeRef),
+    Desugared(NodeRef),
 }
 impl HirId {
     pub fn ty(self) -> TypeSlotId {
@@ -555,6 +567,9 @@ pub enum TypeOperation {
 /// edges. No node owns another HIR node or contains a resolved type descriptor.
 #[derive(Debug)]
 pub enum HirKind {
+    /// A required semantic position for which syntax supplied no information.
+    /// It contributes no evidence and cannot be sealed or evaluated.
+    Missing,
     NativeTypeSlot(i64),
     TypeOperation(TypeOperation),
     TypeMember {
@@ -651,6 +666,8 @@ pub struct Mir {
     /// Completeness established before any value implementation constraints.
     pub declaration_contract_ready: Vec<bool>,
     pub resolve_conflicts: Vec<ResolveConflict>,
+    /// Syntax-only query results and pending dependencies of symbol mini passes.
+    pub resolution_facts: ResolutionFacts,
     pub symbols_closed: bool,
     pub ty_slots: Vec<TypeState>,
     pub symbol_types: Vec<TypeSlotId>,
@@ -668,6 +685,8 @@ pub struct Mir {
     pub implementation_instances: Vec<Option<GenericInstanceId>>,
     pub type_terms: Vec<TypeTerm>,
     pub types: Vec<ResolvedType>,
+    /// Reusable working slots for the current resolved-type substitution.
+    pub type_substitution: TypeSubstitution,
     pub type_layouts: Vec<Option<TypeLayout>>,
     pub member_selections: Vec<Option<MemberSelection>>,
     pub value_materializations: Vec<Option<ValueMaterialization>>,
@@ -677,6 +696,9 @@ pub struct Mir {
     pub construction_checks: Vec<ConstructionCheck>,
     /// Implicit construction boundaries; the source expression retains its own type.
     pub value_adjustments: Vec<Option<TypeSlotId>>,
+    /// Expected signatures at authored function-value uses. These retain the
+    /// obligation independently of the adjustment chosen by type solving.
+    pub callable_boundaries: Vec<Option<TypeSlotId>>,
     /// Lexical function/module boundary for each propagation expression.
     pub propagation_boundaries: Vec<Option<HirId>>,
     pub bound_requirements: Vec<BoundRequirement>,
@@ -719,6 +741,7 @@ impl Mir {
         let id = HirId(self.hir.len().try_into().expect("HIR capacity"));
         self.hir.push(HirNode {
             module,
+            origin: None,
             location,
             kind,
             children,
@@ -773,6 +796,30 @@ impl Mir {
         for (id, conflict) in self.resolve_conflicts.iter().enumerate() {
             writeln!(out, "resolve-conflict {id} {conflict:?}").unwrap();
         }
+        for (task, dependency) in &self.resolution_facts.waiting {
+            writeln!(out, "resolve-wait {task:?} => {dependency:?}").unwrap();
+        }
+        for (id, namespace) in self.resolution_facts.namespaces.iter().enumerate() {
+            if let Some(namespace) = namespace {
+                writeln!(out, "namespace {id} => {namespace:?}").unwrap();
+            }
+        }
+        for (id, constructor) in self.resolution_facts.constructors.iter().enumerate() {
+            if let Some(constructor) = constructor {
+                writeln!(out, "constructor {id} => {constructor}").unwrap();
+            }
+        }
+        for (id, constructor) in self.resolution_facts.constructor_namespaces.iter().enumerate() {
+            if let Some(constructor) = constructor {
+                writeln!(out, "constructor-namespace {id} => {constructor}").unwrap();
+            }
+        }
+        if !self.type_substitution.nodes.is_empty() {
+            writeln!(out, "type-substitution-parameters {:?}", self.type_substitution.parameters).unwrap();
+            for (id, node) in self.type_substitution.nodes.iter().enumerate() {
+                writeln!(out, "type-substitution {id} {node:?}").unwrap();
+            }
+        }
         for (id, term) in self.type_terms.iter().enumerate() {
             writeln!(out, "type-term {id} {term:?}").unwrap();
         }
@@ -787,6 +834,11 @@ impl Mir {
         }
         for (node, target) in self.value_adjustments.iter().enumerate() {
             if let Some(target) = target { writeln!(out, "value-adjustment {node} {:?}", self.ty_slots[target.index()]).unwrap(); }
+        }
+        for (node, target) in self.callable_boundaries.iter().enumerate() {
+            if let Some(target) = target {
+                writeln!(out, "callable-boundary {node} {target:?} => {:?}", self.ty_slots[target.index()]).unwrap();
+            }
         }
         for (node, boundary) in self.propagation_boundaries.iter().enumerate() {
             if let Some(boundary) = boundary { writeln!(out, "propagation-boundary {node} {boundary:?}").unwrap(); }
@@ -877,6 +929,9 @@ impl Mir {
                 self.ty_slots[id]
             )
             .unwrap();
+            if let Some(origin) = node.origin {
+                writeln!(out, "hir-origin {id} {:?} {origin:?}", node.module).unwrap();
+            }
         }
         for diagnostic in &self.diagnostics {
             writeln!(out, "diagnostic {diagnostic:?}").unwrap();

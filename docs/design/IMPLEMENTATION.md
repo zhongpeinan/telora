@@ -31,9 +31,9 @@ seal 的 MIR；执行入口必须通过 seal。后续阶段直接使用静态结
 
 | 层次 | 当前实现 |
 | --- | --- |
-| grammar、CST、parser | `syntax/telora/`、`parser.rs`、`ast.rs` |
+| grammar、CST、parser、借用语法视图 | `syntax/telora/` |
 | 共享数据 parser、source 与 document | `crates/telora-data/src/` |
-| session 图与 HIR lowering | `mir.rs`、`mir/lower.rs`、`module_resolve.rs` |
+| session 图与 HIR lowering | `mir.rs`、`hir_lower/`、`module_resolve.rs` |
 | 符号、类型求解 | `symbol_resolve.rs`、`type_resolve.rs` 及其子目录 |
 | 封闭与只读查询 | `mir/seal.rs`、`mir_query.rs` |
 | 静态执行闭包与类型镜像 | `mir/executable.rs`、`type_image.rs` |
@@ -62,6 +62,17 @@ parser 保留 lossless CST、恢复后的语法和诊断。module Pass 将可达
 记录源码有效性，并分配扁平 HIR 节点及相应 resolve/type 槽。源码不完整也能产生可查询图，
 但不能因此获得执行资格。
 
+CST 是语法数据的唯一所有者；`syntax/telora/ast.rs` 提供借用视图，不构造完整 Owned AST。
+`hir_lower` 用显式任务栈读取这些视图，直接向 HIR arena 写入节点和 Id 边。
+源码节点记录 `HirOrigin::Source`，脱糖节点记录 `HirOrigin::Desugared`，两者都引用所属模块
+CST 中的节点；这不是一对一映射，同一处语法可以产生多个语义节点。
+字符串等字面量在 lowering 时解码，后续阶段消费语义载荷，不重新解析源码。
+
+语法恢复由 parser 决定，CST 保存恢复结果，借用视图允许必要子节点缺失。
+HIR 保留仍有意义的操作和绑定，以 `Missing` 表示没有语法证据的必要位置；
+缺失子节点不会把父节点变成错误节点。lowering 不重新扫描错误子树，也不按诊断文本
+拼接或替换 parser 的结论。后续静态 Pass 可以继续求解已有信息，但含 `Missing` 的图不能 seal。
+
 模块状态包括 `Unloaded`、`Source`、`Data` 和 `Unavailable`。符号求解结果包括
 `Bound`、`Unresolved` 和 `Conflicted`；冲突区分重复定义、多个 import 候选等。
 `ResolveState::Member` 表示已交给类型阶段的成员约束，不是遗留的词法名称查找。
@@ -79,6 +90,30 @@ Conflicted(TypeConflictId)
 冲突发现时记录证据与诊断，最终归一化后记录仍未确定的必需槽。Unresolved/Conflicted
 是前一阶段的权威结果；后续阶段继续处理独立信息，不回退到另一套解析或推导器。
 静态阶段的诊断积累不采用 VM 的失败恢复语义。
+
+### 静态 mini pass 调度
+
+MIR 承载待填槽位和查询结论，任务只指定目标 Id 与局部操作，不递归调度子任务。
+符号索引使用 `(HirId, ScopeId, IndexPass)` 显式工作表，保持源码顺序和稳定的符号分配。
+符号、引用、命名空间、构造器分类使用 `ResolveTask`；查询方法只读取 MIR 的结果，
+缺少输入时返回依赖任务，由外层循环登记等待并调度生产者。结果发布后只唤醒其消费者，
+入队去重，不以反复扫描全部符号推进引用链。
+
+`resolution_facts` 保存命名空间、构造器分类和等待边。尚未查询/仍在等待，与明确的
+否定结论分开。队列耗尽时才分析无法推进的依赖环，发布无依据的引用或分类结论，
+其余消费者继续正常求解。符号诊断在进入类型阶段前按来源排序；类型阶段消费最终
+绑定、未解析或冲突结果，不自行重做名字查找。
+
+类型阶段保留既有约束工作表及 revision 固定点轮次。结构相等与字面量兼容检查
+共用一个局部约束队列，兼容处理不重新调用相等求解。匹配、参数检查和模式 occurs
+使用显式工作表，访问去重保留 binder 上下文。已解析类型的替换把参数映射、子结果槽位
+和结果放在 MIR 的 `type_substitution` 中，通过 Visit/Finish 工作项完成；同一上下文的
+共享子类型只求解一次。结果进入规范类型表后，这组工作槽位可供下一次替换复用。
+
+MIR dump 包含上述查询结论、等待原因和当前替换槽位，读取不触发求解。
+module 图遍历、引用闭合、类型辅助遍历及 seal 的图检查不依赖输入深度递归调度。
+诊断类型文本的渲染仍有显式上限（深度 32、节点预算 128），不随输入无限增长。
+这不对生成 parser 或运行时的栈行为作出承诺。
 
 源码位置从 CST/HIR 保留到 Wasm debug origins 和运行时值。逻辑模块名用于诊断，物理路径由 Host
 单独保存。CLI JSONL 使用 1-based line、0-based UTF-8 byte column；LSP 根据客户端协商
@@ -177,6 +212,11 @@ MIR 拥有 HIR、resolve_slots、ty_slots、结构类型项、最终类型表及
 `Mir::seal` 检查必需类型槽、泛型实例、成员选择、类型布局、构造检查、property 与 bound
 证据是否完整。成功返回只读借用 `SealedMir` 和独立的 TypeImage；seal 不重新编号。
 失败保留原 MIR 和诊断，供 query/LSP 使用。
+
+返回 `Never` 的函数值可用于参数类型完全相同、返回类型不同的函数签名位置。
+类型求解在使用节点记录目标签名和 `value_adjustments`，保留原函数的声明类型；
+泛型实例物化时同步替换适配中的类型参数。seal 检查所需适配证据，Wasm 仅消费
+已确定的签名来调整函数值的类型标记，无需返回值转换或后端重新推断。
 
 入口执行另有 `Mir::seal_export` 发布的 `SealedExecutable`：它保留 TypeImage，
 并封闭所选导出的值依赖、具体实例及元数据初始化集合。未实例化模板仅属于静态

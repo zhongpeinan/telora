@@ -184,7 +184,7 @@ impl Plan {
                 HirKind::Closure
                     | HirKind::Interpreter
                     | HirKind::Binding {
-                        kind: telora_core::ast::BindingKind::Native,
+                        kind: telora_core::syntax::kinds::BindingKind::Native,
                         ..
                     }
             ) || constructor
@@ -352,6 +352,13 @@ impl Plan {
                 if let Some(slot) = syntax.resolution
                     && let ResolveState::Bound(symbol) = mir.resolve_slots[slot.index()]
                     && !executable.globals().contains(&symbol)
+                    // Patterns consume sealed tags/layouts, not constructor values.
+                    // They intentionally have no value-materialization record.
+                    && !(matches!(syntax.kind, HirKind::ConstructorPattern | HirKind::PatternName(_))
+                        && matches!(mir.member_selections[node.index()],
+                            Some(telora_core::mir::MemberSelection::Boolean(_)
+                                | telora_core::mir::MemberSelection::EnumVariant { .. }
+                                | telora_core::mir::MemberSelection::NewtypePattern)))
                     && !matches!(crate::enums::selection(mir, node),
                         Some(telora_core::mir::MemberSelection::Boolean(_)))
                     && !matches!(
@@ -367,9 +374,9 @@ impl Plan {
                         telora_core::mir::SymbolKind::Parameter
                             | telora_core::mir::SymbolKind::Pattern
                             | telora_core::mir::SymbolKind::Declaration(
-                                telora_core::ast::BindingKind::Let
-                                    | telora_core::ast::BindingKind::Def
-                                    | telora_core::ast::BindingKind::Decl
+                                telora_core::syntax::kinds::BindingKind::Let
+                                    | telora_core::syntax::kinds::BindingKind::Def
+                                    | telora_core::syntax::kinds::BindingKind::Decl
                             )
                     )
                 {

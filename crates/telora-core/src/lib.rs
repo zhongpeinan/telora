@@ -6,7 +6,6 @@
     clippy::type_complexity
 )]
 
-pub mod ast;
 pub mod entry_plan;
 pub mod type_image;
 pub mod candidate_layout;
@@ -15,6 +14,7 @@ mod test_protocol;
 pub use test_protocol::{TestContext, TestHost, TestLimits, TestSource};
 pub use telora_data::{document, json, data_plan, source};
 pub mod mir;
+pub mod hir_lower;
 pub mod mir_query;
 pub mod static_sources;
 pub mod module_resolve;
@@ -22,7 +22,6 @@ pub mod symbol_resolve;
 pub mod type_resolve;
 pub mod module_format;
 pub mod package;
-pub mod parser;
 pub mod query;
 pub mod runtime_host;
 pub mod syntax;

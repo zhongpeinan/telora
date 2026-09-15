@@ -1,5 +1,5 @@
 //! Third MIR pass. All constraints use syntax slots and resolved SymbolIds.
-use crate::ast::{BinaryOperator, BindingKind, BlameAction, UnaryOperator};
+use crate::syntax::kinds::{BinaryOperator, BindingKind, BlameAction, UnaryOperator};
 use crate::mir::*;
 use crate::source::{Diagnostic, Location};
 use std::collections::BTreeSet;
@@ -284,6 +284,7 @@ pub fn resolve(mir: &mut Mir) {
 impl Solver<'_> {
     fn new(mir: &mut Mir) -> Solver<'_> {
         mir.value_adjustments.resize(mir.hir.len(), None);
+        mir.callable_boundaries.resize(mir.hir.len(), None);
         let mut value_spreads = vec![false; mir.hir.len()];
         for field in &mir.hir {
             if matches!(field.kind, HirKind::DictField | HirKind::Array | HirKind::Tuple) {
@@ -546,6 +547,7 @@ impl Solver<'_> {
                     }
                 }
             }
+            HirKind::Missing => self.mir.required_types[node.index()] = false,
             HirKind::Wildcard | HirKind::PatternField => {}
             HirKind::StructPattern => {
                 for field in self.children(node, Role::Field) {
@@ -584,6 +586,9 @@ impl Solver<'_> {
                 });
             }
             HirKind::MatchArm { .. } => {
+                // The value carries the obligation; the arm is only its
+                // structural container, including when that value is missing.
+                self.mir.required_types[node.index()] = false;
                 if let Some(guard) = self.child(node, Role::Guard) {
                     self.assign(guard, TypeConstructor::Bool, vec![]);
                 }
