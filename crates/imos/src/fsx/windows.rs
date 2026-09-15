@@ -22,8 +22,15 @@ const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
 const INVALID_HANDLE_VALUE: isize = -1;
 
 // FILETIME is 100ns ticks since 1601-01-01; 11_644_473_600 seconds lie
-// between that epoch and 1970-01-01.
-const FILETIME_EPOCH_OFFSET_TICKS: u64 = 11_644_473_600_000_000;
+// between that epoch and 1970-01-01, i.e. 11_644_473_600 * 10_000_000 ticks.
+const FILETIME_EPOCH_OFFSET_TICKS: u64 = 116_444_736_000_000_000;
+
+/// Converts FILETIME ticks to nanoseconds since the Unix epoch, the stamp
+/// contract shared with the Unix backend. The subtraction is signed so
+/// timestamps from before 1970 stay negative instead of clamping to zero.
+fn filetime_ticks_to_unix_ns(ticks: u64) -> i128 {
+    (i128::from(ticks) - i128::from(FILETIME_EPOCH_OFFSET_TICKS)) * 100
+}
 
 // Mirrors BY_HANDLE_FILE_INFORMATION: every field is a DWORD (or a FILETIME
 // pair of DWORDs), so no padding can appear.
@@ -73,9 +80,7 @@ fn from_handle_information(info: &ByHandleFileInformation) -> io::Result<FileSna
         },
         links: info.links as u64,
         length: ((info.size_high as u64) << 32) | info.size_low as u64,
-        modified: ModificationStamp(
-            i128::from(ticks.saturating_sub(FILETIME_EPOCH_OFFSET_TICKS)).saturating_mul(100),
-        ),
+        modified: ModificationStamp(filetime_ticks_to_unix_ns(ticks)),
         is_file: info.attributes & FILE_ATTRIBUTE_DIRECTORY == 0,
         is_dir: info.attributes & FILE_ATTRIBUTE_DIRECTORY != 0,
     })
@@ -124,17 +129,178 @@ pub(crate) fn snapshot_file(file: &File) -> io::Result<FileSnapshot> {
     from_handle(file.as_raw_handle() as isize)
 }
 
-pub(crate) fn set_access(_path: &Path, _policy: AccessPolicy) -> io::Result<()> {
-    // The store lives under the user's profile, whose default ACLs already
-    // restrict access to the owner. The read-only attribute is deliberately
-    // not used for `WriteProtected`: it would block `replace_request` from
-    // replacing published request files and block removal of stale objects
-    // during collection. Immutability is enforced by store locks and
-    // identity checks instead.
+pub(crate) fn set_access(path: &Path, policy: AccessPolicy) -> io::Result<()> {
+    match policy {
+        // Plain directories, regular files and executables keep the ACLs
+        // they inherit from their private store root.
+        AccessPolicy::Directory | AccessPolicy::RegularFile | AccessPolicy::ExecutableFile => {
+            Ok(())
+        }
+        // Deliberately not the read-only attribute: it would block
+        // `replace_request` from replacing published request files and block
+        // removal of stale objects during collection. Accidental-write
+        // protection is an explicit platform tradeoff, guarded by store
+        // locks and identity checks instead.
+        AccessPolicy::WriteProtected => Ok(()),
+        // `Store::open` accepts arbitrary roots and `TELORA_EES_STORE` can
+        // relocate the store outside the user profile, so inherited ACLs
+        // cannot be assumed to restrict access: write an explicit
+        // owner-only DACL, the counterpart of the Unix 0700 policy.
+        AccessPolicy::PrivateDirectory => set_owner_only_dacl(path),
+    }
+}
+
+/// Grants full control to the directory's owner, SYSTEM and Administrators
+/// through a protected, inheritable DACL, mirroring the Unix 0700 policy for
+/// store roots. Children created inside the directory afterwards inherit
+/// the same grants.
+fn set_owner_only_dacl(path: &Path) -> io::Result<()> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{
+        EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW, SE_FILE_OBJECT, SetEntriesInAclW,
+        SetNamedSecurityInfoW, TRUSTEE_IS_SID, TRUSTEE_W,
+    };
+    use windows_sys::Win32::Security::{
+        AllocateAndInitializeSid, DACL_SECURITY_INFORMATION, FreeSid, OWNER_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSID, SECURITY_NT_AUTHORITY,
+        SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+    };
+
+    const FILE_ALL_ACCESS: u32 = 0x001F_01FF;
+
+    // SAFETY: the returned SID must be freed with `FreeSid`.
+    unsafe fn well_known_sid(subauthorities: &[u32]) -> io::Result<PSID> {
+        let mut sid: PSID = std::ptr::null_mut();
+        let mut tail = [0u32; 7];
+        tail[..subauthorities.len() - 1].copy_from_slice(&subauthorities[1..]);
+        // SAFETY: `SECURITY_NT_AUTHORITY` is a static authority value, the
+        // sub-authority count matches `subauthorities`, and `sid` receives a
+        // PSID the caller frees with `FreeSid`.
+        if unsafe {
+            AllocateAndInitializeSid(
+                &SECURITY_NT_AUTHORITY,
+                subauthorities.len() as u8,
+                subauthorities[0],
+                tail[0],
+                tail[1],
+                tail[2],
+                tail[3],
+                tail[4],
+                tail[5],
+                tail[6],
+                &mut sid,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(sid)
+    }
+
+    let system = unsafe { well_known_sid(&[18]) }?;
+    let administrators = match unsafe { well_known_sid(&[32, 544]) } {
+        Ok(sid) => sid,
+        Err(error) => {
+            // SAFETY: `system` was allocated above and is freed exactly once.
+            unsafe { FreeSid(system) };
+            return Err(error);
+        }
+    };
+
+    let wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+
+    let mut owner: PSID = std::ptr::null_mut();
+    let mut descriptor = std::ptr::null_mut();
+    // SAFETY: `wide` is NUL-terminated and names an existing directory the
+    // caller controls; `owner`/`descriptor` belong to the returned security
+    // descriptor and are freed below.
+    let query = unsafe {
+        GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+
+    let mut dacl = std::ptr::null_mut();
+    let result = if query == 0 {
+        let grant = |sid: PSID| EXPLICIT_ACCESS_W {
+            grfAccessPermissions: FILE_ALL_ACCESS,
+            grfAccessMode: GRANT_ACCESS,
+            grfInheritance: SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+            Trustee: TRUSTEE_W {
+                pMultipleTrustee: std::ptr::null_mut(),
+                MultipleTrusteeOperation: 0,
+                TrusteeForm: TRUSTEE_IS_SID,
+                TrusteeType: 0,
+                ptstrName: sid.cast(),
+            },
+        };
+        let entries = [grant(owner), grant(system), grant(administrators)];
+        // SAFETY: `entries` is an array of correctly shaped EXPLICIT_ACCESS_W;
+        // `dacl` receives an ACL owned by us and freed below.
+        let build = unsafe {
+            SetEntriesInAclW(
+                entries.len() as u32,
+                entries.as_ptr(),
+                std::ptr::null(),
+                &mut dacl,
+            )
+        };
+        if build != 0 {
+            build
+        } else {
+            // SAFETY: `wide` is NUL-terminated. The protected DACL replaces
+            // inherited access on the directory itself, while the inheritable
+            // entries cover children created afterwards.
+            unsafe {
+                SetNamedSecurityInfoW(
+                    wide.as_ptr(),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    dacl,
+                    std::ptr::null(),
+                )
+            }
+        }
+    } else {
+        query
+    };
+
+    // SAFETY: `descriptor`/`dacl` are either null or were produced by the
+    // calls above, and each non-null one is freed exactly once.
+    unsafe {
+        if !descriptor.is_null() {
+            LocalFree(descriptor.cast());
+        }
+        if !dacl.is_null() {
+            LocalFree(dacl.cast());
+        }
+        FreeSid(system);
+        FreeSid(administrators);
+    }
+
+    if result != 0 {
+        return Err(io::Error::from_raw_os_error(result as i32));
+    }
     Ok(())
 }
 
 pub(crate) fn protect_file(_file: &File) -> io::Result<()> {
+    // Same tradeoff as `WriteProtected`: the read-only attribute would block
+    // request replacement (`tempfile` persist) and stale-object removal.
+    // Accidental-write protection relies on store locks and identity checks.
     Ok(())
 }
 
@@ -146,11 +312,17 @@ pub(crate) fn sync_directory(_path: &Path) -> io::Result<()> {
 }
 
 pub(crate) fn request_lock_key(target: &Path) -> String {
-    // Callers pass `std::fs::canonicalize` output, which keeps the Windows
-    // verbatim (`\\?\`) prefix, and Win32 path lookup is case-insensitive:
-    // drop the prefix and fold case so aliases of one target share a lock
-    // key. Over-merging cannot happen for distinct files, because names that
-    // differ only by case denote the same file under default NTFS semantics.
+    // Input premise: callers resolve the request home with
+    // `std::fs::canonicalize` before joining the target name, and the name is
+    // restricted by `validate_plan_name` to lowercase ASCII letters, digits
+    // and single separators. Under those premises the residual alias classes
+    // are the verbatim (`\\?\` and `\\?\UNC\`) prefixes that canonicalize
+    // keeps and differences in drive/directory casing: strip the prefixes and
+    // fold case so those spellings share one lock key. This is not a general
+    // Windows path normalizer; alias forms outside the premise (e.g. 8.3
+    // short names or symlinks under the canonical parent) are expected to be
+    // resolved by canonicalize before the key is computed, and any that are
+    // not would surface as separate keys for the same target.
     let text = target.as_os_str().to_string_lossy();
     let normalized = if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
         format!(r"\\{unc}")
@@ -160,4 +332,150 @@ pub(crate) fn request_lock_key(target: &Path) -> String {
         text.into_owned()
     };
     hex::encode(Sha256::digest(normalized.to_lowercase().as_bytes()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unix_epoch_filetime_converts_to_zero() {
+        assert_eq!(filetime_ticks_to_unix_ns(FILETIME_EPOCH_OFFSET_TICKS), 0);
+    }
+
+    #[test]
+    fn filetime_before_unix_epoch_stays_negative() {
+        // 1601-01-01, the FILETIME zero point, is a whole number of seconds
+        // before 1970-01-01 and must not clamp to zero.
+        assert_eq!(
+            filetime_ticks_to_unix_ns(0),
+            -11_644_473_600i128 * 1_000_000_000
+        );
+    }
+
+    #[test]
+    fn filetime_one_second_after_unix_epoch() {
+        assert_eq!(
+            filetime_ticks_to_unix_ns(FILETIME_EPOCH_OFFSET_TICKS + 10_000_000),
+            1_000_000_000
+        );
+    }
+
+    #[test]
+    fn private_directory_dacl_grants_owner_only() {
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+        use windows_sys::Win32::Security::{
+            ACCESS_ALLOWED_ACE, ACL_SIZE_INFORMATION, AllocateAndInitializeSid, EqualSid, FreeSid,
+            GetAce, GetAclInformation, GetSecurityDescriptorControl, PSID, SE_DACL_PROTECTED,
+            SECURITY_WORLD_SID_AUTHORITY,
+        };
+        use windows_sys::Win32::Security::{AclSizeInformation, DACL_SECURITY_INFORMATION};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        set_access(root, AccessPolicy::PrivateDirectory).unwrap();
+
+        let wide = root
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let mut dacl = std::ptr::null_mut();
+        let mut descriptor = std::ptr::null_mut();
+        // SAFETY: `wide` is NUL-terminated and names the directory we just
+        // protected; the returned descriptor is freed at the end of the test.
+        unsafe {
+            assert_eq!(
+                GetNamedSecurityInfoW(
+                    wide.as_ptr(),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut dacl,
+                    std::ptr::null_mut(),
+                    &mut descriptor,
+                ),
+                0
+            );
+            let mut control = 0u16;
+            let mut revision = 0u32;
+            assert_ne!(
+                GetSecurityDescriptorControl(descriptor, &mut control, &mut revision),
+                0
+            );
+            assert_ne!(control & SE_DACL_PROTECTED, 0, "DACL must be protected");
+
+            let mut size: ACL_SIZE_INFORMATION = std::mem::zeroed();
+            assert_ne!(
+                GetAclInformation(
+                    dacl,
+                    &mut size as *mut _ as *mut core::ffi::c_void,
+                    std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                    AclSizeInformation,
+                ),
+                0
+            );
+            assert_eq!(size.AceCount, 3, "owner, SYSTEM and Administrators only");
+
+            let mut everyone: PSID = std::ptr::null_mut();
+            assert_ne!(
+                AllocateAndInitializeSid(
+                    &SECURITY_WORLD_SID_AUTHORITY,
+                    1,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    &mut everyone,
+                ),
+                0
+            );
+            let mut ace = std::ptr::null_mut();
+            for index in 0..size.AceCount {
+                assert_ne!(GetAce(dacl, index, &mut ace), 0);
+                let allowed = &*(ace as *const ACCESS_ALLOWED_ACE);
+                assert_eq!(allowed.Header.AceType, 0, "every ACE grants access");
+                let sid = &allowed.SidStart as *const u32 as *mut core::ffi::c_void;
+                assert_eq!(EqualSid(sid, everyone), 0, "no ACE may grant Everyone");
+            }
+            FreeSid(everyone);
+            LocalFree(descriptor.cast());
+        }
+    }
+
+    #[test]
+    fn lock_key_folds_verbatim_prefixes_and_casing() {
+        let verbatim = request_lock_key(Path::new(r"\\?\C:\Users\Dev\Data\plan.json"));
+        let plain = request_lock_key(Path::new(r"C:\Users\Dev\Data\plan.json"));
+        assert_eq!(verbatim, plain);
+
+        let folded = request_lock_key(Path::new(r"C:\users\dev\data\plan.json"));
+        assert_eq!(plain, folded);
+    }
+
+    #[test]
+    fn lock_key_normalizes_unc_verbatim_prefix() {
+        let verbatim = request_lock_key(Path::new(r"\\?\UNC\server\share\plan.json"));
+        let plain = request_lock_key(Path::new(r"\\server\share\plan.json"));
+        assert_eq!(verbatim, plain);
+    }
+
+    #[test]
+    fn lock_key_distinguishes_names_and_parents() {
+        let home = Path::new(r"C:\store\home");
+        assert_ne!(
+            request_lock_key(&home.join("plan-a.json")),
+            request_lock_key(&home.join("plan-b.json"))
+        );
+        assert_ne!(
+            request_lock_key(&home.join("plan.json")),
+            request_lock_key(Path::new(r"C:\store\other\plan.json"))
+        );
+    }
 }
