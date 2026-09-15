@@ -1,0 +1,8 @@
+type Diag = struct { code: String };
+type Wrapped = struct { items: Array(Diag) };
+
+def make: Fn(String) -> Result(Wrapped, String) = fn(x) {
+    Ok({ items: [] })
+};
+
+export { make };

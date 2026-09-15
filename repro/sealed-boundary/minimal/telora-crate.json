@@ -1,0 +1,5 @@
+{
+  "name": "sealed-minimal",
+  "modules": ["@src/lib"],
+  "dependencies": []
+}
