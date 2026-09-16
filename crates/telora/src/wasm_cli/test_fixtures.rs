@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use telora_core::{
     DataLimits, Diagnostic, Loc, SourceDatabase, SystemDataFormat, TestContext,
-    data_plan::{self, ValidatedDataPlan},
+    data_plan::{self, ParsedData},
     test_plan::TestResult,
 };
 
@@ -35,7 +35,7 @@ impl Fixtures<'_, '_> {
         label: &str,
         origin: Option<Loc>,
         cache: &mut HashMap<String, Result<String, String>>,
-    ) -> Result<ValidatedDataPlan, Vec<Diagnostic>> {
+    ) -> Result<ParsedData, Vec<Diagnostic>> {
         let error = |message: String| vec![diagnostic(message, origin)];
         let declaring = origin
             .map(|loc| self.sources.get(loc.source).name.to_string())
@@ -77,14 +77,13 @@ impl Fixtures<'_, '_> {
                 .collect::<Vec<_>>()
                 .join("/")
         );
-        let id = self.sources.add(name, text);
+        let id = self.sources.try_add_data(name, text.clone()).map_err(|e| error(e.to_string()))?;
         let format = match source.format {
             SystemDataFormat::Json => data_plan::Format::Json,
             SystemDataFormat::Yaml => data_plan::Format::Yaml,
             SystemDataFormat::Toml => data_plan::Format::Toml,
         };
-        let plan = data_plan::parse_registered(self.sources, id, format)?;
-        data_plan::enforce_limits(&plan, self.limits, text.len()).map_err(error)?;
+        let plan = data_plan::parse_registered_with_limits(self.sources, id, format, self.limits)?;
         Ok(plan)
     }
 }

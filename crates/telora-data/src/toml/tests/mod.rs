@@ -1,121 +1,106 @@
+extern crate std;
 use super::*;
-use alloc::vec::Vec;
+use crate::{
+    SourceDatabase,
+    json::{DataPlanNodeKind, DataScalar, ValidatedDataPlan},
+};
+use alloc::string::String;
+mod machine;
+mod phases;
 
-fn parse(source: &str) -> Result<ValidatedDataPlan, Vec<Diagnostic>> {
+fn fixture(name: &str) -> String {
+    std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/toml")
+            .join(name),
+    )
+    .unwrap()
+}
+fn parse(text: &str, limits: DataLimits) -> Result<ValidatedDataPlan, Vec<Diagnostic>> {
     let mut sources = SourceDatabase::default();
-    let id = sources.add("test.toml", source);
-    validate_toml_registered(&sources, id)
+    let source = sources.try_add_data("test.toml", text.into()).unwrap();
+    let crate::data_plan::ParsedData::Toml { plan, decoded } =
+        crate::data_plan::parse_registered_with_limits(
+            &sources,
+            source,
+            crate::data_plan::Format::Toml,
+            limits,
+        )?
+    else {
+        panic!("TOML span plan")
+    };
+    let mut plan = owned(plan, text, &decoded);
+    plan.source_index = Some((source, sources.get(source).line_index().clone()));
+    Ok(plan)
 }
-
-#[test]
-fn lowers_tables_arrays_inline_values_and_temporal_tags() {
-    let parsed = parse(
-        r#"title = "Telora"
-when = 1979-05-27 07:32:00+00:00
-local = 1979-05-27T07:32:00
-dates = [1979-05-27, 07:32:00.1200]
-point = { x = 1, y = 2 }
-[owner]
-name = 'Ada'
-[[products]]
-name = "one"
-[[products]]
-name = "two"
-"#,
-    );
-    assert!(parsed.is_ok(), "{parsed:?}");
-    assert_eq!(
-        crate::data_plan_test::render(&parsed.unwrap()),
-        "{dates: ['LocalDate(\"1979-05-27\"), 'LocalTime(\"07:32:00.1200\")], local: 'LocalDateTime(\"1979-05-27T07:32:00\"), owner: {name: \"Ada\"}, point: {x: 1, y: 2}, products: [{name: \"one\"}, {name: \"two\"}], title: \"Telora\", when: 'OffsetDateTime(\"1979-05-27T07:32:00Z\")}"
-    );
-}
-
-#[test]
-fn rejects_invalid_dates_and_duplicate_keys() {
-    let date = parse("when = 2025-02-29\n");
-    assert!(date.is_err());
-    assert!(date.as_ref().unwrap_err()[0].message.contains("day"));
-
-    let duplicate = parse("a = 1\na = 2\n");
-    assert!(duplicate.is_err());
-    assert_eq!(duplicate.as_ref().unwrap_err()[0].labels.len(), 2);
-}
-
-#[test]
-fn decodes_toml_strings_numbers_and_rejects_table_conflicts() {
-    let parsed = parse(
-        "escaped = \"line\\n\\u5F62\"\nfolded = \"\"\"\nfirst\\\n  second\"\"\"\nhex = 0xDEAD_BEEF\nfloat = 1_000.50\n",
-    );
-    assert!(parsed.is_ok(), "{parsed:?}");
-    assert_eq!(
-        crate::data_plan_test::render(&parsed.unwrap()),
-        "{escaped: \"line\\n形\", float: 1000.5, folded: \"firstsecond\", hex: 3735928559}"
-    );
-
-    for source in [
-        "value = 1__0\n",
-        "value = 01\n",
-        "a = {b = 1}\na.c = 2\n",
-        "a = 1\n[a]\nb = 2\n",
-        "[a]\nb = 1\n[a]\nc = 2\n",
-        "a = []\n[[a]]\nb = 1\n",
-        "a.b = 1\n[a]\nc = 2\n",
-    ] {
-        let parsed = parse(source);
-        assert!(parsed.is_err(), "accepted invalid TOML: {source}");
-        assert!(!parsed.as_ref().unwrap_err().is_empty(), "{source}");
+fn owned(parsed: TomlPlan, source: &str, decoded: &str) -> ValidatedDataPlan {
+    let mut plan = ValidatedDataPlan::default();
+    for node in parsed.nodes {
+        let scalar = match node.kind {
+            TomlKind::Int(n) => DataScalar::Int(n),
+            TomlKind::Float(n) => DataScalar::Float(n),
+            TomlKind::Bool(b) => DataScalar::Bool(b),
+            TomlKind::String(s) => DataScalar::String(s.resolve(source, decoded).into()),
+            TomlKind::Temporal { kind, value } => DataScalar::Temporal {
+                kind,
+                value: value.resolve(source, decoded).into(),
+            },
+            TomlKind::Array(items) => {
+                plan.array(items, node.location);
+                continue;
+            }
+            TomlKind::Object(fields) => {
+                plan.object(
+                    fields
+                        .into_iter()
+                        .map(|(k, v)| (k.resolve(source, decoded).into(), v))
+                        .collect(),
+                    node.location,
+                );
+                continue;
+            }
+        };
+        plan.scalar(scalar, node.location);
     }
-
-    let implicit_header = parse("[a.b]\nvalue = 1\n[a]\nname = \"ok\"\n");
-    assert!(implicit_header.is_ok(), "{:?}", implicit_header);
+    plan.set_root(parsed.root);
+    plan.postordered = true;
+    plan
 }
 
 #[test]
-fn covers_toml_1_0_string_and_numeric_boundaries() {
-    let parsed = parse(
-        "four = \"\"\"one\"\"\"\"\nfive = '''two'''''\r\nlines = \"\"\"a\r\nb\"\"\"\r\nempty = \"\"\nquoted.key = 1\n\"quoted.key\" = 2\n",
-    );
-    assert!(parsed.is_ok(), "{parsed:?}");
-    assert_eq!(
-        crate::data_plan_test::render(&parsed.unwrap()),
-        "{empty: \"\", five: \"two''\", four: \"one\\\"\", lines: \"a\\nb\", quoted: {key: 1}, quoted.key: 2}"
-    );
-
-    for source in [
-        "value = +0x1\n",
-        "value = -0o7\n",
-        "value = 1.\n",
-        "value = 1.e2\n",
-        "value = 1e\n",
-        "value = 1e+\n",
-    ] {
-        let parsed = parse(source);
-        assert!(parsed.is_err(), "accepted invalid TOML: {source}");
+fn eol_and_lexical_windows_preserve_values_and_positions() {
+    let mut snapshots = Vec::new();
+    for eol in ["\n", "\r\n", "\r"] {
+        let text = fixture("core.toml").replace('\n', eol);
+        let plan = parse(&text, DataLimits::default()).unwrap();
+        snapshots.push((
+            crate::data_plan_test::render(&plan),
+            plan.nodes()
+                .iter()
+                .map(|n| plan.compact(n.location).0)
+                .collect::<Vec<_>>(),
+        ));
+    }
+    assert_eq!(snapshots[0], snapshots[1]);
+    assert_eq!(snapshots[0], snapshots[2]);
+    for len in [4094, 4095, 4096, 8191] {
+        let text = format!("x=\"{}\\u4e2d\"", "a".repeat(len));
+        let plan = parse(&text, DataLimits::default()).unwrap();
+        assert!(plan.nodes().iter().any(|n| matches!(&n.kind, DataPlanNodeKind::Scalar(DataScalar::String(s)) if s == &format!("{}中", "a".repeat(len)))));
     }
 }
-
 #[test]
-fn rejects_non_finite_float_values() {
-    for source in [
-        "value = inf\n",
-        "value = -inf\n",
-        "value = nan\n",
-        "value = 1.0e9999\n",
-    ] {
-        let parsed = parse(source);
-        assert!(parsed.is_err(), "accepted {source}");
-        assert!(
-            parsed.as_ref().unwrap_err()[0]
-                .message
-                .contains("must be finite")
-        );
-    }
-
-    let overflow = parse("value = 9223372036854775808\n");
-    assert!(overflow.is_err());
-    assert!(
-        overflow.as_ref().unwrap_err()[0]
-            .message
-            .contains("outside the i64 range")
-    );
+fn duplicate_and_unicode_spans_are_preserved() {
+    let text = fixture("locations.toml");
+    let errors = parse(&text, DataLimits::default()).unwrap_err();
+    let first = text.find("name").unwrap();
+    let second = text.rfind("name").unwrap();
+    assert_eq!(errors[0].labels[0].location.range(), second..second + 4);
+    assert_eq!(errors[0].labels[1].location.range(), first..first + 4);
+    let plan = parse(&text[..second], DataLimits::default()).unwrap();
+    let DataPlanNodeKind::Object(fields) = &plan.node(plan.root()).kind else {
+        panic!()
+    };
+    assert_eq!(fields["é"].key_location.range(), 0..4);
+    assert_eq!(plan.node(fields["é"].value).location.range(), 7..13);
 }

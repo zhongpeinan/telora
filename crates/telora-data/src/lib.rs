@@ -1,4 +1,4 @@
-//! Shared LLW data parsers, source spans and flat data plans for Host and Wasm.
+//! Shared data parsers, source spans and flat data plans for Host and Wasm.
 #![no_std]
 #[macro_use]
 extern crate alloc;
@@ -11,8 +11,8 @@ pub mod json_serde;
 mod limits;
 pub mod source;
 pub mod syntax;
-mod toml;
-mod yaml;
+pub mod toml;
+pub mod yaml;
 
 pub use document::DocumentText;
 pub use limits::DataLimits;
