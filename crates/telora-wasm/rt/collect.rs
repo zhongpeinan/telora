@@ -5,66 +5,79 @@ use crate::{
     values::word,
 };
 use alloc::{collections::BTreeMap, vec, vec::Vec};
+mod initialization;
+pub(crate) use initialization::collect as collect_initialization;
 
-static mut MAIN_END: u32 = 0;
+static mut TRACE_TYPES: u32 = 0;
+static mut DEMANDS: (u32, u32) = (0, 0);
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn telora_collection_bootstrap(types: u32, demands: u32, count: u32) {
+    unsafe {
+        assert_eq!(*core::ptr::addr_of!(TRACE_TYPES), 0);
+        TRACE_TYPES = types;
+        DEMANDS = (demands, count);
+    }
+}
+
 pub(crate) unsafe fn freeze() {
     unsafe {
-        MAIN_END = crate::NEXT as u32;
+        crate::heap::freeze();
+        crate::content::freeze();
         crate::sources::freeze();
     }
 }
 
 pub(crate) struct Collector {
-    pub base: u32,
+    pub initialization: bool,
+    pub heap: crate::heap::OldWords,
     pub types: u32,
-    pub image: Vec<u8>,
     pub old: [Table; TABLE_COUNT as usize],
     pub slots: Vec<Vec<Slot>>,
     pub objects: BTreeMap<(u32, u32), u32>,
     pub values: BTreeMap<u32, u32>,
-    pub environments: BTreeMap<u32, u32>,
     pub pending: Vec<(u32, u32, u32, u32)>, // table, old pointer, destination offset, bytes
-    pub patches: Vec<(u32, u32)>,
     pub sources: alloc::collections::BTreeSet<u32>,
+    pub content: Vec<u32>,
 }
 
 impl Collector {
+    pub unsafe fn old_word(&self, reference: u32, offset: u64) -> u32 {
+        unsafe { self.heap.read(reference + offset as u32) }
+    }
     pub fn reserve(&mut self, bytes: u32) -> u32 {
-        let at = u32::try_from(self.image.len()).unwrap();
-        self.image
-            .resize((self.image.len() + bytes as usize + 7) & !7, 0);
-        at
+        unsafe { crate::telora_alloc(bytes) }
     }
     pub unsafe fn copy_bytes(&mut self, pointer: u32, bytes: u32) -> u32 {
         let at = self.reserve(bytes);
         unsafe {
             core::ptr::copy_nonoverlapping(
-                pointer as *const u8,
-                self.image.as_mut_ptr().add(at as usize),
+                self.heap.ptr::<u8>(pointer),
+                crate::heap::ptr::<u8>(at),
                 bytes as usize,
             );
         }
         at
     }
     pub fn put(&mut self, at: u32, value: u32) {
-        self.image[at as usize..at as usize + 4].copy_from_slice(&value.to_le_bytes());
+        unsafe { crate::heap::write(at, value); }
     }
     pub unsafe fn value(&mut self, pointer: u32) -> u32 {
         unsafe {
-            if pointer == 0 || pointer < self.base {
+            if pointer == 0 || crate::heap::is_frozen(pointer) {
                 return pointer;
             }
             if let Some(&at) = self.values.get(&pointer) {
-                return self.base + at;
+                return at;
             }
-            let ty = word(pointer, TYPE);
-            self.sources.insert(word(pointer, SOURCE) & 0xffff);
+            let ty = self.old_word(pointer, TYPE);
+            self.trace_location(self.old_word(pointer, SOURCE));
             let bytes = word(self.types + ty * 20, 4);
             assert!(bytes >= HEADER_BYTES);
             let at = self.copy_bytes(pointer, bytes);
             self.values.insert(pointer, at);
             self.pending.push((VALUES, pointer, at, bytes));
-            self.base + at
+            at
         }
     }
     pub unsafe fn object(&mut self, table: u32, id: u32) -> u32 {
@@ -77,7 +90,7 @@ impl Collector {
             if let Some(&next) = self.objects.get(&(table, id)) {
                 return next;
             }
-            let slot = (old.buffer as *const Slot).add(id as usize).read();
+            let slot: Slot = self.heap.read(old.buffer + id * 8);
             let next = self.slots[table as usize].len() as u32;
             self.objects.insert((table, id), next);
             // Publish forwarding before traversal, including cyclic environments.
@@ -85,20 +98,15 @@ impl Collector {
                 payload: 0,
                 bytes: slot.bytes,
             });
-            let bytes = slot.bytes & !ENV_RAW_PARENT;
             let at = if table == REGEXES {
-                let pattern = crate::regex::pattern(slot.payload);
-                self.copy_bytes(pattern.as_ptr() as u32, pattern.len() as u32)
+                // Owned Rust resource: move its table ownership, not its bytes.
+                slot.payload
             } else {
-                self.copy_bytes(slot.payload, bytes)
+                self.copy_bytes(slot.payload, slot.bytes)
             };
             self.slots[table as usize][next as usize] = Slot {
-                payload: self.base + at,
-                bytes: if table == REGEXES {
-                    crate::regex::pattern(slot.payload).len() as u32
-                } else {
-                    slot.bytes
-                },
+                payload: at,
+                bytes: slot.bytes,
             };
             if table != REGEXES {
                 self.pending.push((table, slot.payload, at, slot.bytes));
@@ -106,21 +114,12 @@ impl Collector {
             next
         }
     }
-    pub unsafe fn environment_pointer(&mut self, pointer: u32) -> u32 {
-        unsafe {
-            let id = *self
-                .environments
-                .get(&pointer)
-                .expect("registered parent environment");
-            let next = self.object(ENVIRONMENTS, id);
-            self.slots[ENVIRONMENTS as usize][next as usize].payload
-        }
-    }
-    pub unsafe fn finish(mut self) -> u32 {
+    pub unsafe fn finish(mut self) {
         unsafe {
             while let Some((table, old, at, bytes)) = self.pending.pop() {
                 self.trace_object(table, old, at, bytes);
             }
+            crate::content::collect(&self.content, self.initialization);
             // Sources are Host metadata, but RT may render their names in captures.
             crate::sources::collect(&mut self);
             let mut tables = self.old;
@@ -132,42 +131,44 @@ impl Collector {
                     self.put(at + index as u32 * 8, slot.payload);
                     self.put(at + index as u32 * 8 + 4, slot.bytes);
                 }
-                tables[i].buffer = self.base + at;
+                tables[i].buffer = at;
                 tables[i].length = count;
                 tables[i].capacity = count;
             }
-            let end = self.base.checked_add(self.image.len() as u32).unwrap();
-            for &(pointer, value) in &self.patches {
-                (pointer as *mut u32).write_unaligned(value);
-            }
-            core::ptr::copy(self.image.as_ptr(), self.base as *mut u8, self.image.len());
             for i in 0..TABLE_COUNT {
                 (table_address(i) as *mut Table).write(tables[i as usize]);
             }
-            let base = self.base;
-            // Scratch maps/vectors were allocated after old work; their storage is
-            // discarded with the arena. Never run destructors after reusing it.
-            core::mem::forget(self);
-            crate::NEXT = end as u64;
-            let regex = tables[REGEXES as usize];
-            for id in regex.frozen..regex.length {
-                let slot = (regex.buffer as *mut Slot).add(id as usize);
-                let text = core::str::from_utf8(core::slice::from_raw_parts(
-                    (*slot).payload as *const u8,
-                    (*slot).bytes as usize,
-                ))
-                .unwrap();
-                *slot = crate::regex::restore(text);
+            let old_regex = self.old[REGEXES as usize];
+            for id in old_regex.frozen..old_regex.length {
+                if !self.objects.contains_key(&(REGEXES, id)) {
+                    let slot: Slot = self.heap.read(old_regex.buffer + id * 8);
+                    crate::regex::release(slot.payload);
+                }
             }
-            base
         }
     }
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn telora_collect(types: u32, roots: u32, count: u32) -> u32 {
+pub unsafe extern "C" fn telora_collect(roots: u32, count: u32) -> u32 {
     unsafe {
-        assert!(MAIN_END != 0);
+        let mut gc = Collector::begin(false);
+        let result = gc.reserve(count * 4);
+        for index in 0..count {
+            let pointer = gc.value(gc.old_word(roots, index as u64 * 4));
+            gc.put(result + index * 4, pointer);
+        }
+        gc.finish();
+        result
+    }
+}
+
+impl Collector {
+    unsafe fn begin(initialization: bool) -> Self {
+      unsafe {
+        // Keep the old arena alive until all traversal and patching finishes.
+        let old_work = if initialization { crate::heap::take_initialization() }
+            else { crate::heap::take_work() };
         let old = core::array::from_fn(|i| (table_address(i as u32) as *const Table).read());
         let slots = old
             .iter()
@@ -175,51 +176,23 @@ pub unsafe extern "C" fn telora_collect(types: u32, roots: u32, count: u32) -> u
                 if table.frozen == 0 {
                     vec![]
                 } else {
-                    core::slice::from_raw_parts(table.buffer as *const Slot, table.frozen as usize)
+                    core::slice::from_raw_parts(old_work.ptr::<Slot>(table.buffer), table.frozen as usize)
                         .to_vec()
                 }
             })
             .collect();
-        let mut gc = Collector {
-            base: MAIN_END,
-            types,
-            image: vec![],
+        Collector {
+            initialization,
+            heap: old_work,
+            types: TRACE_TYPES,
             old,
             slots,
             objects: BTreeMap::new(),
             values: BTreeMap::new(),
-            environments: BTreeMap::new(),
             pending: vec![],
-            patches: vec![],
             sources: alloc::collections::BTreeSet::new(),
-        };
-        gc.reserve(count * 4);
-        let env = old[ENVIRONMENTS as usize];
-        for id in 0..env.length {
-            let slot = (env.buffer as *const Slot).add(id as usize).read();
-            gc.environments.insert(slot.payload, id);
+            content: vec![],
         }
-        for index in 0..count {
-            let pointer = gc.value(word(roots, index as u64 * 4));
-            gc.put(index * 4, pointer);
-        }
-        // Interpreter memo cells in main environments may refer to work values.
-        // Their immutable captures stay put; only these exact pointer cells patch.
-        for id in 0..env.frozen {
-            let slot = (env.buffer as *const Slot).add(id as usize).read();
-            for index in 0..(slot.bytes & !ENV_RAW_PARENT) / 4 {
-                let cell = slot.payload + index * 4;
-                let old = word(cell, 0);
-                let next = if slot.bytes & ENV_RAW_PARENT != 0 {
-                    gc.environment_pointer(old)
-                } else {
-                    gc.value(old)
-                };
-                if next != old {
-                    gc.patches.push((cell, next));
-                }
-            }
-        }
-        gc.finish()
+      }
     }
 }

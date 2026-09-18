@@ -16,7 +16,7 @@ fn run_and_serve_share_the_same_static_entry_and_preserve_diagnostics() {
     assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
     assert_eq!(serde_json::from_slice::<Value>(&result.stdout).unwrap(), 42);
     let mut command = telora(&cwd);
-    command.args(["serve", "@src/main", "--bind", "stdio://"]);
+    command.args(["serve", "@src/main", "--bind", "stdio+jsonl://"]);
     let result = input_command(command, b"42\nnull\n43\n{bad}\n44\n");
     assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
     let replies = jsonl(&result.stdout);
@@ -24,7 +24,9 @@ fn run_and_serve_share_the_same_static_entry_and_preserve_diagnostics() {
     assert_eq!(replies[0]["ok"], 42);
     assert_eq!(replies[1]["error"], true);
     assert_eq!(replies[1]["diagnostics"][0]["message"], "missing input");
-    assert_eq!(replies[1]["diagnostics"][0]["labels"][1]["location"]["source"], "@request");
+    let labels = replies[1]["diagnostics"][0]["labels"].as_array().unwrap();
+    assert!(!labels.is_empty(), "the static failure rule still has a location");
+    assert!(labels.iter().all(|label| label["location"]["source"] != "@request"));
     assert_eq!(replies[2]["ok"], 43);
     assert_eq!(replies[3]["error"], true);
     assert_eq!(replies[4]["ok"], 44);
@@ -50,7 +52,7 @@ fn service_resets_after_request_resource_exhaustion() {
         ("1000", "8", "42\n\"grow\"\n43\n", "growth"),
     ] {
         let mut command = telora(&cwd);
-        command.args(["--report-usage", "--with-fuel", fuel, "--with-memory-limit", memory, "serve", "@src/main", "--bind", "stdio://"]);
+        command.args(["--report-usage", "--with-fuel", fuel, "--with-memory-limit", memory, "serve", "@src/main", "--bind", "stdio+jsonl://"]);
         let output = input_command(command, payload.as_bytes());
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
         let replies = jsonl(&output.stdout);
@@ -97,7 +99,7 @@ fn initialization_sources_are_separate_from_each_transform_input() {
     fs::write(cwd.join("src/base.json"), "{\"loaded\":true}").unwrap();
     fs::write(cwd.join("config.json"), "{\"prefix\":42}").unwrap();
     let mut command = telora(&cwd);
-    command.args(["serve", "@src/main", "--source", "config=config.json", "--bind", "stdio://"]);
+    command.args(["serve", "@src/main", "--source", "config=config.json", "--bind", "stdio+jsonl://"]);
     let output = input_command(command, b"{\"answer\":1,\"endpoint\":\"localhost:42\"}\n{\"answer\":0,\"endpoint\":\"localhost:42\"}\n{\"answer\":2,\"endpoint\":\"localhost:42\"}\n");
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     let replies = jsonl(&output.stdout);
@@ -105,7 +107,7 @@ fn initialization_sources_are_separate_from_each_transform_input() {
     assert_eq!(replies[0]["ok"], serde_json::json!([{"prefix":42},{"loaded":true},{"answer":1,"endpoint":"localhost:42"}]));
     assert_eq!(replies[1]["error"], true);
     assert!(replies[1]["diagnostics"].to_string().contains("positive input required"));
-    assert!(replies[1]["diagnostics"].to_string().contains("@request"));
+    assert!(!replies[1]["diagnostics"].to_string().contains("@request"));
     assert_eq!(replies[2]["ok"][2]["answer"], 2);
     for extra in [vec![], vec!["--source", "other=config.json"], vec!["--source", "config=stdin+json://"]] {
         let output = telora(&cwd).args(["run", "@src/main"]).args(extra).output().unwrap();

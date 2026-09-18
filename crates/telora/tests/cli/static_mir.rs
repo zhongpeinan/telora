@@ -332,7 +332,7 @@ fn static_mir_eval_imports_data_after_static_solving() {
         String::from_utf8_lossy(&output.stderr)
     );
     let output = telora(&cwd)
-        .args(["serve", "@src/main", "--bind", "stdio://"])
+        .args(["serve", "@src/main", "--bind", "stdio+jsonl://"])
         .output()
         .unwrap();
     assert!(!output.status.success());
@@ -702,7 +702,8 @@ fn dump_types_layout_is_static_deterministic_and_hidden() {
         }
         if entry["constructor"] == "Bytes" {
             assert_eq!(entry["layout"]["shape"]["value_bytes"], 32);
-            assert_eq!(entry["layout"]["shape"]["table"], "BytesTable");
+            assert_eq!(entry["layout"]["shape"]["table"], "Content");
+            assert_eq!(entry["layout"]["shape"]["data_bytes"], 16);
             assert_eq!(entry["object"]["element_stride"], 1);
         }
     }

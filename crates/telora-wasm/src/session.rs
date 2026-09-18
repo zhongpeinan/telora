@@ -1,5 +1,7 @@
 //! Thin execution host: Wasm owns language operations, values, and initialization.
 use crate::{abi, artifact::Manifest};
+pub(crate) mod exports;
+mod timing;
 
 // Generous execution boundaries, not an allocation accounting model. The engine
 // refuses growth before allocating; its ordinary stack limits remain in force.
@@ -7,6 +9,7 @@ const MEMORY_BOUND: usize = 1024 * 1024 * 1024;
 const TABLE_BOUND: usize = 1_000_000;
 
 pub struct Session {
+    pub(crate) exports: exports::Exports,
     pub(crate) fuel_budget: u64,
     pub(crate) memory_limit: usize,
     pub(crate) module: wasmi::Module,
@@ -17,7 +20,6 @@ pub struct Session {
     pub(crate) memory: wasmi::Memory,
     pub(crate) registered_sources: usize,
     pub(crate) emitted_debug: std::cell::Cell<u32>,
-    pub(crate) trace_types: u32,
 }
 
 /// Engine boundaries and consumption, in raw fuel units and bytes (not RSS).
@@ -51,12 +53,17 @@ impl Session {
     }
 
     pub fn load_with_limits(bytes: &[u8], fuel: u64, memory_limit: usize) -> Result<Self, String> {
+        let metadata_timer = timing::Timer::new("load_metadata");
         let manifest = Manifest::read(bytes)?;
         let bundled_data = crate::bundle::read(bytes, &manifest)?;
+        drop(metadata_timer);
+        let module_timer = timing::Timer::new("load_module");
         let mut config = wasmi::Config::default();
         config.consume_fuel(true);
         let engine = wasmi::Engine::new(&config);
         let module = wasmi::Module::new(&engine, bytes).map_err(|e| e.to_string())?;
+        drop(module_timer);
+        let instance_timer = timing::Timer::new("load_instance");
         let limits = wasmi::StoreLimitsBuilder::new()
             .memory_size(memory_limit)
             .table_elements(TABLE_BOUND)
@@ -71,7 +78,11 @@ impl Session {
         let memory = instance
             .get_memory(&store, "memory")
             .ok_or("Wasm: missing memory export")?;
+        let registered_sources = manifest.sources.len();
+        let exports = exports::Exports::bind(instance, &store)?;
+        drop(instance_timer);
         let mut session = Self {
+            exports,
             module,
             fuel_budget: fuel,
             memory_limit,
@@ -80,17 +91,27 @@ impl Session {
             store,
             instance,
             memory,
-            registered_sources: 0,
+            registered_sources,
             emitted_debug: std::cell::Cell::new(0),
-            trace_types: 0,
         };
         for module in bundled_data {
-            session.inject_data_packet(module.symbol, &module.packet)?;
+            if !session.manifest.sources.iter().any(|source| source.id == module.source.id) {
+                session.manifest.sources.push(module.source.clone());
+                session.register_sources()?;
+            }
+            let format = match module.format {
+                1 => telora_core::data_plan::Format::Json,
+                2 => telora_core::data_plan::Format::Yaml,
+                3 => telora_core::data_plan::Format::Toml,
+                _ => unreachable!("validated bundle format"),
+            };
+            let value = session.parse_data_text(&module.text, format, module.source.id)?
+                .map_err(|diagnostics| diagnostics.to_string())?;
+            session.inject_data_value(module.symbol, value)?;
         }
         Ok(session)
     }
     pub fn initialize(&mut self) -> Result<(), String> {
-        self.prepare_collection()?;
         self.register_sources()?;
         let initialize = self
             .instance
@@ -109,8 +130,10 @@ impl Session {
             let source = &self.manifest.sources[self.registered_sources];
             let id = source.id;
             let name = source.name.as_bytes().to_vec();
+            let lines = source.lines.iter().flatten().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>();
             let pointer = self.allocate(name.len())?;
             self.write(pointer as usize, &name)?;
+            let pointer = self.output().address(pointer.into(), name.len() as u64)? as u32;
             let register = self
                 .instance
                 .get_typed_func::<(i32, i32, i32), i32>(&self.store, "telora_register_source")
@@ -125,6 +148,16 @@ impl Session {
             {
                 return Err("Wasm: source identity was registered with a different name".into());
             }
+            if !lines.is_empty() {
+            let pointer = self.allocate(lines.len())?;
+            self.write(pointer as usize, &lines)?;
+            let pointer = self.output().address(pointer.into(), lines.len() as u64)? as u32;
+            self.instance.get_typed_func::<(u32, u32, u32), ()>(&self.store, "telora_source_index")
+                .map_err(|e| e.to_string())?
+                .call(&mut self.store, (id, pointer, (lines.len() / 8) as u32))
+                .map_err(|e| e.to_string())?;
+            }
+            self.manifest.sources[self.registered_sources].lines.clear();
             self.registered_sources += 1;
         }
         Ok(())
@@ -158,6 +191,7 @@ impl Session {
         let args = self.allocate(
             arguments
                 .len()
+                .checked_add(1).ok_or("Wasm: argument count overflow")?
                 .checked_mul(4)
                 .ok_or("Wasm: argument size overflow")?,
         )?;
@@ -165,6 +199,8 @@ impl Session {
             let value = self.input(ty, value, 0)?;
             self.write(args as usize + index * 4, &value.to_le_bytes())?;
         }
+        // Host invocation has no Telora computation expression to blame.
+        self.write(args as usize + arguments.len() * 4, &0u32.to_le_bytes())?;
         let invoke = self
             .instance
             .get_typed_func::<(i32, i32), i32>(&self.store, "telora_invoke")

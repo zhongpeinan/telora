@@ -8,7 +8,7 @@ use telora_core::mir::TypeId;
 use wasm_encoder::{BlockType, Instruction as I, ValType};
 
 impl Emitter<'_> {
-    fn json_write(&mut self, op: i32, writer: u32, argument: u32) -> u32 {
+    pub(crate) fn json_write(&mut self, op: i32, writer: u32, argument: u32) -> u32 {
         let result = self.local(ValType::I32);
         self.extend([
             I::I32Const(op),
@@ -19,7 +19,7 @@ impl Emitter<'_> {
         ]);
         result
     }
-    fn json_immediate(&mut self, op: i32, writer: u32, argument: i32) {
+    pub(crate) fn json_immediate(&mut self, op: i32, writer: u32, argument: i32) {
         self.extend([
             I::I32Const(op),
             I::LocalGet(writer),
@@ -77,11 +77,19 @@ impl Emitter<'_> {
         let zero = self.local(ValType::I32);
         let writer = self.json_write(0, indent, zero);
         let input = self.parameter(0);
-        self.json_call(args[0], writer, input);
+        let status = self.json_call_result(args[0], writer, input);
+        self.extend([I::LocalGet(status), I::I32Eqz, I::If(BlockType::Empty)]);
+        self.json_immediate(11, writer, 0);
+        self.emit(I::End);
+        self.checked(status);
         let span = self.json_write(1, writer, zero);
         self.text_span_value(args[1], span)
     }
     fn json_call(&mut self, ty: TypeId, writer: u32, value: u32) {
+        let result = self.json_call_result(ty, writer, value);
+        self.checked(result);
+    }
+    fn json_call_result(&mut self, ty: TypeId, writer: u32, value: u32) -> u32 {
         let key = Key {
             special: Special::Json(ty),
             callable: true,
@@ -94,7 +102,7 @@ impl Emitter<'_> {
             I::Call(self.plan.functions[&key]),
             I::LocalSet(result),
         ]);
-        self.checked(result);
+        result
     }
     pub fn json_type(&mut self, ty: TypeId) -> Result<(), String> {
         let variants: Vec<_> = self.plan.layouts[ty.index()]
@@ -135,7 +143,7 @@ impl Emitter<'_> {
                 "Array" | "Object" => {
                     let object = branch == "Object";
                     let payload = self.enum_payload(ty, index as u32, 1)?;
-                    let base = self.table_data(ARRAYS, payload, if object { 24 } else { DATA });
+                    let base = self.table_data(ARRAYS, payload, if object { DATA + 8 } else { DATA });
                     let keys = if object {
                         Some(self.table_data(ARRAYS, payload, DATA))
                     } else {
@@ -144,9 +152,9 @@ impl Emitter<'_> {
                     let start = if object {
                         self.local(ValType::I32)
                     } else {
-                        self.read32(payload, 20)
+                        self.read32(payload, DATA + 4)
                     };
-                    let end = self.read32(payload, if object { 20 } else { 24 });
+                    let end = self.read32(payload, if object { DATA + 4 } else { DATA + 8 });
                     let cursor = self.local(ValType::I32);
                     self.extend([I::LocalGet(start), I::LocalSet(cursor)]);
                     self.json_immediate(6, 0, i32::from(object));
@@ -171,7 +179,7 @@ impl Emitter<'_> {
                         self.extend([
                             I::LocalGet(keys),
                             I::LocalGet(cursor),
-                            I::I32Const(32),
+                            I::I32Const(STRING_BYTES as i32),
                             I::I32Mul,
                             I::I32Add,
                             I::LocalSet(key),

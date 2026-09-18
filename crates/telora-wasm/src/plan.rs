@@ -72,6 +72,7 @@ impl Key {
 }
 
 pub(crate) struct Plan {
+    pub generated_helpers: u32,
     pub constructor_aliases: BTreeMap<Key, Key>,
     pub functions: BTreeMap<Key, u32>,
     pub globals: BTreeMap<SymbolId, Key>,
@@ -87,6 +88,8 @@ pub(crate) struct Plan {
     pub comparisons: BTreeMap<TypeId, Key>,
     pub parsers: BTreeMap<TypeId, Key>,
     pub reflection: Vec<u8>,
+    pub origins: crate::value_origins::OriginConstants,
+    pub native_signatures: BTreeSet<TypeId>,
 }
 
 impl Plan {
@@ -99,6 +102,7 @@ impl Plan {
             special: Special::Normal,
         };
         let mut plan = Self {
+            generated_helpers: 4,
             constructor_aliases: BTreeMap::new(),
             functions: BTreeMap::new(),
             globals: BTreeMap::new(),
@@ -114,6 +118,8 @@ impl Plan {
             comparisons: BTreeMap::new(),
             parsers: BTreeMap::new(),
             reflection: vec![],
+            origins: Default::default(),
+            native_signatures: BTreeSet::new(),
         };
         for &symbol in executable.globals() {
             if !mir.symbol_generics[symbol.index()].is_empty() {
@@ -399,6 +405,12 @@ impl Plan {
                     .filter(|id| !declared.contains(&mir.generic_instances[id.index()].symbol))
                     .collect(),
             );
+        }
+        for key in plan.functions.keys() {
+            if key.callable && key.special == Special::Normal
+                && crate::natives::identity(mir, key.node).is_some() {
+                plan.native_signatures.insert(key.ty(mir, key.node)?);
+            }
         }
         Ok(plan)
     }

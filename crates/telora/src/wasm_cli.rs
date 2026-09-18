@@ -15,6 +15,7 @@ use telora_core::{
 use timing::PhaseTimer;
 
 fn load_session(bytes: &[u8], runtime: telora_core::RuntimeOptions) -> Result<telora_wasm::session::Session, String> {
+    timing::artifact_size(bytes.len());
     let config = crate::execution_config_for(runtime)?;
     let mut session = telora_wasm::session::Session::load_with_limits(
         bytes, config.fuel, config.memory_limit,
@@ -130,22 +131,24 @@ pub(crate) fn initialize_diagnostics(
         let source = sources
             .try_add_data(module.name, text)
             .map_err(|e| vec![error(e.to_string())])?;
-        let plan = match telora_core::data_plan::parse_registered_with_limits(
-            sources, source, format, crate::execution_config().data_limits,
-        ) {
-            Ok(plan) => plan,
-            Err(errors) => { diagnostics.extend(errors); continue; }
+        let value = match session.parse_data_source(sources.get(source), format)
+            .map_err(|e| vec![error(e)])? {
+            Ok(value) => value,
+            Err(errors) => {
+                diagnostics.extend(diagnostics::parsed(errors, sources).map_err(|e| vec![error(e)])?);
+                continue;
+            }
         };
-        prepared.push((module.symbol, plan));
+        prepared.push((module.symbol, value));
     }
     if !diagnostics.is_empty() { return Err(diagnostics); }
-    for (symbol, plan) in prepared {
-        session.register_data_sources(sources, &plan).map_err(|e| vec![error(e)])?;
-        session.inject_data(symbol, &plan, sources).map_err(|e| vec![error(e)])?;
+    for (symbol, value) in prepared {
+        session.inject_data_value(symbol, value).map_err(|e| vec![error(e)])?;
     }
     drop(timer);
     let _timer = PhaseTimer::new("initialize");
     let result = session.initialize();
+    if result.is_ok() { timing::initialization_heap(session).map_err(|e| vec![error(e)])?; }
     if result.is_err() { Err(check_diagnostics(session, sources, result)) } else { Ok(()) }
 }
 

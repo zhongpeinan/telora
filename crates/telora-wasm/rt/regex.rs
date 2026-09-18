@@ -48,14 +48,8 @@ fn compile(pattern: &str) -> Result<Compiled, String> {
     })
 }
 
-pub(crate) unsafe fn pattern(pointer: u32) -> &'static str {
-    unsafe { &(*(pointer as *const Compiled)).pattern }
-}
-
-pub(crate) fn restore(pattern: &str) -> crate::tables::Slot {
-    let compiled = compile(pattern).expect("previously validated regex");
-    crate::tables::Slot { payload: Box::into_raw(Box::new(compiled)) as u32,
-        bytes: core::mem::size_of::<Compiled>() as u32 }
+pub(crate) unsafe fn release(pointer: u32) {
+    unsafe { drop(Box::from_raw(pointer as *mut Compiled)); }
 }
 
 unsafe fn get(id: u32) -> *mut Compiled {
@@ -68,7 +62,7 @@ pub unsafe extern "C" fn telora_regex(operation: u32, a: u32, b: u32) -> u32 {
     unsafe {
         match operation {
             0 => {
-                let packet = crate::telora_alloc(8) as *mut u32;
+                let packet = crate::telora_alloc(8);
                 let (id, error) = match compile(crate::text::text(a)) {
                     Ok(compiled) => {
                         let pointer = Box::into_raw(Box::new(compiled)) as u32;
@@ -83,9 +77,9 @@ pub unsafe extern "C" fn telora_regex(operation: u32, a: u32, b: u32) -> u32 {
                     }
                     Err(message) => (0, crate::format::render(format_args!("{message}"))),
                 };
-                packet.write(id);
-                packet.add(1).write(error);
-                packet as u32
+                crate::heap::write(packet, id);
+                crate::heap::write(packet + 4, error);
+                packet
             }
             1 => {
                 let compiled = &mut *get(a);
@@ -112,7 +106,8 @@ pub unsafe extern "C" fn telora_regex(operation: u32, a: u32, b: u32) -> u32 {
             }
             4 => {
                 // Packet: input String, field count, then field-name Strings.
-                // Result: matched flag, then {UTF-8 pointer, length, present}.
+                // Result: matched flag, then {relative byte offset, length, present}.
+                // Parsing a preceding field may grow the content arena.
                 let compiled = &mut *get(a);
                 let input = crate::text::text(word(b, 0));
                 let count = word(b, 4);
@@ -121,14 +116,14 @@ pub unsafe extern "C" fn telora_regex(operation: u32, a: u32, b: u32) -> u32 {
                     .engine
                     .captures(&mut compiled.engine.create_cache(), input, &mut captures);
                 let output = crate::telora_alloc(4 + count * 12);
-                (output as *mut u32).write(captures.is_match() as u32);
+                crate::heap::write(output, captures.is_match() as u32);
                 for index in 0..count {
                     let name = crate::text::text(word(b, 8 + u64::from(index) * 4));
                     let capture = captures.get_group_by_name(name);
-                    let row = (output + 4 + index * 12) as *mut u32;
+                    let row = crate::heap::ptr::<u32>(output + 4 + index * 12);
                     match capture {
                         Some(span) => {
-                            row.write(input.as_ptr() as u32 + span.start as u32);
+                            row.write(span.start as u32);
                             row.add(1).write((span.end - span.start) as u32);
                             row.add(2).write(1);
                         }

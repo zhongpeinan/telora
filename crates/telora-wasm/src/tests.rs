@@ -5,6 +5,10 @@ use telora_core::{
 };
 
 mod data;
+mod content;
+mod source_ranges;
+mod host_memory;
+mod service_sources;
 mod debug;
 mod dynamic;
 mod equality;
@@ -61,41 +65,54 @@ fn engine_stops_unbounded_loops_and_allocation() {
 }
 
 #[test]
-fn packed_sources_are_eol_independent_without_artifact_line_tables() {
+fn source_indexes_preserve_original_eol_byte_ranges() {
     for eol in ["\n", "\r\n", "\r"] {
         let text = format!("中文🙂x{eol}next{eol}");
         let mut database = telora_core::SourceDatabase::default();
         let id = database.add("test", &text);
         let file = database.get(id);
         let source = crate::artifact::Source::from_file(file);
+        assert!(serde_json::to_value(&source).unwrap().get("lines").is_none(),
+            "BOLs belong only to Guest storage, not the serialized manifest");
         let loc = telora_core::Loc::from_usize(id, "中文".len()..text.find("next").unwrap() + 4).unwrap();
-        let packed = file.compact(loc);
+        let packed = file.coordinates(loc);
         assert_eq!(source.position(packed.start()), (1, 7));
         assert_eq!(source.position(packed.end()), (2, 5));
         assert_eq!(file.byte_location(packed), Some(loc));
-        assert_eq!(serde_json::to_value(source).unwrap(), serde_json::json!({"id": 1, "name": "test"}));
+        assert_eq!(source.lines, vec![
+            [0, "中文🙂x".len() as u32],
+            [text.find("next").unwrap() as u32, (text.len() - eol.len()) as u32],
+            [text.len() as u32, text.len() as u32],
+        ]);
     }
 }
 
 #[test]
-fn compiled_artifact_is_identical_across_line_endings() {
+fn diagnostics_are_equivalent_across_line_endings() {
     let source = "# comment\nexport def answer: Fn() -> Never = fn() {\n    let value = dbg!((\n        42\n    ));\n    fail!(\"same failure\", value)\n};\n";
-    let expected = compile(source).unwrap();
-    for eol in ["\r\n", "\r"] {
-        assert!(compile(&source.replace('\n', eol)).unwrap() == expected, "artifact differs for {eol:?}");
+    let mut expected = None;
+    for eol in ["\n", "\r\n", "\r"] {
+        let text = source.replace('\n', eol);
+        let bytes = compile(&text).unwrap();
+        assert_eq!(bytes, compile(&text).unwrap(), "same input must remain deterministic");
+        let mut session = crate::session::Session::load(&bytes, 1_000_000).unwrap();
+        session.initialize().unwrap();
+        assert!(session.call(&[]).is_err());
+        let diagnostic = session.diagnostics().unwrap().remove(0);
+        let rendered = diagnostic.render(&session.manifest);
+        if let Some(expected) = &expected { assert_eq!(&rendered, expected); }
+        else { expected = Some(rendered); }
     }
 }
 
 #[test]
-fn multiline_string_values_and_artifacts_ignore_source_eol() {
+fn multiline_string_values_ignore_source_eol() {
     let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"),
         "/../../tests/language/src/test/string-eol/values.telora")).unwrap()
         .replace("\r\n", "\n");
     for name in ["physical_newlines", "explicit_carriage_returns", "continuations"] {
-        let expected = compile_export(&source, name).unwrap();
         for eol in ["\n", "\r\n", "\r"] {
             let bytes = compile_export(&source.replace('\n', eol), name).unwrap();
-            assert!(bytes == expected, "{name}: artifact differs for {eol:?}");
             let mut session = crate::session::Session::load(&bytes, 1_000_000).unwrap();
             session.initialize().unwrap();
             assert_eq!(session.call(&[]).unwrap(), serde_json::json!(true));
@@ -105,16 +122,16 @@ fn multiline_string_values_and_artifacts_ignore_source_eol() {
 
 #[test]
 fn runtime_diagnostics_preserve_high_line_bits() {
-    let source = format!("{}export def answer: Fn() -> Never = fn() {{ fail!(\"high line\", 42) }};", "\n".repeat(300));
+    let source = format!("{}export def answer: Fn() -> Never = fn() {{ fail!(\"high line\", 42) }};", "\n".repeat(70_000));
     let bytes = compile(&source).unwrap();
-    let mut session = crate::session::Session::load(&bytes, 1_000_000).unwrap();
+    let mut session = crate::session::Session::load(&bytes, 10_000_000).unwrap();
     session.initialize().unwrap();
     assert!(session.call(&[]).is_err());
     let diagnostics = session.diagnostics().unwrap();
-    let loc = telora_core::source::CompactLoc(diagnostics[0].origin);
-    assert_eq!(loc.start() >> 24, 300);
+    let loc = telora_core::source::SourceCoordinates(diagnostics[0].origin);
+    assert_eq!(loc.start() >> 32, 70_000);
     let name = &session.manifest.sources.iter().find(|file| file.id == loc.source()).unwrap().name;
-    assert!(diagnostics[0].render(&session.manifest).starts_with(&format!("{name}:301:")));
+    assert!(diagnostics[0].render(&session.manifest).starts_with(&format!("{name}:70001:")));
 }
 
 #[test]
@@ -186,11 +203,11 @@ fn sequence_contributions_use_sealed_layouts_and_preserve_evaluation_order() {
     );
     assert!(diagnostics.iter().all(|d| d.warning));
     assert_eq!(
-        result[2]["labels"][1]["location"]["start"],
+        diagnostic_point(&result[2]["labels"][1]["location"]["start"]),
         point(source, source.find("42").unwrap())
     );
     assert_eq!(
-        result[3]["labels"][1]["location"]["start"],
+        diagnostic_point(&result[3]["labels"][1]["location"]["start"]),
         point(source, source.find("(...original, 3)").unwrap())
     );
 }
@@ -572,21 +589,17 @@ fn data_injection_precedes_property_initialization_and_is_single_use() {
     );
     let mut sources = mir.sources;
     let source = sources.try_add_data("input.json", "{\"number\":42}".into()).unwrap();
-    let plan = telora_core::data_plan::parse_registered(
-        &sources,
-        source,
-        telora_core::data_plan::Format::Json,
-    )
-    .unwrap();
+    let format = telora_core::data_plan::Format::Json;
     let mut session = crate::session::Session::load(&bytes, 2_000_000).unwrap();
     let symbol = session.manifest.data_modules[0].symbol;
-    assert!(missing.inject_data(symbol, &plan, &sources).is_err());
+    let value = missing.parse_data_source(sources.get(source), format).unwrap().unwrap();
+    assert!(missing.inject_data_value(symbol, value).is_err());
     let mut conflicting = telora_core::SourceDatabase::default();
-    conflicting.add("different source using the same id", "");
-    assert!(session.register_data_sources(&conflicting, &plan).is_err());
-    session.register_data_sources(&sources, &plan).unwrap();
-    session.inject_data(symbol, &plan, &sources).unwrap();
-    assert!(session.inject_data(symbol, &plan, &sources).is_err());
+    let conflict = conflicting.add("different source using the same id", "");
+    assert!(session.parse_data_source(conflicting.get(conflict), format).is_err());
+    let value = session.parse_data_source(sources.get(source), format).unwrap().unwrap();
+    session.inject_data_value(symbol, value).unwrap();
+    assert!(session.inject_data_value(symbol, value).is_err());
     session.initialize().unwrap();
     let lookup = session
         .instance
@@ -594,19 +607,19 @@ fn data_injection_precedes_property_initialization_and_is_single_use() {
         .unwrap();
     for (id, expected) in [
         (source.get(), "input.json"),
-        (u32::MAX, "source:4294967295"),
     ] {
         let span = lookup.call(&mut session.store, id as i32).unwrap() as usize;
-        let memory = session.memory.data(&session.store);
-        let pointer = u32::from_le_bytes(memory[span..span + 4].try_into().unwrap()) as usize;
-        let length = u32::from_le_bytes(memory[span + 4..span + 8].try_into().unwrap()) as usize;
-        assert_eq!(&memory[pointer..pointer + length], expected.as_bytes());
+        let output = session.output();
+        let pointer = u64::from(output.word(span as u64).unwrap());
+        let length = u64::from(output.word(span as u64 + 4).unwrap());
+        assert_eq!(output.bytes(pointer, length).unwrap(), expected.as_bytes());
     }
     assert_eq!(
         session.eval().unwrap(),
         serde_json::json!([{"number":42},42])
     );
-    assert!(session.inject_data(symbol, &plan, &sources).is_err());
+    assert!(session.inject_data_value(symbol, value).is_err());
+    assert!(lookup.call(&mut session.store, -1).is_err());
 }
 
 fn compile(source: &str) -> Result<Vec<u8>, String> {
@@ -708,7 +721,9 @@ fn interpreter_fuel_is_shared_across_initialization_calls() {
     let bytes =
         compile("def loop: Fn(Int) -> Int = fn(n: Int) -> Int { loop(n + 1) }; export def answer: Int = loop(0);")
             .unwrap();
-    let mut session = crate::session::Session::load(&bytes, 1000).unwrap();
+    let mut session = crate::session::Session::load(&bytes, 100_000).unwrap();
+    // Startup work may change; this test constrains the initialization loop.
+    session.store.set_fuel(1000).unwrap();
     assert!(
         session
             .initialize()
@@ -743,10 +758,12 @@ fn sealed_export_runs_without_mir_or_host_imports() {
         .get_typed_func::<(), i32>(&store, "telora_entry")
         .unwrap();
     let pointer = entry.call(&mut store, ()).unwrap() as usize;
+    let pointer = instance.get_typed_func::<u32, u32>(&store, "telora_heap_address").unwrap()
+        .call(&mut store, pointer as u32).unwrap() as usize;
     let memory = instance.get_memory(&store, "memory").unwrap();
     let bytes = memory.data(&store);
     assert_eq!(
-        i64::from_le_bytes(bytes[pointer + 16..pointer + 24].try_into().unwrap()),
+        i64::from_le_bytes(bytes[pointer + crate::abi::DATA as usize..pointer + crate::abi::DATA as usize + 8].try_into().unwrap()),
         42
     );
 }
@@ -824,7 +841,8 @@ fn typed_input_and_post_initialization_calls_keep_main_ids() {
         );
     }
     let after = session.memory.data(&session.store);
-    assert_eq!(&after[allocation..allocation + marker.len()], &marker);
+    assert!(session.output().bytes(allocation as u64, marker.len() as u64).unwrap() == marker,
+        "logical allocation must survive arena relocation");
     for table in 0..crate::abi::TABLE_COUNT as usize {
         let offset = table * crate::abi::TABLE_BYTES as usize + 12;
         assert_eq!(
@@ -871,10 +889,12 @@ fn language_functions_and_control_flow() {
         let pointer = entry.call(&mut store, ()).unwrap() as usize;
         assert_ne!(pointer, 0, "{source}");
         assert_eq!(entry.call(&mut store, ()).unwrap() as usize, pointer);
+        let pointer = instance.get_typed_func::<u32, u32>(&store, "telora_heap_address").unwrap()
+            .call(&mut store, pointer as u32).unwrap() as usize;
         let memory = instance.get_memory(&store, "memory").unwrap();
         let bytes = memory.data(&store);
         assert_eq!(
-            i64::from_le_bytes(bytes[pointer + 16..pointer + 24].try_into().unwrap()),
+            i64::from_le_bytes(bytes[pointer + crate::abi::DATA as usize..pointer + crate::abi::DATA as usize + 8].try_into().unwrap()),
             42,
             "{source}"
         );
@@ -885,11 +905,15 @@ fn point(source: &str, byte: usize) -> u64 {
     let prefix = &source[..byte];
     let line = prefix.bytes().filter(|&byte| byte == b'\n').count();
     let column = prefix.rsplit('\n').next().unwrap().len();
-    ((line as u64) << 24) | column as u64
+    ((line as u64) << 32) | column as u64
 }
 
-fn source_slice(source: &str, words: [u32; 3]) -> &str {
+fn source_slice(source: &str, words: [u32; 5]) -> &str {
     let index = telora_core::source::LineIndex::new(source).unwrap();
-    let loc = telora_core::source::CompactLoc(words);
+    let loc = telora_core::source::SourceCoordinates(words);
     &source[index.byte(loc.start()).unwrap() as usize..index.byte(loc.end()).unwrap() as usize]
+}
+
+fn diagnostic_point(value: &serde_json::Value) -> u64 {
+    (value["line"].as_u64().unwrap() << 32) | value["offset"].as_u64().unwrap()
 }

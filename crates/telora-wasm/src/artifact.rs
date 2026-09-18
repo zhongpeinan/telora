@@ -99,6 +99,8 @@ pub enum Kind {
 pub struct Source {
     pub id: u32,
     pub name: String,
+    #[serde(skip)]
+    pub lines: Vec<[u32; 2]>,
 }
 
 impl Source {
@@ -106,12 +108,13 @@ impl Source {
         Self {
             id: file.id().get(),
             name: file.name.to_string(),
+            lines: file.line_index().ranges().collect(),
         }
     }
 
     /// One-based line and UTF-8 byte column for diagnostic display.
     pub fn position(&self, point: u64) -> (usize, usize) {
-        let (line, column) = telora_core::source::CompactLoc::position(point);
+        let (line, column) = telora_core::source::SourceCoordinates::position(point);
         (line as usize + 1, column as usize + 1)
     }
 }
@@ -169,6 +172,9 @@ impl Manifest {
                         T::Dyn => Kind::Dyn,
                         T::Tuple => Kind::Tuple,
                         T::Record(_) => Kind::Record,
+                        // Unchecked only admits named structs. It keeps its own
+                        // TypeId but uses the owner's closed record layout.
+                        T::Unchecked => Kind::Record,
                         T::Nominal(symbol) => match executable
                             .sealed_mir()
                             .types()
@@ -240,7 +246,7 @@ impl Manifest {
                     };
                     Some(DebugSite {
                         node: index as u32,
-                        origin: mir.sources.get(node.location.source).compact(node.location).0,
+                        origin: [node.location.source.get(), node.location.start, node.location.end],
                         name: expression.replace("\r\n", "\n").replace('\r', "\n"),
                         message: message.clone(),
                     })

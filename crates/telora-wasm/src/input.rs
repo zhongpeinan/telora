@@ -5,20 +5,20 @@ use serde_json::Value;
 impl Session {
     pub(crate) fn write_input_text(&mut self, pointer: u32, text: &str) -> Result<(), String> {
         let bytes = text.as_bytes();
-        if bytes.len() <= 14 {
+        if bytes.len() < 16 {
             let mut inline = [0u8; 16];
-            inline[1] = bytes.len() as u8;
-            inline[2..2 + bytes.len()].copy_from_slice(bytes);
-            self.write(pointer as usize + 16, &inline)?;
+            inline[15] = bytes.len() as u8;
+            inline[..bytes.len()].copy_from_slice(bytes);
+            self.write(pointer as usize + (DATA as usize), &inline)?;
         } else {
             let data = self.allocate(bytes.len())?;
             self.write(data as usize, bytes)?;
             let length =
                 u32::try_from(bytes.len()).map_err(|_| "Wasm: string input size overflow")?;
-            let id = self.push_input(STRINGS, data, length)?;
-            self.write(pointer as usize + 16, &1u32.to_le_bytes())?;
-            self.write(pointer as usize + 20, &id.to_le_bytes())?;
-            self.write(pointer as usize + 28, &length.to_le_bytes())?;
+            let write = self.instance.get_typed_func::<(u32, u32, u32), u32>(
+                &self.store, "telora_content_write").map_err(|e| e.to_string())?;
+            write.call(&mut self.store, (pointer + DATA as u32, data, length))
+                .map_err(|e| e.to_string())?;
         }
         Ok(())
     }
@@ -33,6 +33,7 @@ impl Session {
             .map_err(|e| e.to_string())? as u32)
     }
     pub(crate) fn write(&mut self, address: usize, bytes: &[u8]) -> Result<(), String> {
+        let address = self.output().address(address as u64, bytes.len() as u64)? as usize;
         self.memory
             .write(&mut self.store, address, bytes)
             .map_err(|e| e.to_string())
@@ -55,12 +56,14 @@ impl Session {
             .map_err(|e| e.to_string())? as u32)
     }
     pub(crate) fn copy_input(&mut self, to: u32, from: u32, bytes: usize) -> Result<(), String> {
+        let to = self.output().address(to.into(), bytes as u64)? as usize;
+        let from = self.output().address(from.into(), bytes as u64)? as usize;
         let memory = self.memory.data_mut(&mut self.store);
-        let source = from as usize..from as usize + bytes;
-        if source.end > memory.len() || to as usize + bytes > memory.len() {
+        let source = from..from + bytes;
+        if source.end > memory.len() || to + bytes > memory.len() {
             return Err("Wasm: input copy out of bounds".into());
         }
-        memory.copy_within(source, to as usize);
+        memory.copy_within(source, to);
         Ok(())
     }
     pub(crate) fn input(&mut self, ty: u32, value: &Value, depth: usize) -> Result<u32, String> {
@@ -85,21 +88,21 @@ impl Session {
                 }
             }
             Kind::Int => self.write(
-                pointer as usize + 16,
+                pointer as usize + (DATA as usize),
                 &value
                     .as_i64()
                     .ok_or("Wasm: expected Int input")?
                     .to_le_bytes(),
             )?,
             Kind::Float => self.write(
-                pointer as usize + 16,
+                pointer as usize + (DATA as usize),
                 &value
                     .as_f64()
                     .ok_or("Wasm: expected Float input")?
                     .to_le_bytes(),
             )?,
             Kind::Bool => self.write(
-                pointer as usize + 16,
+                pointer as usize + (DATA as usize),
                 &u64::from(value.as_bool().ok_or("Wasm: expected Bool input")?).to_le_bytes(),
             )?,
             Kind::String => self.write_input_text(
@@ -124,8 +127,8 @@ impl Session {
                     self.copy_input(data + index as u32 * stride, value, stride as usize)?;
                 }
                 let id = self.push_input(ARRAYS, data, bytes)?;
-                self.write(pointer as usize + 16, &id.to_le_bytes())?;
-                self.write(pointer as usize + 24, &length.to_le_bytes())?;
+                self.write(pointer as usize + (DATA as usize), &id.to_le_bytes())?;
+                self.write(pointer as usize + (DATA + 8) as usize, &length.to_le_bytes())?;
             }
             Kind::Record | Kind::Tuple => {
                 let valid = match descriptor.kind {
@@ -158,7 +161,7 @@ impl Session {
                     self.copy_input(data + field.offset, value, width as usize)?;
                 }
                 let id = self.push_input(RECORDS, data, bytes)?;
-                self.write(pointer as usize + 16, &id.to_le_bytes())?;
+                self.write(pointer as usize + (DATA as usize), &id.to_le_bytes())?;
             }
             Kind::Dict => self.input_dict(pointer, &descriptor, value, depth)?,
             Kind::Option | Kind::Enum | Kind::Value => {
@@ -175,7 +178,7 @@ impl Session {
                     payload,
                     self.manifest.types[field.ty as usize].bytes,
                 )?;
-                self.write(pointer as usize + 16, &id.to_le_bytes())?;
+                self.write(pointer as usize + (DATA as usize), &id.to_le_bytes())?;
             }
             _ => return Err("Wasm: input encoding is not implemented for this type".into()),
         }

@@ -1,7 +1,7 @@
 use crate::{abi::*, tables::telora_table_get};
 
 pub(crate) unsafe fn word(pointer: u32, offset: u64) -> u32 {
-    unsafe { ((pointer + offset as u32) as *const u32).read_unaligned() }
+    unsafe { crate::heap::read(pointer.checked_add(offset.try_into().unwrap()).unwrap()) }
 }
 
 #[unsafe(no_mangle)]
@@ -25,16 +25,7 @@ pub unsafe extern "C" fn telora_invoke(value: u32, args: u32) -> u32 {
 }
 
 pub(crate) unsafe fn string_span(value: u32) -> (u32, u32) {
-    unsafe {
-        if *((value + DATA as u32) as *const u8) == 0 {
-            (value + 18, *((value + 17) as *const u8) as u32)
-        } else {
-            let start = word(value, 24);
-            let end = word(value, 28);
-            let base = word(telora_table_get(table_address(STRINGS), word(value, 20)), 0);
-            (base + start, end - start)
-        }
-    }
+    unsafe { crate::content::span(value + DATA as u32) }
 }
 
 #[unsafe(no_mangle)]

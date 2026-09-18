@@ -23,7 +23,7 @@ Telora 当前仍处于快速演进阶段，不提供语法或 ABI 兼容性承�
 构建命令行工具：
 
 ```bash
-cargo build --release -p telora
+cargo build --release -p telora -p telora-run
 ```
 
 建立最小 crate：
@@ -76,7 +76,7 @@ target/release/telora -C hello query exports @src/app
 
 模块导出具体类型 MainService，实现 `std/transform-service.TransformService` 的 init 与 transform。
 MIR 封闭所有方法实例；Host 准备声明的来源并初始化服务，run 处理一个 stdin JSON，
-serve 处理 JSONL。每次调用从同一初始化状态开始，服务间隙 reset；fuel/memory 配额只
+serve 通过 JSONL 或 HTTP 处理请求。每次调用从同一初始化状态开始，服务间隙 reset；fuel/memory 配额只
 约束单次调用。来源与诊断细节见 [执行模式](guide/EXEC-MODE.md)。
 
 `check --only-types` 和 `query` 已接入新的三个静态 Pass，直接消费 MIR，
@@ -119,8 +119,8 @@ Some(1)
 
 Bool 只接受 `True` 和 `False`，不进行 truthiness 转换。用户 enum 的构造使用
 声明限定名，例如 `Status.Ready`；不使用带单引号的旧 tag 语法。
-Array 是有序同质序列；Tuple 是固定长度异质积；record 和 Dict 在运行时共享 Dict
-表示，但具有不同静态语义。
+Array 是有序同质序列；Tuple 是固定长度异质积；具名 Struct 的字段由声明确定，Dict(T) 的键可变化而值类型固定。
+记录字面量必须得到具名 Struct 或 Dict(T) 的完整类型，不能留下匿名 Record 值。
 
 模块顶层是声明空间，只接受 `import`、`type`、`trait`、`impl`、`decl`、`def`、`native`
 和 `export`。局部顺序计算使用 `let`；复杂模块值通过 `do` 表达：
@@ -149,8 +149,8 @@ type Maybe(A) = enum {
 ```
 
 Struct 和 enum 是封闭的具名类型。即使结构相同，不同声明也不是同一类型；alias、
-import 和 reexport 保留声明身份。参数化声明定义 TypeMetadata constructor；同一
-constructor 使用相同类型实参时得到相同的 canonical 类型。
+import 和 reexport 保留声明身份。参数化声明定义静态类型族；同一声明
+使用相同类型实参时得到相同的 canonical 类型。
 
 `T` 是静态类型，`T.type` 将其投影为精确的 `TypeOf(T)` 元数据，可作为 `Type`
 传递。普通函数可以观察和组合元数据，但不能把函数返回的元数据反向用作类型声明。
@@ -176,7 +176,8 @@ JSON、YAML 和 TOML 文件也是静态模块，并统一导出 `std/value.Value
 import "./request.json" { data as request };
 ```
 
-它们在模块图封闭时由 Host 加载，不是运行时文件 IO。
+静态阶段只登记其 data: Value 接口；类型闭合后才加载和解析内容。
+程序本身不能读取任意文件。
 
 ### Codec 与展示
 
@@ -195,8 +196,8 @@ export def encoded: Value = codec.encode(Value.type, request);
 `std/codec` 在 `Value` 与有类型值之间转换；`std/json` 负责 JSON 文本。
 Decorator provider 计算 typed property，codec 消费对应的类型元数据和 property。
 
-字符串插值 `` `value=\{value}` `` 只依据运行时 primitive meta 支持 String、Int、
-Float 和 Atom，不隐式调用用户 Display。稳定的数据交换使用 codec；临时观察使用
+字符串插值要求每个表达式具有静态选定的 std/fmt.Display 实现。
+String、Int、Float 有标准实现；具名类型可以实现 Display 或使用 fmt.display_by。稳定的数据交换使用 codec；临时观察使用
 `dbg!`；显式的面向人展示可以使用 `std/fmt`。
 
 ## 诊断与 best-effort
@@ -245,7 +246,9 @@ serve 处理 JSONL。每次调用从同一初始化状态开始，服务间隙 r
 ```text
 telora eval <module:name>  求值 module 的一个 Value 导出
 telora run <module>        读取一个 stdin JSON，输出 transform 的结果
-telora serve <module> --bind stdio://  持续处理独立 JSONL 请求
+telora serve <module> --bind <URI>  通过 JSONL 或 HTTP 持续处理独立请求
+telora build <module> -o app.wasm   编译为普通 Wasm 制品
+telora-run app.wasm [--bind <URI>]  独立执行制品，不需要源码和编译器
 telora lock                物化 package source 并原子刷新 workspace lock
 telora check <module-id>   类型闭合后完成可达模块图初始化
 telora check --lib [--tests] [--only-types]  批量检查当前 crate
@@ -257,6 +260,13 @@ telora lsp                 启动语言服务器
 
 包管理在私有 Host 内使用 IMOS 物化依赖，不向程序开放外部 I/O。
 `eval` 读取普通 Value 导出；run/serve 执行 MainService。
+
+`--bind` 支持 `stdio+jsonl://`、`http://127.0.0.1:8080` 和
+`http+unix:///tmp/telora.sock`。HTTP 接口为 `POST /transform`。
+`telora-run` 不传 `--bind` 时从 stdin 读取一个完整 JSON，输出一个结果；
+传入时持续服务。`--source name=file.json` 提供初始化数据，与请求输入分开。
+普通 Wasm 制品不保存初始化状态，每次启动 runner 都进行初始化；
+当前不提供 snapshot 或 Wasmtime 后端。详细示例见 [执行模式](guide/EXEC-MODE.md)。
 
 `query` 包含：
 

@@ -1,116 +1,134 @@
-//! One static service entry, driven once or by a JSONL input stream.
+//! One static service entry, driven once or through the shared serving transports.
 use super::*;
-use std::{collections::BTreeMap, io::{BufRead, Write}};
-use telora_core::{SourceDatabase, SourceId, data_plan::{self, Format}};
-use telora_wasm::{transform_service::TransformSession, transport::Value};
+use std::io::Write;
+use telora_wasm::transform_service::TransformSession;
 
-pub(crate) fn execute(context: PathBuf, arguments: crate::ApplicationArgs, serve: bool) -> Result<i32, String> {
+pub(crate) fn execute(
+    context: PathBuf,
+    arguments: crate::ApplicationArgs,
+    bind: Option<telora_run::transport::Bind>,
+) -> Result<i32, String> {
     let frontend = PhaseTimer::new("frontend");
-    if arguments.module.contains(':') { return Err("service entry expects MODULE, exporting MainService".into()); }
+    if arguments.module.contains(':') {
+        return Err("service entry expects MODULE, exporting MainService".into());
+    }
     let mut inventory = Inventory::new(&context, arguments.module.starts_with("std/"))?;
     let module = inventory.select(&arguments.module)?;
     let mut mir = inventory.solve_transform(&module)?;
-    if mir.diagnostics.iter().any(|d| d.severity == Severity::Error) {
-        return Err(mir.diagnostics.iter().map(|d| mir.sources.render(d)).collect::<Vec<_>>().join("\n"));
+    if mir
+        .diagnostics
+        .iter()
+        .any(|d| d.severity == Severity::Error)
+    {
+        return Err(mir
+            .diagnostics
+            .iter()
+            .map(|d| mir.sources.render(d))
+            .collect::<Vec<_>>()
+            .join("\n"));
     }
-    let sealed = mir.seal().map_err(|ds| ds.iter().map(|d| mir.sources.render(d)).collect::<Vec<_>>().join("\n"))?;
-    let ModuleTarget::Bound(root) = mir.roots[0] else { return Err("unresolved service entry".into()); };
-    let symbol = *mir.exports[root.index()].iter().find(|s| mir.symbols[s.index()].name == "main")
+    let sealed = mir.seal().map_err(|ds| {
+        ds.iter()
+            .map(|d| mir.sources.render(d))
+            .collect::<Vec<_>>()
+            .join("\n")
+    })?;
+    let ModuleTarget::Bound(root) = mir.roots[0] else {
+        return Err("unresolved service entry".into());
+    };
+    let symbol = *mir.exports[root.index()]
+        .iter()
+        .find(|s| mir.symbols[s.index()].name == "main")
         .ok_or("missing static service plan")?;
-    let executable = sealed.seal_export(symbol).map_err(|ds| ds.iter().map(|d| mir.sources.render(d)).collect::<Vec<_>>().join("\n"))?;
+    let executable = sealed.seal_export(symbol).map_err(|ds| {
+        ds.iter()
+            .map(|d| mir.sources.render(d))
+            .collect::<Vec<_>>()
+            .join("\n")
+    })?;
     drop(frontend);
-    let mut session = compile(&executable, inventory.runtime_options())?;
-    let result = initialize(&mut session, &inventory, &mut mir.sources);
-    diagnostics::finish(&session, &mir.sources, 0, result)?;
+    let bytes = {
+        let _timer = PhaseTimer::new("codegen_link");
+        telora_wasm::compile_service(&executable)?
+    };
+    let mut session = {
+        let _timer = PhaseTimer::new("engine_load");
+        load_session(&bytes, inventory.runtime_options())?
+    };
+    initialize(&mut session, &inventory, &mut mir.sources)?;
     let service_init = PhaseTimer::new("service_initialize");
     let mut service = TransformSession::new(session)?;
     let names = crate::source_arg::service_source_names(&arguments.sources)?;
     if names != service.sources() {
-        return Err(format!("service sources differ: declared {:?}, supplied {names:?}", service.sources()));
+        return Err(format!(
+            "service sources differ: declared {:?}, supplied {names:?}",
+            service.sources()
+        ));
     }
     crate::source_arg::reject_stdin_sources(&arguments.sources)?;
     let limits = crate::execution_config_for(inventory.runtime_options())?.data_limits;
-    let mut values = BTreeMap::new();
-    for (name, input) in crate::source_arg::collect_service_sources(arguments.sources, limits.file_size)? {
-        let id = mir.sources.try_add_data(input.source_name, input.text).map_err(|e| e.to_string())?;
-        let format = match input.format {
-            telora_core::SystemDataFormat::Json => Format::Json,
-            telora_core::SystemDataFormat::Yaml => Format::Yaml,
-            telora_core::SystemDataFormat::Toml => Format::Toml,
-        };
-        let value = materialize(&mut service, &mir.sources, id, format)?;
-        values.insert(name, value);
+    let sources = crate::source_arg::service_source_readers(arguments.sources);
+    let initialization = service.initialize_readers(sources, limits.file_size)?;
+    for diagnostic in initialization.diagnostics.as_array().into_iter().flatten() {
+        emit_diagnostic(diagnostic)?;
     }
-    let result = service.initialize(&values);
-    diagnostics::finish(service.session(), &mir.sources, 0, result)?;
+    for event in service.session().take_debug_events()? {
+        crate::emit_stderr(serde_json::to_value(event).map_err(|e| e.to_string())?)?;
+    }
+    if !initialization.success {
+        return Ok(1);
+    }
     service.seal_initialization()?;
+    timing::initialization_heap(service.session_mut())?;
     drop(service_init);
     let usage_reporter = service.session_mut().usage_reporter.take();
-    let request = mir.sources.try_add_data("@request", String::new()).map_err(|e| e.to_string())?;
     let stdin = std::io::stdin();
-    if !serve {
+    if bind.is_none() {
         let input = crate::source_arg::read_limited(stdin.lock(), limits.file_size, "query input")?;
-        let input = String::from_utf8(input).map_err(|e| e.to_string())?;
-        let response = transform(&mut service, &mut mir.sources, request, input);
-        if let Some(report) = usage_reporter { report(service.usage()); }
-        for diagnostic in response["diagnostics"].as_array().into_iter().flatten() {
-            crate::emit_stderr(serde_json::json!({"schema":"telora.execution/v1", "record":"diagnostic",
-                "severity":diagnostic["severity"], "message":diagnostic["message"],
-                "labels":diagnostic["labels"], "notes":diagnostic["notes"]}))?;
+        let response = transform(&mut service, &input);
+        if let Some(report) = usage_reporter {
+            report(service.usage());
         }
-        if response["error"] == true { return Ok(1); }
-        crate::emit(response["ok"].clone())?;
+        let reply: Reply<'_> = serde_json::from_slice(&response).map_err(|e| e.to_string())?;
+        if reply.schema != "telora.service/v1" { return Err("invalid service response schema".into()); }
+        for diagnostic in &reply.diagnostics {
+            emit_diagnostic(diagnostic)?;
+        }
+        if reply.error {
+            return Ok(1);
+        }
+        write_json(reply.ok.get().as_bytes())?;
         return Ok(0);
     }
-    let mut reader = stdin.lock();
-    loop {
-        let mut bytes = Vec::new();
-        let mut oversized = false;
-        loop {
-            let available = reader.fill_buf().map_err(|e| e.to_string())?;
-            if available.is_empty() { break; }
-            let end = available.iter().position(|b| *b == b'\n').map(|n| n + 1);
-            let count = end.unwrap_or(available.len());
-            if bytes.len().saturating_add(count) <= limits.file_size {
-                bytes.extend_from_slice(&available[..count]);
-            } else { oversized = true; }
-            reader.consume(count);
-            if end.is_some() { break; }
-        }
-        if bytes.is_empty() && !oversized { break; }
-        let response = if oversized {
-            failure("request exceeds file_size limit")
-        } else { match String::from_utf8(bytes) {
-            Ok(input) => {
-                let response = transform(&mut service, &mut mir.sources, request, input);
-                if let Some(report) = usage_reporter { report(service.usage()); }
-                response
-            },
-            Err(_) => failure("request is not UTF-8"),
-        }};
-        crate::emit(response)?;
-        std::io::stdout().flush().map_err(|e| e.to_string())?;
-    }
+    telora_run::transport::serve(bind.unwrap(), limits.file_size, |input| {
+        let response = transform(&mut service, input);
+        if let Some(report) = usage_reporter { report(service.usage()); }
+        Ok(response)
+    }).map_err(|e| e.to_string())?;
     Ok(0)
 }
 
-fn materialize(service: &mut TransformSession, sources: &SourceDatabase, source: SourceId,
-    format: Format) -> Result<Value, String> {
-    let plan = data_plan::parse_registered_with_limits(sources, source, format, crate::execution_config().data_limits)
-        .map_err(|ds| ds.iter().map(|d| sources.render(d)).collect::<Vec<_>>().join("\n"))?;
-    service.session_mut().register_data_sources(sources, &plan)?;
-    service.session_mut().materialize_value(&plan, sources)
+#[derive(serde::Deserialize)]
+struct Reply<'a> {
+    schema: &'a str,
+    #[serde(borrow)]
+    ok: &'a serde_json::value::RawValue,
+    error: bool,
+    diagnostics: Vec<serde_json::Value>,
 }
 
-fn transform(service: &mut TransformSession, sources: &mut SourceDatabase, request: SourceId, input: String) -> serde_json::Value {
+fn write_json(bytes: &[u8]) -> Result<(), String> {
+    let mut out = std::io::stdout().lock();
+    out.write_all(bytes).and_then(|_| out.write_all(b"\n")).map_err(|e| e.to_string())
+}
+
+fn transform(service: &mut TransformSession, input: &[u8]) -> Vec<u8> {
     let result = (|| {
         {
             let _timer = PhaseTimer::new("request_reset");
             service.reset()?;
         }
         let _timer = PhaseTimer::new("request_transform");
-        sources.replace_unreferenced_data(request, "@request", input).map_err(|e| e.to_string())?;
-        let input = materialize(service, sources, request, Format::Json)?;
         let result = service.transform(input);
         for event in service.session().take_debug_events()? {
             crate::emit_stderr(serde_json::to_value(event).map_err(|e| e.to_string())?)?;
@@ -118,17 +136,21 @@ fn transform(service: &mut TransformSession, sources: &mut SourceDatabase, reque
         result
     })();
     match result {
-        Ok(observed) => if let Some(ok) = observed.get("Ok") {
-            serde_json::json!({"ok":ok[0],"error":false,"diagnostics":ok[1]})
-        } else if let Some(errors) = observed.get("Err") {
-            serde_json::json!({"ok":null,"error":true,"diagnostics":errors})
-        } else { failure("invalid sealed transform result") },
-        Err(error) => failure(&error),
+        Ok(response) => response,
+        Err(error) => failure_bytes(&error),
     }
 }
 
-fn failure(message: &str) -> serde_json::Value {
-    serde_json::json!({"ok":null,"error":true,"diagnostics":[{
+fn failure_bytes(message: &str) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({"schema":"telora.service/v1","ok":null,"error":true,"diagnostics":[{
         "severity":"Error", "message":message, "labels":[], "notes":[]
-    }]})
+    }]})).expect("serializable service failure")
+}
+
+fn emit_diagnostic(diagnostic: &serde_json::Value) -> Result<(), String> {
+    crate::emit_stderr(
+        serde_json::json!({"schema":"telora.execution/v1", "record":"diagnostic",
+        "severity":diagnostic["severity"], "message":diagnostic["message"],
+        "labels":diagnostic["labels"], "notes":diagnostic["notes"]}),
+    )
 }

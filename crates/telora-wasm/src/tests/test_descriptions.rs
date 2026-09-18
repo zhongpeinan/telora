@@ -117,11 +117,10 @@ fn test_descriptions_preserve_identity_and_defer_callbacks() {
     let mut session = crate::session::Session::load(&bytes, 2_000_000).unwrap();
     session.initialize().unwrap();
     let value = session.entry().unwrap() as usize;
-    let word = |bytes: &[u8], offset: usize| {
-        u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
-    };
-    let memory = session.memory.data(&session.store);
-    let id = word(memory, value + 16) as usize;
+    let word = |output: &crate::output::Output<'_>, offset: usize| output.word(offset as u64).unwrap();
+    let output = session.output();
+    let memory = &output;
+    let id = word(memory, value + crate::abi::DATA as usize) as usize;
     let table = crate::abi::table_address(crate::abi::TESTS) as usize;
     let slot = word(memory, table) as usize + id * 8;
     let description = word(memory, slot) as usize;
@@ -139,7 +138,7 @@ fn test_descriptions_preserve_identity_and_defer_callbacks() {
     assert_ne!(result, 0);
     assert_eq!(
         i64::from_le_bytes(
-            session.memory.data(&session.store)[result + 16..result + 24]
+            session.output().bytes(result as u64 + crate::abi::DATA, 8).unwrap()
                 .try_into()
                 .unwrap()
         ),
@@ -161,7 +160,7 @@ fn test_description_rejects_empty_expectation_before_callback() {
     let diagnostics = session.diagnostics().unwrap();
     assert_eq!(diagnostics.len(), 1);
     assert_eq!(
-        telora_core::source::CompactLoc(diagnostics[0].subjects[0]).start(),
+        telora_core::source::SourceCoordinates(diagnostics[0].subjects[0]).start(),
         point(source, source.rfind("\"\"").unwrap())
     );
 }

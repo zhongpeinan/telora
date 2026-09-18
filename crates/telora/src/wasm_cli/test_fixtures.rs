@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use telora_core::{
     DataLimits, Diagnostic, Loc, SourceDatabase, SystemDataFormat, TestContext,
-    data_plan::{self, ParsedData},
+    data_plan,
     test_plan::TestResult,
 };
 
@@ -13,11 +13,11 @@ pub(super) fn diagnostic(message: impl Into<String>, origin: Option<Loc>) -> Dia
     )
 }
 
-pub(super) fn location(sources: &SourceDatabase, words: [u32; 3]) -> Option<Loc> {
+pub(super) fn location(sources: &SourceDatabase, words: [u32; 5]) -> Option<Loc> {
     sources
         .files()
-        .find(|file| file.id().get() == (words[0] & 0xffff))
-        .and_then(|file| file.byte_location(telora_core::source::CompactLoc(words)))
+        .find(|file| file.id().get() == words[0])
+        .and_then(|file| file.byte_location(telora_core::source::SourceCoordinates(words)))
 }
 
 pub(super) struct Fixtures<'a, 'b> {
@@ -25,6 +25,11 @@ pub(super) struct Fixtures<'a, 'b> {
     pub limits: DataLimits,
     pub sources: &'a mut SourceDatabase,
     pub admitted_bytes: usize,
+}
+
+pub(super) struct Input {
+    pub source: telora_core::SourceId,
+    pub format: data_plan::Format,
 }
 
 impl Fixtures<'_, '_> {
@@ -35,7 +40,7 @@ impl Fixtures<'_, '_> {
         label: &str,
         origin: Option<Loc>,
         cache: &mut HashMap<String, Result<String, String>>,
-    ) -> Result<ParsedData, Vec<Diagnostic>> {
+    ) -> Result<Input, Vec<Diagnostic>> {
         let error = |message: String| vec![diagnostic(message, origin)];
         let declaring = origin
             .map(|loc| self.sources.get(loc.source).name.to_string())
@@ -83,8 +88,7 @@ impl Fixtures<'_, '_> {
             SystemDataFormat::Yaml => data_plan::Format::Yaml,
             SystemDataFormat::Toml => data_plan::Format::Toml,
         };
-        let plan = data_plan::parse_registered_with_limits(self.sources, id, format, self.limits)?;
-        Ok(plan)
+        Ok(Input { source: id, format })
     }
 }
 

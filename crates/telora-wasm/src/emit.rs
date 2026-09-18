@@ -61,10 +61,12 @@ impl<'a> Emitter<'a> {
         if demand.is_some() {
             self.locals.push(ValType::I32);
         }
+        let scratch = self.locals.len() as u32 + 2;
+        self.locals.extend([ValType::I32, ValType::I64]);
         let mut function = crate::object::ObjectFunction::new(Function::new(
             self.locals.into_iter().map(|ty| (1, ty)),
-        ));
-        let count = FIRST_FUNCTION + self.plan.functions.len() as u32 + 3;
+        ), scratch);
+        let count = FIRST_FUNCTION + self.plan.functions.len() as u32 + self.plan.generated_helpers;
         if demand.is_some() {
             function.instruction(&I::Block(wasm_encoder::BlockType::Result(ValType::I32)));
         }
@@ -140,6 +142,11 @@ impl<'a> Emitter<'a> {
             I::I32Store(memory(offset, 2)),
         ]);
     }
+    pub fn store_location(&mut self, pointer: u32, loc: telora_core::Loc) {
+        self.store32(pointer, SOURCE, loc.source.get());
+        self.store32(pointer, START, loc.start);
+        self.store32(pointer, END, loc.end);
+    }
     pub fn value(&mut self, node: HirId, bytes: u32) -> Result<u32, String> {
         let ty = self.effective_ty(node)?;
         self.value_as(node, ty, bytes)
@@ -149,11 +156,7 @@ impl<'a> Emitter<'a> {
             return Err(format!("Wasm: value width mismatch at {node:?}"));
         }
         let result = self.alloc(bytes);
-        let loc = self.mir.hir[node.index()].location;
-        let loc_words = self.mir.sources.get(loc.source).compact(loc).0;
-        self.store32(result, SOURCE, loc_words[0]);
-        self.store32(result, START, loc_words[1]);
-        self.store32(result, END, loc_words[2]);
+        self.produced_origin(result, node)?;
         self.store32(result, TYPE, ty.index() as u32);
         Ok(result)
     }
@@ -184,16 +187,13 @@ impl<'a> Emitter<'a> {
     }
     pub fn failure(&mut self, node: HirId, code: u32) {
         let location = self.mir.hir[node.index()].location;
-        let location_words = self.mir.sources.get(location.source).compact(location).0;
         let pointer = self.alloc(DIAGNOSTIC_BYTES);
-        self.store32(pointer, 0, location_words[0]);
-        self.store32(pointer, 4, location_words[1]);
-        self.store32(pointer, 8, location_words[2]);
-        self.store32(pointer, 12, code);
+        self.store_location(pointer, location);
+        self.store32(pointer, DIAG_CODE, code);
         self.extend([
             I::LocalGet(pointer),
             I::GlobalGet(INITIALIZATION_ROOT_GLOBAL),
-            I::I32Store(memory(32, 2)),
+            I::I32Store(memory(DIAG_ROOT, 2)),
         ]);
         self.table_push(DIAGNOSTICS, pointer, DIAGNOSTIC_BYTES);
         self.extend([

@@ -4,6 +4,7 @@ use std::env;
 use std::path::PathBuf;
 use telora_core::DataLimits;
 mod eval_cli;
+mod build_cli;
 mod wasm_cli;
 mod source_arg;
 mod static_cli;
@@ -80,6 +81,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Compile MainService to a portable Wasm file (experimental publication format).
+    Build(build_cli::BuildArgs),
     /// Evaluate one exported Value without an Entry or effect system.
     Eval(EvalArgs),
     /// Transform one JSON input using the module's MainService.
@@ -119,9 +122,9 @@ struct ApplicationArgs {
 struct ServeArgs {
     #[command(flatten)]
     application: ApplicationArgs,
-    /// Request/response transport. The first version supports stdio:// JSONL.
+    /// Serve stdio+jsonl://, http://IP:PORT or http+unix:///absolute/path.sock.
     #[arg(long, value_name = "URI")]
-    bind: String,
+    bind: telora_run::transport::Bind,
 }
 
 #[derive(Args)]
@@ -296,14 +299,10 @@ fn parse_module_selector(value: &str) -> Result<ModuleSelector, String> {
 fn run_cli(cli: Cli) -> Result<i32, String> {
     let context = command_context(cli.context)?;
     match cli.command {
+        Command::Build(arguments) => build_cli::execute(context, arguments),
         Command::Eval(arguments) => eval_cli::run(context, arguments),
-        Command::Run(arguments) => wasm_cli::run::execute(context, arguments.application, false),
-        Command::Serve(arguments) => {
-            if arguments.bind != "stdio://" {
-                return Err("serve supports only stdio://".into());
-            }
-            wasm_cli::run::execute(context, arguments.application, true)
-        }
+        Command::Run(arguments) => wasm_cli::run::execute(context, arguments.application, None),
+        Command::Serve(arguments) => wasm_cli::run::execute(context, arguments.application, Some(arguments.bind)),
         Command::Lock => package_host::lock(&context)
             .and_then(|path| emit(json!(display_host_path(&path))).map(|()| 0)),
         Command::Check(arguments) => check_command(context, arguments, "telora.check/v1"),

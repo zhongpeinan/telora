@@ -1,6 +1,9 @@
 //! Typed host handles into Wasm memory; no host copy of language object graphs.
 use crate::{abi, artifact::Kind, output::Output, session::Session};
 
+/// A borrowed language handle. Initialization compacts its owned graph: inject
+/// pre-initialization inputs into their demand slots, then acquire fresh handles
+/// afterwards. Work collection similarly returns replacements for explicit roots.
 #[derive(Clone, Copy, Debug)]
 pub struct Value {
     pub(crate) pointer: u32,
@@ -71,31 +74,7 @@ impl Session {
         Ok(())
     }
 
-    pub(crate) fn pair(&self, value: Value) -> Result<(Value, Value), String> {
-        self.expect_value(value, value.ty)?;
-        let desc = &self.manifest.types[value.ty as usize];
-        if desc.kind != Kind::Tuple || desc.fields.len() != 2 {
-            return Err("Wasm: service transition requires a sealed pair".into());
-        }
-        let output = self.output();
-        let (base, bytes) =
-            output.payload(abi::RECORDS, output.word(value.pointer as u64 + abi::DATA)?)?;
-        let field = |index: usize| -> Result<Value, String> {
-            let field = &desc.fields[index];
-            if field.offset as u64 + self.manifest.types[field.ty as usize].bytes as u64 > bytes {
-                return Err("Wasm: transition field exceeds tuple".into());
-            }
-            let value = Value {
-                pointer: u32::try_from(base + field.offset as u64)
-                    .map_err(|_| "Wasm: field address overflow")?,
-                ty: field.ty,
-            };
-            self.expect_value(value, field.ty)?;
-            Ok(value)
-        };
-        Ok((field(0)?, field(1)?))
-    }
-
+    #[cfg(test)]
     pub(crate) fn invoke_values(
         &mut self,
         closure: Value,
@@ -123,12 +102,14 @@ impl Session {
         let args = self.allocate(
             arguments
                 .len()
+                .checked_add(1).ok_or("Wasm: argument count overflow")?
                 .checked_mul(4)
                 .ok_or("Wasm: argument size overflow")?,
         )?;
         for (index, value) in arguments.iter().enumerate() {
             self.write(args as usize + index * 4, &value.pointer.to_le_bytes())?;
         }
+        self.write(args as usize + arguments.len() * 4, &0u32.to_le_bytes())?;
         let invoke = self
             .instance
             .get_typed_func::<(i32, i32), i32>(&self.store, "telora_invoke")

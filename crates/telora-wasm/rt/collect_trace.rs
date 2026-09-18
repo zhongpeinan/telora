@@ -2,9 +2,15 @@
 use crate::{abi::*, collect::Collector, values::word};
 
 impl Collector {
+    pub unsafe fn trace_location(&mut self, id: u32) {
+        if id != 0 {
+            self.sources.insert(id);
+        }
+    }
+
     unsafe fn handle(&mut self, table: u32, old: u32, at: u32) {
         unsafe {
-            let id = self.object(table, word(old, 0));
+            let id = self.object(table, self.old_word(old, 0));
             self.put(at, id);
         }
     }
@@ -12,47 +18,63 @@ impl Collector {
     pub unsafe fn trace_object(&mut self, table: u32, old: u32, at: u32, bytes: u32) {
         unsafe {
             match table {
-                STRINGS | BYTES | HASHES => {}
+                HASHES => {}
                 RECORDS | ARRAYS | VALUES | NEWTYPES => {
                     let mut offset = 0;
                     while offset < bytes {
-                        let ty = word(old + offset, TYPE);
-                        self.sources.insert(word(old + offset, SOURCE) & 0xffff);
+                        let ty = self.old_word(old + offset, TYPE);
+                        self.trace_location(self.old_word(old + offset, SOURCE));
                         let width = word(self.types + ty * 20, 4);
                         assert!(width >= HEADER_BYTES && width <= bytes - offset);
-                        self.trace_data(ty, old + offset + 16, at + offset + 16);
+                        self.trace_data(ty, old + offset + DATA as u32, at + offset + DATA as u32);
                         offset += width;
                     }
                 }
                 ENVIRONMENTS => {
-                    for index in 0..(bytes & !ENV_RAW_PARENT) / 4 {
-                        let pointer = word(old, index as u64 * 4);
-                        let next = if bytes & ENV_RAW_PARENT != 0 {
-                            self.environment_pointer(pointer)
-                        } else {
-                            self.value(pointer)
-                        };
+                    for index in 0..bytes / 4 {
+                        let pointer = self.old_word(old, index as u64 * 4);
+                        let next = self.value(pointer);
                         self.put(at + index * 4, next);
                     }
                 }
                 BLAMES => {
-                    self.sources.insert(word(old, SOURCE) & 0xffff);
-                    for index in 0..word(old, 32) {
-                        self.sources.insert(word(old, 40 + index as u64 * 12) & 0xffff);
+                    self.trace_location(self.old_word(old, SOURCE));
+                    for index in 0..self.old_word(old, BLAME_COUNT as u64) {
+                        self.trace_location(self.old_word(old, BLAME_SUBJECTS as u64 + index as u64 * LOC_BYTES as u64));
                     }
-                    self.string(old + 16, at + 16);
+                    self.string(old + DATA as u32, at + DATA as u32);
                 }
                 FORMATS => {
-                    let count = if word(old, 0) == 4 { 2 } else { 1 };
+                    let count = if self.old_word(old, 0) == 4 { 2 } else { 1 };
                     for index in 0..count {
-                        let next = self.value(word(old, 4 + index * 4));
+                        let next = self.value(self.old_word(old, 4 + index * 4));
                         self.put(at + 4 + index as u32 * 4, next);
                     }
                 }
                 TESTS => {
-                    for index in 0..word(old, 4) {
-                        let next = self.value(word(old, 8 + index as u64 * 4));
+                    for index in 0..self.old_word(old, 4) {
+                        let next = self.value(self.old_word(old, 8 + index as u64 * 4));
                         self.put(at + 8 + index * 4, next);
+                    }
+                }
+                DEBUG_EVENTS => {
+                    let next = self.value(self.old_word(old, 4));
+                    self.put(at + 4, next);
+                }
+                DIAGNOSTICS => {
+                    self.trace_location(self.old_word(old, SOURCE));
+                    let message = self.value(self.old_word(old, DIAG_MESSAGE));
+                    self.put(at + DIAG_MESSAGE as u32, message);
+                    let count = self.old_word(old, DIAG_COUNT);
+                    let subjects = self.old_word(old, DIAG_SUBJECTS);
+                    if count != 0 {
+                        let next = self.copy_bytes(subjects, count.checked_mul(LOC_BYTES).unwrap());
+                        self.put(at + DIAG_SUBJECTS as u32, next);
+                        for index in 0..count {
+                            self.trace_location(self.old_word(subjects, index as u64 * LOC_BYTES as u64));
+                        }
+                    } else {
+                        self.put(at + DIAG_SUBJECTS as u32, 0);
                     }
                 }
                 _ => core::arch::wasm32::unreachable(),
@@ -60,12 +82,8 @@ impl Collector {
         }
     }
 
-    unsafe fn string(&mut self, old: u32, at: u32) {
-        unsafe {
-            if *(old as *const u8) == 1 {
-                self.handle(STRINGS, old + 4, at + 4);
-            }
-        }
+    unsafe fn string(&mut self, _old: u32, at: u32) {
+        self.content.push(at);
     }
 
     unsafe fn trace_data(&mut self, ty: u32, old: u32, at: u32) {
@@ -73,8 +91,7 @@ impl Collector {
             let desc = self.types + ty * 20;
             match word(desc, 0) {
                 0 => {}
-                1 => self.string(old, at),
-                2 => self.handle(BYTES, old, at),
+                1 | 2 => self.string(old, at),
                 3 => self.handle(RECORDS, old, at),
                 4 => self.handle(ARRAYS, old, at),
                 5 => {
@@ -82,7 +99,7 @@ impl Collector {
                     self.handle(ARRAYS, old + 8, at + 8);
                 }
                 6 => {
-                    let tag = word(old, 0);
+                    let tag = self.old_word(old, 0);
                     assert!(tag < word(desc, 12));
                     let variant = self.types + word(desc, 16) + tag * 8;
                     let payload = word(variant, 0);
@@ -90,21 +107,21 @@ impl Collector {
                         if word(variant, 4) != 0 {
                             self.handle(VALUES, old + 8, at + 8);
                         } else {
-                            self.sources.insert(word(old, 8) & 0xffff);
-                            self.trace_data(payload, old + 24, at + 24);
+                            self.trace_location(self.old_word(old, 8));
+                            self.trace_data(payload, old + 8 + HEADER_BYTES, at + 8 + HEADER_BYTES);
                         }
                     }
                 }
                 7 => {
-                    let payload = word(old, 0);
-                    if word(old, 4) == 1 {
+                    let payload = self.old_word(old, 0);
+                    if self.old_word(old, 4) == 1 {
                         self.handle(VALUES, old + 8, at + 8);
                     } else {
                         self.trace_data(payload, old + 8, at + 8);
                     }
                 }
                 8 => {
-                    let id = word(old, 4);
+                    let id = self.old_word(old, 4);
                     if id != 0 {
                         let next = self.object(ENVIRONMENTS, id - 1);
                         self.put(at + 4, next + 1);

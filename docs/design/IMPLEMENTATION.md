@@ -46,7 +46,8 @@ seal 的 MIR；执行入口必须通过 seal。后续阶段直接使用静态结
 
 codegen 消费 SealedExecutable，生成 Wasm 指令和类型确定的胶水。Rust RT 在 Cargo
 构建期间预编译、预链接并嵌入 Telora；用户执行期间无需外部 linker，不写临时代码文件。
-旧 bytecode/LIR/VM 与直接 Cranelift 后端已删除，无后端选择开关或产物 CLI。
+执行统一为 Wasm/wasmi；`telora build` 可保存普通 Wasm，`telora-run` 独立执行制品。
+没有运行后端选择开关或持久化 snapshot 功能。
 
 ## 2. Frontend 与静态诊断
 
@@ -182,7 +183,7 @@ export { data };
 
 数据内容在静态阶段不读取、不解析；因此类型检查成功不代表 JSON/YAML/TOML 内容有效。
 
-Host 的数据模块导入与 Wasm RT 的 `json.parse`、`toml.parse`、`yaml.parse` 共用
+数据模块导入与 Wasm RT 的 `json.parse`、`toml.parse`、`yaml.parse` 共用
 `telora-data`。共享库使用 `no_std + alloc`，输出带来源位置的扁平数据图。
 JSON 的词法模式、容器栈与配额计数显式保存；字符串按
 QStart/QEnd/Text/EscChar/EscUtf16 消费，不接受 `\x`。parse-0 只计量解码长度，
@@ -195,16 +196,17 @@ base64 只计量 Bytes 长度，block scalar 按 folding/chomping 后的实际�
 JSON/YAML 节点天然子节点优先；TOML 在 parse-1 完成后序整理。三个格式的 RT 导出均直接消费 span。
 运行时产生的 Telora 值沿用输入字符串的来源位置。
 
-代码来源保留可编辑的 Rope；数据来源直接接管读入的连续 String。JSON/YAML/TOML 的数据计划
-通过 SourceId / Span 引用来源库，并持有共享解码缓冲区（文本与 Bytes 分开）；Host materializer 直接消费
-这些引用，直到写入 Wasm Heap 或发布数据包时才复制文本。内置 `json.parse` / `yaml.parse` / `toml.parse` 借用 VM
-中的输入字符串并直接导出 Span，所有解码文本共用一份 VM 生命周期的缓冲区，
+代码来源保留可编辑的 Rope；数据来源直接接管读入的连续 String。Host 将原始数据字节传入 Guest，
+静态数据模块、注入来源及测试 fixture 均在 Guest 完成 JSON/YAML/TOML 解析和语言值构造，
+不在 Host 构造并复制数据树。内部实验数据包携带原始文本及来源元数据，加载时也走同一 Guest 解析路径。
+内置 `json.parse` / `yaml.parse` / `toml.parse` 借用 VM
+中的输入字符串并直接导出 Span，每次解析的转换文本共用该次解析上下文中的缓冲区，
 不创建临时 Rope 或逐字符串的 owned-plan。
 
-Host 配置、产物元数据和 EES 协议的 JSON 文本也先由同一 JSON 状态机校验，再由可选的
-`json_serde` 适配器转换为 Rust 结构。Serde 不参与这些入口的文本解析；JSON 输出仍可
-使用 serde_json 序列化。LSP 协议保留原有 serde/serde_json 实现。
-实际内容在执行准备阶段接受格式与 DataLimits 检查，全部有效后才注入 Wasm。
+Host 的 workspace/package 配置经共享 JSON 解析及 `json_serde` 适配取得 Rust 结构。
+Guest 中的数据解析使用 telora-data。独立 runner 的制品 envelope、服务响应与 LSP
+协议使用 serde_json；这些 Host 协议与 Telora 的 JSON 数据解析不是同一入口。
+数据字节先传入 Guest，再接受格式与 DataLimits 检查；只有成功解析才安装为语言值。
 
 symbol Pass 先索引模块的声明、导出和作用域，再闭合引用。import * 建立搜索范围，
 具体引用才选择绑定；显式绑定与遮蔽按普通名称解析规则处理。内置类型的特殊身份来自
@@ -298,9 +300,23 @@ codegen 的公开编译入口接受 SealedExecutable。表达式类型、泛型�
 普通构造拒绝产生运行时失败，codec 解码拒绝返回 Err。读取或复制已完成的值不会重新
 执行构造校验；新构造与 `<~` 更新会检查其结果。
 
-运行时值头包含 12 字节的紧凑 Loc 和 4 字节 TypeId（共 16 字节），后接由静态布局
-决定的 payload。标量值为 24 字节；函数保存函数表索引与闭包环境。
-String、Array、Record 等对象位于各自 typed table；Tuple/Record 共用 Record table。
+运行时值头包含 12 字节 Loc（src/start/end 三个 u32）和 4 字节 TypeId（共 16 字节），
+后接由静态布局决定的 payload。标量值为 24 字节；函数保存函数表索引与闭包环境。
+Array、Record 等对象位于各自 typed table；Tuple/Record 共用 Record table。
+String/Bytes 共用独立的 `Vec<u8>` 内容池：不足 16 字节时直接内联，最后一字节保存
+长度；其余值保存 `start/end/raw_start` 三个绝对偏移，最后一字节为 16。
+共享切片保留 raw_start；回收先汇总同组存活区间，再复制包围区间并重定位全部视图。
+没有独立 String/Bytes 表。Host 的只读内容视图位于线性内存 48/52（地址/长度），
+不可跨 Guest 调用缓存内容地址。结构化对象与表缓冲区已迁入单个 `Vec<u64>`。
+语言引用编码为 `origin + byte_offset`，origin 是链接后静态镜像末端；小于 origin
+的引用指向永久 Wasm 静态区，其余通过当前 words 基址访问。Host 交换缓冲区和来源
+记录仍使用独立的真实线性内存地址，不能当作语言引用传入。
+只读 words 视图位于 40/44（地址/字节数），origin 位于 56；扩容后必须重新取基址。
+类型追踪描述与反射描述在编译时进入永久静态镜像，Guest 启动时登记；words 中
+无需再分配一份类型描述。成功初始化后先移动回收，再冻结 words/content 前缀。
+保守根为全部 Ready demand、service handler，以及尚待消费的诊断/debug 事件；
+顶层值、property/check、已实例化泛型值通过 demand 保留。初始化专用句柄清空。
+工作区显式回收保留冻结前缀，并返回调用方显式根的替代句柄。
 Dict 使用有序 keys/values，字段操作与构造胶水消费已闭合的布局证据。
 具体尺寸与表示以 `telora-wasm-shared/src/abi.rs` 和生成器为准，不构成发布 ABI。
 
@@ -310,16 +326,33 @@ codegen 不沿 def/let initializer 追溯构造器。类型域别名不作为初
 pattern 使用单独的 member selection 事实，不执行值物化。
 
 enum 构造器代码按封闭签名和 variant 复用。其函数值的 environment 为 0，invoke
-将函数值地址作为第一个参数交给构造器胶水，用于复制 12 字节来源头；payload
+将函数值地址作为第一个参数交给构造器胶水，用于复制 12 字节 Loc；payload
 仍按原布局搬运，不重写其来源。普通闭包使用非零环境句柄，调用约定不变。
-内部 ABI 版本为 15（此前为 14）；旧 Wasm 制品需重新生成，值布局未改变。
+内部 ABI 版本为 25；旧 Wasm 制品需重新生成，不能混用旧布局或调用约定。
+`interpreter!` 在构造时捕获输入函数，工厂和适配器使用普通值引用环境；
+没有适配器 memo 槽或 raw-parent 环境，回收不再扫描、修补冻结环境中的该类缓存。
 
-Loc 使用 `src_id:u16`，起止位置各为 `line:u16 + UTF-8 offset:u24`。
-行和偏移从 0 开始，范围为 `[start,end)`；CRLF、LF、CR 都计作一次换行。
-源码和数据注册时检查容量，编译器/Host 将原始字节范围转换为该坐标。
-Wasm 来源表仅保存 ID 和名称，不携带 bols。诊断可以直接显示行列；
+Loc 标记值的产生处：字面量、类型域物化、计算和构造写入对应表达式的位置；
+绑定、字段/元素读取及返回已有值转发原来源。native 计算的新值使用调用处，
+不使用库中 native 声明处。内容不变的计算仍产生新来源，可共享底层 payload，
+不能通过复用输入值头覆盖原值的位置。解析和 codec 的输入来源传播契约保持不变。
+
+普通函数返回时不重写来源，也不分配独立 Loc。可能调用 native 的封闭签名，
+在参数指针数组末尾附加一个来源指针；它指向 Wasm 静态常量，无运行时位置登记。
+native 内部调用 native 回调时传递自身的计算来源，普通回调则按其函数体产生或转发值。
+不可能指向 native 的普通调用省去这个隐藏参数；不存在全局“最近调用位置”。
+Test 构造器使用同一新值来源规则，不再对所有调用维护测试专用状态。
+Host 直接调用时没有 Telora 调用表达式，隐藏来源为 0，不伪造 native 声明处的来源。
+
+全零 Loc 表示无来源；其余位置直接保存实际输入中的 UTF-8 字节范围 `[start,end)`。
+不维护逐位置登记表。静态源码的来源名称和 BOLs 随 Wasm 生成；data-source 在 Guest
+解析时建立 BOLs，随来源记录保存和回收。CRLF、LF、CR 都计作一次换行。
+`with_diagnostics` 在 Guest 内查询来源行索引，生成 `SourcePoint {line, offset}`。
+普通字符串解析继承输入 Loc；临时解析错误只附加输入内的 start/end 字节范围，
+不建立 BOLs、不计算临时行号。`telora build` 在输入端归一化 EOL，使相同文本的 LF/CRLF/CR 构建得到相同制品；
+普通源码执行仍用实际输入的字节位置，不改变原文件。
 原始文本片段、UTF-16 列和终端宽度的转换由 Host 负责。
-三个 u32 的精确打包方式见 [RFC 0293](../../rfc/0293-packed-source-coordinates.md)。
+详细布局见 [RFC 0300](../../rfc/0300-host-guest-abi-and-location-ids.md)。
 
 类型元数据复用静态 TypeId，不递归重建类型描述符。语言值和闭包留在 Wasm 内存，
 Host 通过带类型的 session 句柄传递根；仅输入、输出、资源和诊断跨 Host 边界。
@@ -327,7 +360,7 @@ Host 通过带类型的 session 句柄传递根；仅输入、输出、资源和
 typed equality 使用类型身份及对应值表示，来源位置不参与相等；Dyn 的投影与 codec
 通过已确定的见证检查契约。动态值检查属于运行时行为，不是重新推断表达式类型。
 
-## 6. Property、MainWorld 与 WorkWorld
+## 6. Property 与初始化/请求生命周期
 
 静态 property 记录说明某个 owner/member 是否具有特定 carrier，以及 provider 的
 签名和来源。判断 HasProperty 不需要执行 provider。property 内容则是运行时值，
@@ -342,13 +375,22 @@ fold，最终只有一个有效结果；不同成员仍是不同键。
 codegen 不与运行时共用可变推导状态。
 
 数据注入后主动完成初始化根，顶层值与 property 的相互依赖由需求求值处理。
-初始化不调用普通函数体，除非某个初始化计算实际调用它。成功后冻结线性内存的 main
-边界，后续分配属于 work；执行阶段不重新启动初始化。
+初始化不调用普通函数体，除非某个初始化计算实际调用它。成功后固定语言堆的 main
+对象集合，后续语言对象属于 work。words/content 的冻结长度标识保留前缀；语言逻辑引用
+与分配器使用的线性内存地址不同。
+执行阶段不重新启动初始化。
 
-服务事件及测试边界进行精确 work copy-collect。根包括跨事件状态、闭包、待执行
-测试描述与必要缓存；遍历依据闭合类型布局，更新所有移动句柄，保留共享与环。
-main 引用保持稳定。线性内存允许保留高水位，但固定存活状态应复用 work 空间，
-不能以重建 session 或丢弃状态实现回收。
+Guest 使用 wasm32-unknown-unknown 标准库默认分配器，不自定义全局分配器。
+mem-alloc/realloc/free 只是把这套分配器暴露给 Host，与 Rust Vec/String 共用。
+语言小对象追加到零初始化 words Vec，引用使用逻辑偏移，避免每个标量触发一次标准分配；
+Host 缓冲区和 Rust 临时对象不经过这层语言对象存储。
+分类表的 payload 指向 words；Regex 等 Rust 资源独立持有。复制回收释放旧 words/content，
+不覆盖分配器元数据。释放允许分配器复用空间，不意味着 Wasm 线性内存缩页。
+
+初始化采用保守根集合进行 copy-collect；测试等显式保活边界继续支持 work copy-collect。
+遍历依据闭合类型布局，更新所有移动句柄，保留共享与环。冻结前缀引用保持稳定。
+正常服务请求没有需要延续的临时根，直接 truncate 请求后缀，复用容量而不重建实例。
+线性内存允许保留高水位；只有 trap/poisoned 状态使用初始化快照恢复。
 
 运行期数据的来源记录也参与回收：值、内联 enum payload、闭包及 Blame 的来源
 标记决定哪些记录仍存活。静态/初始化来源固定保留；动态来源从 RT 和 Host manifest
@@ -414,10 +456,13 @@ fixture 仅累计已接受的源文本字节作为粗略输入边界，保留展
 实例由静态 trait 证据选择。Plan 是内部 (sources, initializer)；initializer 返回捕获 Self
 的已类型化 handler，with_diagnostics 包装每次调用。Host 不解码 Self。
 
-当前 reset 复用 wasmi Module，创建新 store/instance，再恢复初始化后的线性内存及
-全部 mutable globals（包括 Rust stack pointer）。函数表由静态链接确定。
-不重复 codegen、数据加载或 init。请求临时值、trap 状态和来源登记随 reset 丢弃。
-该基线复制是首版实现，不是语言规定；后续可优化 reset 成本。
+正常完成请求后，reset-service 先释放请求 Regex 资源，再恢复分类表基线并 truncate
+words/content，保留容量；Host 恢复执行 globals、debug 游标和每次请求的 fuel。
+输出及 Host ABI 缓冲区必须先消费并释放。临时 parse 不登记请求来源，来源表保留
+初始化时的名称/BOLs。JSON writer 在普通语言失败路径也显式释放。
+只有 trap/poisoned 状态或清理本身失败时，才复用 wasmi Module 创建新 store/instance，
+恢复初始化快照及全部 mutable globals（包括 Rust stack pointer）。函数表固定。
+两条恢复路径都不重复 codegen、数据加载或 init；保留快照是异常恢复策略，不是旧值布局。
 
 ## 9. CLI## 9. CLI 与 LSP 的阶段边界
 
@@ -460,7 +505,7 @@ LSP 的 `mir_workspace` 把文档覆盖内容和磁盘清单送入同一静态�
 - seal 不隐藏未知、冲突或遗漏的泛型/构造证据，也不重新编号。
 - native 特殊身份来自声明的稳定标识，普通名称受 import、遮蔽和作用域规则约束。
 - 类型骨架不依赖 property 值，数据内容不进入静态求解。
-- 初始化覆盖整图并统一发布；共享和来源跨 World 复制后保持正确。
+- 初始化所选执行图的根并统一发布；移动回收保留共享、封闭类型身份和来源。
 - 构造校验覆盖新的合法值边界，不能用跳过检查换取性能。
 - query/LSP 可观察失败图，执行入口只能接受成功 seal 的图。
 
@@ -470,4 +515,7 @@ LSP 的 `mir_workspace` 把文档覆盖内容和磁盘清单送入同一静态�
 泛型实例以及构造/解码/更新边界。
 
 完整构建的确定性覆盖静态身份与所选执行闭包；Wasm 测试覆盖生成代码、初始化、
-数据来源和长期服务根。发布缓存、snapshot、引擎替换与进一步减少复制不属于当前路径。
+数据来源和长期服务根。普通 Wasm 制品由 `telora build` 发布；`telora-run` 使用 wasmi 独立加载、注入和初始化。
+两个 CLI 共用 `telora-run::transport` 的 JSONL/TCP HTTP/Unix socket HTTP 传输层，
+执行回调保持串行，各自执行入口负责 reset 和资源配额。HTTP 分帧由 Hyper 处理。
+持久化 snapshot、引擎替换与进一步减少复制不属于当前路径。
