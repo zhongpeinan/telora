@@ -87,6 +87,7 @@ pub(crate) struct Plan {
     pub checks: BTreeMap<usize, Key>,
     pub comparisons: BTreeMap<TypeId, Key>,
     pub parsers: BTreeMap<TypeId, Key>,
+    pub parser_evidence: BTreeMap<TypeId, usize>,
     pub reflection: Vec<u8>,
     pub origins: crate::value_origins::OriginConstants,
     pub native_signatures: BTreeSet<TypeId>,
@@ -117,6 +118,7 @@ impl Plan {
             checks: BTreeMap::new(),
             comparisons: BTreeMap::new(),
             parsers: BTreeMap::new(),
+            parser_evidence: BTreeMap::new(),
             reflection: vec![],
             origins: Default::default(),
             native_signatures: BTreeSet::new(),
@@ -207,7 +209,7 @@ impl Plan {
                 if matches!(mir.hir[root.node.index()].kind, HirKind::Interpreter)
                     || matches!(
                         crate::natives::identity(mir, root.node),
-                        Some((18, "property") | (17, "stringify_pretty"))
+                        Some((18, "property") | (17, "stringify_pretty") | (19, "parse_by"))
                     )
                 {
                     plan.functions.insert(
