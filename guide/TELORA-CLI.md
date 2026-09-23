@@ -2,35 +2,37 @@
 
 Telora CLI 及其运行时适配器共同充当运行时宿主（Host）：它们准备输入、执行纯数据入口并呈现诊断。
 
-workspace、crate manifest、模块清单和依赖来源的完整用法见
+workspace、crate manifest、模块树和依赖来源的完整用法见
 [`WORKSPACE.md`](WORKSPACE.md)。
 
 编译限制通过 workspace 配置的 `compiler` 设置，没有对应 CLI 参数。
-运行时 `runtime.fuel` 和 `runtime.memoryLimit` 分别默认 100 和 1024，单位为
-1,000,000 fuel 和 MiB（`1 << 20` 字节）。显式的 `--with-fuel N`、`--with-memory-limit N`
-逐项覆盖配置；未传入的项保留配置值。`--report-usage` 输出会话实际使用的上限和用量。
+运行时 `runtime.initializationFuel`、`runtime.requestFuel` 默认分别为 5000 和 1000（单位为
+1,000,000 fuel），`runtime.memoryLimit` 默认 64 MiB（每 MiB 为 `1 << 20` 字节）。
+`--initialization-fuel N` 与 `--request-fuel N` 分别直接覆盖对应预算，
+`--with-memory-limit N` 覆盖内存边界。构建时将最终预算写入 Wasm 制品。
+`--report-usage` 输出会话实际使用的上限和用量。
 
-每个 Telora crate 的模块位于 `src/`，测试位于 `tests/`。`telora-crate.json` 声明
-canonical crate name、模块清单和直接依赖名称；workspace 根的 `telora-config.json`
+每个 Telora crate 的模块树以 `src/lib.telora` 为根，测试位于 `tests/`。
+`telora-crate.json` 声明 canonical crate name 和直接依赖名称；workspace 根的 `telora-config.json`
 选择这些名称的唯一来源，`telora-lock.json` 固定完整包图。
 
 Telora 从当前目录向上查找最近的 `telora-config.json`，因此命令可以从 workspace 内
 任意目录执行。`-C` 可以显式改变查找的起始目录。`telora lock` 是唯一写入 lock 的
-命令；`build`、`eval`、`run`、`serve`、`test`、`check`、`query` 和 LSP 要求 lock 已存在且与配置一致。
+命令；`build`、`eval`、`run`、`test`、`check`、`query` 和 LSP 要求 lock 已存在且与配置一致。
 命令参数使用稳定逻辑模块 ID，不使用物理文件名：
 
 ```text
 telora -C examples/my-crate eval @src/model:answer
 telora -C examples/my-crate run @src/model < request.json
-telora -C examples/my-crate run @src/app < request.json
-telora -C examples/my-crate run @src/app --source knowledge=model.json < request.json
-telora -C examples/my-crate serve @src/app --bind stdio+jsonl://
+telora -C examples/my-crate run @src/lib < request.json
+telora -C examples/my-crate run @src/lib --source knowledge=model.json < request.json
+telora -C examples/my-crate run @src/lib --serve stdio+jsonl://
 telora -C examples/my-crate check @test/compiler
 telora -C examples/my-crate test compiler
 telora -C examples/my-crate test parser/expressions
 telora -C examples/my-crate query modules
-telora -C examples/my-crate query at @src/app
-telora -C examples/my-crate query at @src/compiler -k type,let,def,import
+telora -C examples/my-crate query at @src/lib
+telora -C examples/my-crate query at @src/compiler -k type,let,def,use
 telora -C examples/my-crate query exports @src/compiler
 telora -C examples/my-crate query at @src/compiler:12:3
 telora -C examples/my-crate query exports std/string
@@ -47,7 +49,7 @@ telora -C examples/my-crate check --tests
 telora -C examples/my-crate check --lib --tests --only-types
 ```
 
-`--lib` 选择清单中的全部模块，含私有模块与数据模块；`--tests` 递归选择 tests/ 下
+`--lib` 选择从 `src/lib.telora` 可达的全部模块，含私有模块与数据模块；`--tests` 递归选择 tests/ 下
 全部模块，含辅助模块，但不执行测试用例。两者可组合，与显式 MODULE_ID 互斥。
 多个根共用一次整图求解和初始化，空集合成功；summary 的 `roots` 列出按名称排序的根。
 任何静态错误都会阻止整图初始化，不提供每个目标独立的 summary。
@@ -58,36 +60,36 @@ telora -C examples/my-crate check --lib --tests --only-types
 后者为零。`check_seconds` 为这两个阶段之和，`catalog_seconds` 单独记录清单准备。
 
 `check` 的输入是完整模块或批量模块选择，不是任意表达式 scratch。模块顶层使用 `def` 声明
-计算根；需要执行或查询的公开接口显式 export。顶层 `let`、裸调用和 final expression 均不合法。
+计算根；需要执行或查询的公开接口使用 `pub` 或 `pub use`。顶层 `let`、裸调用和 final expression 均不合法。
 需要局部步骤时把它们放进 `do`：
 
 ```telora
-export def lowering_case: () = do {
+pub def lowering_case: () = do {
     let plan = lower(request);
     validate_plan(plan).unwrap!();
 };
 ```
 
 上述写法用于模块初始化诊断。行为测试应把被测计算放进 Test thunk，并用多个具名
-Test export 隔离用例；不要先在顶层计算断言再把结果包装成 Test。具体写法见
+Test 公开项隔离用例；不要先在顶层计算断言再把结果包装成 Test。具体写法见
 [测试最佳实践](TESTING.md)。
 
 `test NAME` 选择当前 crate 的 `tests/NAME.telora`，先完成模块检查和初始化，再执行
-入口直接公开导出的 `std/test.Test`。
-`NAME` 不带后缀，可以包含子目录；不接受绝对路径、`..`、通配符或 export selector。
-当前只支持显式选择一个测试入口（入口可以导出多个用例）。Host 先准备整个 `tests/` 的模块清单，再解析和求值从
-该入口可达的模块；测试模块可以相互 import，源码不能反向 import 测试。完整规则见
+入口直接公开导出的 `std/test::Test`。
+`NAME` 不带后缀，可以包含子目录；不接受绝对路径、`..`、通配符或公开项 selector。
+当前只支持显式选择一个测试入口（入口可以公开多个用例）。Host 先准备整个 `tests/` 的访问边界，再解析和求值从
+该入口可达的模块；测试模块可以相互引用，源码不能反向访问测试。完整规则见
 [`WORKSPACE.md`](WORKSPACE.md#test-root)。
 
 ```telora
-import "std/test" as test;
-import "std/value" {Value};
+use std::test as test;
+use std::value::{Value};
 
-export def accepts: test.Test = test.should_ok(fn() { 1 + 1 });
-export def rejects: test.Test = test.should_fail_with(fn() { fail!("expected rejection") }, "rejection");
-export def inputs: test.Test = test.with_fixtures(["fixtures/a.json", "fixtures/b.yaml"], fn(value) {
-    test.should_ok(fn() {
-        match value { Value.Object(_) => True, _ => fail!("expected object", value) }
+pub def accepts: test::Test = test::should_ok(fn() { 1 + 1 });
+pub def rejects: test::Test = test::should_fail_with(fn() { fail!("expected rejection") }, "rejection");
+pub def inputs: test::Test = test::with_fixtures(["fixtures/a.json", "fixtures/b.yaml"], fn(value) {
+    test::should_ok(fn() {
+        match value { Value::Object(_) => True, _ => fail!("expected object", value) }
     })
 });
 ```
@@ -96,7 +98,7 @@ export def inputs: test.Test = test.with_fixtures(["fixtures/a.json", "fixtures/
 `should_ok` 接受任何正常返回值，包括 `False` 和 `Err(...)`。`should_fail` 要求
 可恢复的执行失败；`should_fail_with` 还要求主错误消息包含非空、区分大小写的子串。
 通过的预期失败会被消费，warning 仍按用例报告；普通失败后继续执行其他用例。
-语法、类型、import 和模块初始化错误阻止全部用例执行。资源耗尽等终止错误会中止
+语法、类型、模块解析和初始化错误阻止全部用例执行。资源耗尽等终止错误会中止
 调用，不能作为预期失败通过。
 
 `with_fixtures` 的 factory 接收一个 sourced `Value` 并返回子 Test，可以返回嵌套
@@ -105,7 +107,7 @@ fixture 组。Host 在调用本组第一个 factory 前准备全部直接输入�
 fixture 支持 JSON/YAML/YML/TOML 路径和 `file+json://`、`file+yaml://`、
 `file+toml://`；不支持 stdin、网络或通配展开。路径相对实际调用 `with_fixtures`
 的模块，导入和重导出不改变基准；绝对路径和越过声明 crate 根的路径被拒绝。
-fixture 不产生 import 边，来源使用 `@test-ctx/<入口>/<导出名>/<索引路径>`，
+fixture 不产生模块边，来源使用 `@test-ctx/<入口>/<导出名>/<索引路径>`，
 入口和导出名分别进行 UTF-8 percent encoding。
 
 Test 按公开导出名排序，组内按数组顺序深度优先执行。显式重导出按入口的公开名称
@@ -129,9 +131,9 @@ stdout 使用 `telora.test/v2`：diagnostic 保留原有字段，并为用例增
 
 - `eval module:name` 读取 Value 导出。
 - `run module` 选择 MainService，读取 stdin JSON，输出一个 JSON Value。
-- `serve module --bind stdio+jsonl://` 持续处理 JSONL，响应含 ok/error/diagnostics；诊断保留
+- `run module --serve stdio+jsonl://` 持续处理 JSONL，响应含 ok/error/diagnostics；诊断保留
   severity、message、labels、notes。语言失败和请求配额耗尽不影响下一条请求。
-- `@service.source("name")` 声明初始化来源，--source 的名称集合须精确匹配。
+- `@service::source("name")` 声明初始化来源，--source 的名称集合须精确匹配。
   来源使用文件 JSON/YAML/TOML，stdin 保留给请求。逻辑来源为 @service/name。
   参见 [执行模式](EXEC-MODE.md)。
 - `telora -C context run module` 从 `context` 开始向上发现 workspace config，并以包含
@@ -140,7 +142,7 @@ stdout 使用 `telora.test/v2`：diagnostic 保留原有字段，并为用例增
   `--best-effort`，初始化失败不启动 Entry，不为诊断额外预执行用户代码。
 - `run`、`check` 和 `query` 的 `-C context` 都从 `context` 开始向上发现 workspace；
   `check` 和 `query` 接受完整稳定模块 ID，`check @test/...` 检查测试入口；`run` 和
-  `serve` 接受 `MODULE`。
+  `run` 接受 `MODULE`。
 - `check` 先完成全图模块、符号和类型求解及 seal，再编译并初始化；静态阶段不执行
   Telora 代码。静态错误阻止整图初始化。初始化可继续独立任务以收集诊断，但最终判定
   仍然严格。stdout 使用 `telora.check/v1` JSONL，先输出诊断，最后输出一份 summary；
@@ -149,7 +151,7 @@ stdout 使用 `telora.test/v2`：diagnostic 保留原有字段，并为用例增
   诊断另带 `initialization`：`module`、`node` 标识当时执行的初始化根，具名根还提供
   `symbol` 和 `name`；property 等非具名根的后两项为 null。这些 ID 属于本次封闭图。
   它记录实际触发，不是导入者或所有受影响导出的清单；缓存失败只报告原事件一次。
-  纯导出以 eval 验收；服务以 run/serve 验收。
+  纯导出以 eval 验收；服务以 `run` 或 `run --serve URI` 验收。
 - `query`（可见别名 `q`）输出 `telora.query/v1` JSONL 语义记录。`query modules`
   列出当前 crate 可见的规范模块 ID；`query exports <module>` 查询公共接口；
   `query at <module>` 查询顶层 local definitions，追加 `:<line>` 或 `:<line>:<column>`
@@ -158,14 +160,14 @@ stdout 使用 `telora.test/v2`：diagnostic 保留原有字段，并为用例增
   `check` 或 `run`。
 - `query modules` 列出本 crate 的 public/private source、dependency 的 public source
   和 public built-in；test 与 private built-in 不进入 catalog。
-- `query at std/...` 和 `query exports std/...` 直接查询内置标准库模块，与源码
-  `import "std/..."` 使用同一模块身份。resolver 在图发现前按 crate 粒度建立 first-win
-  清单，builtin `std` 先于 workspace 配置；后序同名 dependency 不能补充或改写它。
+- `query at std/...` 和 `query exports std/...` 直接查询内置标准库模块，与源码中的
+  `std::...` 静态路径使用同一身份。`std/lib.telora` 是标准库根，子模块由其中的
+  `pub mod` 按需发现；builtin `std` 先于 workspace 配置，后序同名依赖不能改写它。
 - `-p` 按名称的大小写敏感字面子串过滤，不是 glob 或正则。
-- `query at <module> -k` 接受逗号分隔的 `type,let,def,import`；公共接口使用独立的
+- `query at <module> -k` 接受逗号分隔的 `type,let,def,use`；公共接口使用独立的
   `query exports` 子命令查询。
-- Namespace import 的记录用 `target` 给出目标模块 ID，不带普通值 `type`；用
-  `query exports <target>` 查询其成员的精确 type/scheme。Selective import 的记录
+- Namespace `use` 的记录用 `target` 给出目标模块 ID，不带普通值 `type`；用
+  `query exports <target>` 查询其成员的精确 type/scheme。Selective `use` 的记录
   直接携带所选成员的精确 type/scheme。
 - `query at <module>:<line>[:<column>]` 的行号从 1 开始，列号从 0 开始并按 UTF-8
   byte 计数；输出范围同样采用 1-based line、0-based UTF-8 column 的半开区间。
@@ -175,8 +177,8 @@ stdout 使用 `telora.test/v2`：diagnostic 保留原有字段，并为用例增
 `output`。每个事件是一行紧凑 JSON：
 
 ```json
-{"name":"var","repr":"3","module":"@src/app","line":12}
-{"name":"plan","repr":"{...}","module":"@src/app","line":13,"message":"generated"}
+{"name":"var","repr":"3","module":"my-crate","line":12}
+{"name":"plan","repr":"{...}","module":"my-crate","line":13,"message":"generated"}
 ```
 
 固定字段为 `name`、`repr`、`module`、`line`；只有显式 message 时才有 `message`。
@@ -191,14 +193,14 @@ Telora 程序不可感知。Float 的 `repr` 使用 Debug 表示，例如 `3.0` 
 ## 构建制品与独立服务
 
 ```sh
-telora build @src/app -o app.wasm
+telora build @src/lib -o app.wasm
 telora-run app.wasm --source knowledge=model.json < request.json
-telora serve @src/app --source knowledge=model.json --bind http://127.0.0.1:8080
-telora-run app.wasm --source knowledge=model.json --bind http+unix:///tmp/telora.sock
+telora run @src/lib --source knowledge=model.json --serve http://127.0.0.1:8080
+telora-run app.wasm --source knowledge=model.json --serve http+unix:///tmp/telora.sock
 ```
 
-build 选择导出 MainService 的模块，输出普通 Wasm；运行时初始化数据通过
---source 提供。telora-run 不需要 workspace 和编译器，不传 --bind 时处理一个
-stdin JSON。--bind 支持 stdio+jsonl://、http://IP:PORT 和
-http+unix:///absolute/path.sock；HTTP 入口为 POST /transform。
+build 选择导出 `@service::collection` MainService struct 的模块，输出普通 Wasm；运行时初始化数据通过
+--source 提供。telora-run 不需要 workspace 和编译器，不传 --serve 时处理一个
+stdin JSON。--serve 支持 stdio+jsonl://、http://IP:PORT 和
+http+unix:///absolute/path.sock；HTTP 路由由集合字段的 `@http::get/post` 声明。
 完整生命周期、响应和配额说明见 [执行模式](EXEC-MODE.md)。

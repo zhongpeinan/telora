@@ -1,9 +1,9 @@
 //! Source execution through Wasm. The frontend stops at SealedExecutable.
-pub(crate) mod run;
-pub(crate) mod testing;
-mod test_fixtures;
 mod diagnostics;
 mod eval_contract;
+pub(crate) mod run;
+mod test_fixtures;
+pub(crate) mod testing;
 mod timing;
 use crate::static_input::Inventory;
 use std::path::PathBuf;
@@ -14,12 +14,18 @@ use telora_core::{
 };
 use timing::PhaseTimer;
 
-fn load_session(bytes: &[u8], runtime: telora_core::RuntimeOptions) -> Result<telora_wasm::session::Session, String> {
+fn load_session(
+    bytes: &[u8],
+    runtime: telora_core::RuntimeOptions,
+) -> Result<telora_wasm::session::Session, String> {
     timing::artifact_size(bytes.len());
     let config = crate::execution_config_for(runtime)?;
     let mut session = telora_wasm::session::Session::load_with_limits(
-        bytes, config.fuel, config.memory_limit,
+        bytes,
+        config.initialization_fuel,
+        config.memory_limit,
     )?;
+    session.set_request_fuel(config.request_fuel);
     if config.report_usage {
         session.usage_reporter = Some(|usage| {
             let _ = crate::emit_stderr(serde_json::json!({
@@ -47,7 +53,10 @@ pub(crate) fn error(message: impl Into<String>) -> Diagnostic {
     }
 }
 
-fn compile(executable: &SealedExecutable<'_>, runtime: telora_core::RuntimeOptions) -> Result<telora_wasm::session::Session, String> {
+fn compile(
+    executable: &SealedExecutable<'_>,
+    runtime: telora_core::RuntimeOptions,
+) -> Result<telora_wasm::session::Session, String> {
     let bytes = {
         let _timer = PhaseTimer::new("codegen_link");
         telora_wasm::compile_executable(executable)?
@@ -92,7 +101,9 @@ fn compile_modules(
             .collect::<Vec<_>>()
             .join("\n")
     })?;
-    if !check { return compile(&executable, runtime); }
+    if !check {
+        return compile(&executable, runtime);
+    }
     let bytes = {
         let _timer = PhaseTimer::new("codegen_link");
         telora_wasm::compile_check(&executable)?
@@ -107,7 +118,11 @@ pub(crate) fn initialize(
     sources: &mut telora_core::SourceDatabase,
 ) -> Result<(), String> {
     initialize_diagnostics(session, inventory, sources).map_err(|diagnostics| {
-        diagnostics.iter().map(|d| sources.render(d)).collect::<Vec<_>>().join("\n")
+        diagnostics
+            .iter()
+            .map(|d| sources.render(d))
+            .collect::<Vec<_>>()
+            .join("\n")
     })
 }
 
@@ -117,7 +132,9 @@ pub(crate) fn initialize_diagnostics(
     sources: &mut telora_core::SourceDatabase,
 ) -> Result<(), Vec<Diagnostic>> {
     let timer = PhaseTimer::new("data_input");
-    session.set_debug_enabled(true).map_err(|e| vec![error(e)])?;
+    session
+        .set_debug_enabled(true)
+        .map_err(|e| vec![error(e)])?;
     let mut diagnostics = vec![];
     let mut prepared = vec![];
     for module in session.manifest.data_modules.clone() {
@@ -126,30 +143,46 @@ pub(crate) fn initialize_diagnostics(
             crate::execution_config().data_limits.file_size,
         ) {
             Ok(data) => data,
-            Err(message) => { diagnostics.push(error(message)); continue; }
+            Err(message) => {
+                diagnostics.push(error(message));
+                continue;
+            }
         };
         let source = sources
             .try_add_data(module.name, text)
             .map_err(|e| vec![error(e.to_string())])?;
-        let value = match session.parse_data_source(sources.get(source), format)
-            .map_err(|e| vec![error(e)])? {
+        let value = match session
+            .parse_data_source(sources.get(source), format)
+            .map_err(|e| vec![error(e)])?
+        {
             Ok(value) => value,
             Err(errors) => {
-                diagnostics.extend(diagnostics::parsed(errors, sources).map_err(|e| vec![error(e)])?);
+                diagnostics
+                    .extend(diagnostics::parsed(errors, sources).map_err(|e| vec![error(e)])?);
                 continue;
             }
         };
         prepared.push((module.symbol, value));
     }
-    if !diagnostics.is_empty() { return Err(diagnostics); }
+    if !diagnostics.is_empty() {
+        return Err(diagnostics);
+    }
     for (symbol, value) in prepared {
-        session.inject_data_value(symbol, value).map_err(|e| vec![error(e)])?;
+        session
+            .inject_data_value(symbol, value)
+            .map_err(|e| vec![error(e)])?;
     }
     drop(timer);
     let _timer = PhaseTimer::new("initialize");
     let result = session.initialize();
-    if result.is_ok() { timing::initialization_heap(session).map_err(|e| vec![error(e)])?; }
-    if result.is_err() { Err(check_diagnostics(session, sources, result)) } else { Ok(()) }
+    if result.is_ok() {
+        timing::initialization_heap(session).map_err(|e| vec![error(e)])?;
+    }
+    if result.is_err() {
+        Err(check_diagnostics(session, sources, result))
+    } else {
+        Ok(())
+    }
 }
 
 pub(crate) fn check_diagnostics(
@@ -163,7 +196,35 @@ pub(crate) fn check_diagnostics(
     };
     if let Err(message) = result {
         if !diagnostics.iter().any(|d| d.severity == Severity::Error) {
-            diagnostics.push(error(message));
+            let mut diagnostic = error(message);
+            if let Ok(Some(root)) = session.active_initialization_root() {
+                let coordinates = telora_core::source::SourceCoordinates(root.origin);
+                if let Some(location) = sources
+                    .files()
+                    .find(|file| file.id().get() == coordinates.source())
+                    .and_then(|file| file.byte_location(coordinates))
+                {
+                    diagnostic.labels.push(telora_core::source::Label {
+                        location,
+                        message: match root.name {
+                            Some(name) => format!("while initializing {name}"),
+                            None => format!("while initializing MIR node {}", root.node),
+                        },
+                        primary: true,
+                    });
+                }
+                diagnostic.notes.push(format!(
+                    "initialization root: {}#{}",
+                    root.module, root.node
+                ));
+            }
+            if let Ok(usage) = session.arena_usage() {
+                diagnostic.notes.push(format!(
+                    "language arenas: words={} bytes, content={} bytes",
+                    usage.words, usage.content
+                ));
+            }
+            diagnostics.push(diagnostic);
         }
     }
     diagnostics

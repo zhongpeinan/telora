@@ -12,27 +12,44 @@ pub(crate) struct Output<'a> {
 
 impl Output<'_> {
     pub(crate) fn location_words(&self, pointer: u64) -> Result<[u32; 5], String> {
-        Ok(self.location([self.word(pointer)?, self.word(pointer + 4)?, self.word(pointer + 8)?])?.unwrap_or([0; 5]))
+        let bytes: [u8; 8] = self.bytes(pointer, 8)?.try_into().unwrap();
+        let range =
+            telora_wasm_shared::source_range::SourceRange::unpack(u64::from_le_bytes(bytes))
+                .ok_or("Wasm: invalid packed origin")?;
+        Ok(self
+            .location([range.source, range.start, range.end])?
+            .unwrap_or([0; 5]))
     }
 
     pub(crate) fn location(&self, range: [u32; 3]) -> Result<Option<[u32; 5]>, String> {
         let [id, start, end] = range;
         if id == 0 {
-            return if start == 0 && end == 0 { Ok(None) } else { Err("Wasm: invalid empty origin".into()) };
+            return if start == 0 && end == 0 {
+                Ok(None)
+            } else {
+                Err("Wasm: invalid empty origin".into())
+            };
         }
-        if start > end { return Err("Wasm: invalid source range".into()); }
+        if start > end {
+            return Err("Wasm: invalid source range".into());
+        }
         let registry = self.word(SOURCE_REGISTRY as u64)? as u64;
         let count = self.word(SOURCE_REGISTRY as u64 + 4)?;
         let mut index = None;
         for i in 0..count {
             let record = registry + u64::from(i) * 20;
             if self.raw_word(record)? == id {
-                index = Some((self.raw_word(record + 12)? as u64, self.raw_word(record + 16)?));
+                index = Some((
+                    self.raw_word(record + 12)? as u64,
+                    self.raw_word(record + 16)?,
+                ));
                 break;
             }
         }
         let (lines, count) = index.ok_or("Wasm: missing source metadata")?;
-        if count == 0 { return Err("Wasm: missing source index".into()); }
+        if count == 0 {
+            return Err("Wasm: missing source index".into());
+        }
         self.raw_bytes(lines, u64::from(count) * 8)?;
         let point = |byte: u32| -> Result<(u32, u32), String> {
             if byte > self.raw_word(lines + u64::from(count - 1) * 8 + 4)? {
@@ -41,8 +58,11 @@ impl Output<'_> {
             let (mut lo, mut hi) = (0, count);
             while lo < hi {
                 let mid = lo + (hi - lo) / 2;
-                if self.raw_word(lines + u64::from(mid) * 8)? <= byte { lo = mid + 1; }
-                else { hi = mid; }
+                if self.raw_word(lines + u64::from(mid) * 8)? <= byte {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
             }
             let line = lo.checked_sub(1).ok_or("Wasm: invalid source index")?;
             let start = self.raw_word(lines + u64::from(line) * 8)?;
@@ -55,9 +75,6 @@ impl Output<'_> {
     }
 
     pub(crate) fn field(&self, pointer: u64, ty: u32, name: &str) -> Result<(u32, u32), String> {
-        if self.word(pointer + TYPE)? != ty {
-            return Err("Wasm: record type differs from sealed contract".into());
-        }
         let desc = self
             .manifest
             .types
@@ -86,17 +103,27 @@ impl Output<'_> {
     }
     pub(crate) fn address(&self, reference: u64, length: u64) -> Result<u64, String> {
         let origin = u64::from(self.raw_word(u64::from(WORDS_ORIGIN))?);
-        if reference < origin { return Ok(reference); }
-        let offset = reference - origin;
-        let end = offset.checked_add(length).ok_or("Wasm: heap range overflow")?;
-        if end > u64::from(self.raw_word(u64::from(WORDS_VIEW + 4))?) {
-            return Err("Wasm: reference exceeds language heap".into());
+        if reference < origin {
+            return Ok(reference);
         }
-        u64::from(self.raw_word(u64::from(WORDS_VIEW))?).checked_add(offset)
+        let offset = reference - origin;
+        let end = offset
+            .checked_add(length)
+            .ok_or("Wasm: heap range overflow")?;
+        let heap_length = u64::from(self.raw_word(u64::from(WORDS_VIEW + 4))?);
+        if end > heap_length {
+            return Err(format!(
+                "Wasm: reference {reference}+{length} exceeds language heap origin {origin} length {heap_length}"
+            ));
+        }
+        u64::from(self.raw_word(u64::from(WORDS_VIEW))?)
+            .checked_add(offset)
             .ok_or_else(|| "Wasm: heap address overflow".into())
     }
     pub(crate) fn raw_word(&self, address: u64) -> Result<u32, String> {
-        Ok(u32::from_le_bytes(self.raw_bytes(address, 4)?.try_into().unwrap()))
+        Ok(u32::from_le_bytes(
+            self.raw_bytes(address, 4)?.try_into().unwrap(),
+        ))
     }
     pub(crate) fn raw_bytes(&self, address: u64, length: u64) -> Result<&[u8], String> {
         let end = address
@@ -115,6 +142,37 @@ impl Output<'_> {
         ))
     }
     pub(crate) fn payload(&self, table: u32, id: u32) -> Result<(u64, u64), String> {
+        if matches!(table, RECORDS | VALUES | NEWTYPES) {
+            let pointer = u64::from(id);
+            let bytes = u64::from(self.word(pointer + 4)?);
+            self.bytes(pointer + 8, bytes)?;
+            return Ok((pointer + 8, bytes));
+        }
+        if table == ARRAYS {
+            let pointer = u64::from(id);
+            let ty = self.word(pointer)?;
+            let data = u64::from(self.word(pointer + 4)?);
+            let length = self.word(pointer + 8)?;
+            let capacity = self.word(pointer + 12)?;
+            if length > capacity {
+                return Err("Wasm: array length exceeds capacity".into());
+            }
+            let width = self
+                .manifest
+                .types
+                .get(ty as usize)
+                .ok_or("Wasm: invalid array element TypeId")?
+                .bytes;
+            let bytes = length
+                .checked_mul(width)
+                .ok_or("Wasm: array size overflow")?;
+            self.bytes(data, bytes.into()).map_err(|error| {
+                format!(
+                    "{error}; array object={id} element_type={ty} data={data} len={length} cap={capacity} width={width}"
+                )
+            })?;
+            return Ok((data, bytes.into()));
+        }
         let descriptor = table_address(table) as u64;
         if id >= self.word(descriptor + 4)? {
             return Err("Wasm: output has invalid HeapId".into());
@@ -125,12 +183,6 @@ impl Output<'_> {
     pub fn json(&self, pointer: u64, expected: u32, depth: usize) -> Result<Value, String> {
         if depth > 512 {
             return Err("Wasm: JSON output nesting limit".into());
-        }
-        if self.word(pointer + TYPE)? != expected {
-            return Err(format!(
-                "Wasm: output at {pointer} has type {}, expected {expected}",
-                self.word(pointer + TYPE)?
-            ));
         }
         let ty = self
             .manifest
@@ -152,7 +204,10 @@ impl Output<'_> {
             }
             Kind::String => self.text(pointer)?.into(),
             Kind::Array => {
-                let (base, bytes) = self.payload(ARRAYS, self.word(pointer + DATA)?)?;
+                let object = self.word(pointer + DATA)?;
+                let (base, bytes) = self.payload(ARRAYS, object).map_err(|error| {
+                    format!("{error}; Array value={pointer} type={expected} object={object}")
+                })?;
                 let start = self.word(pointer + DATA + 4)? as u64;
                 let end = self.word(pointer + DATA + 8)? as u64;
                 let element = *ty
@@ -253,7 +308,9 @@ impl Output<'_> {
                             payload.ok_or("Wasm: semantic Value payload missing")?
                         }
                         "LocalDate" | "LocalTime" | "LocalDateTime" | "OffsetDateTime" => {
-                            return Err("JSON cannot encode temporal values; use a codec first".into());
+                            return Err(
+                                "JSON cannot encode temporal values; use a codec first".into()
+                            );
                         }
                         "Bytes" => {
                             return Err("Value.Bytes cannot be emitted as semantic JSON".into());
@@ -301,7 +358,12 @@ impl Output<'_> {
                 let start = u64::from(self.word(pointer + DATA)?);
                 let end = u64::from(self.word(pointer + DATA + 4)?);
                 let raw = u64::from(self.word(pointer + DATA + 8)?);
-                if raw > start || start > end || end > length || end - start < 16 || header[12..15] != [0; 3] {
+                if raw > start
+                    || start > end
+                    || end > length
+                    || end - start < 16
+                    || header[12..15] != [0; 3]
+                {
                     return Err("Wasm: invalid content slice".into());
                 }
                 self.raw_bytes(base + start, end - start)

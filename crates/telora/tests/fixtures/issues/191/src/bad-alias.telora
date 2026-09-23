@@ -1,2 +1,0 @@
-type Text = Missing(String);
-export def bad: Text = {};

@@ -23,10 +23,30 @@ pub(crate) unsafe fn collect_initialization(gc: &mut crate::collect::Collector) 
     unsafe {
         if let Some(service) = (&mut *core::ptr::addr_of_mut!(SERVICE)).as_mut() {
             assert!(service.phase == Phase::Ready);
-            service.handler = gc.value(service.handler);
+            service.handler = gc.value(service.handler, service.contract.handler_type);
             service.initializer = 0;
             inputs::release_initialization_values();
         }
+    }
+}
+
+pub(crate) unsafe fn snapshot() -> u32 {
+    unsafe {
+        let service = service();
+        assert!(service.phase == Phase::Ready);
+        service.handler
+    }
+}
+
+pub(crate) unsafe fn restore(handler: u32) {
+    unsafe {
+        let service = service();
+        assert!(matches!(service.phase, Phase::Unprepared));
+        service.phase = Phase::Ready;
+        service.initializer = 0;
+        service.handler = handler;
+        service.errors.clear();
+        service.parse_errors.clear();
     }
 }
 
@@ -71,7 +91,7 @@ unsafe fn prepare() -> bool {
         if initialize() == 0 { service().phase = Phase::Failed; return false; }
         let plan = entry();
         if plan == 0 { service().phase = Phase::Failed; return false; }
-        let fields = word(tables::telora_table_get(table_address(RECORDS), word(plan, DATA)), 0);
+        let fields = word(plan, DATA).checked_add(8).unwrap();
         inputs::telora_service_sources_prepare(fields + contract.names_offset);
         service().initializer = fields + contract.initializer_offset;
         service().phase = Phase::Prepared;
@@ -129,7 +149,8 @@ pub unsafe extern "C" fn create() -> i32 {
             return 1;
         }
         let context = inputs::context::telora_service_context(contract.context_type,
-            contract.dict_type, contract.value_bytes, contract.sources_offset);
+            contract.dict_type, contract.value_bytes, contract.sources_offset,
+            contract.string_type, contract.value_type);
         if context == 0 { return 1; }
         let args = crate::telora_alloc(8);
         crate::heap::write(args, context);

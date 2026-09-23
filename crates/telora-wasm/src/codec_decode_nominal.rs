@@ -13,25 +13,12 @@ impl Emitter<'_> {
         target: TypeId,
         input: u32,
     ) -> Result<u32, String> {
-        let decode_property = crate::codec_properties::decode_by_parse_property(self.mir);
-        let encode_property = crate::codec_properties::encode_by_display_property(self.mir);
-        let decode = crate::codec_properties::has_property(self.mir, target, decode_property);
-        let encode = crate::codec_properties::has_property(self.mir, target, encode_property);
-        if decode != encode {
-            self.codec_error(
-                input,
-                "std/string.decode_by_parse and std/string.encode_by_display must be used together",
-            )?;
-            return Ok(self.local(wasm_encoder::ValType::I32));
-        }
-        if decode {
-            self.codec_property_value_exact(target, decode_property.unwrap())?;
-            self.codec_property_value_exact(target, encode_property.unwrap())?;
+        if self.plan.parse_codecs.contains(&target) {
             return self.codec_decode_text(source, target, input);
         }
         // Validate rename metadata even for a newtype, then decode its payload.
         let rename = self.codec_rename(target, input)?;
-        let untagged = self.codec_property_value(target, 2)?;
+        let untagged = self.codec_untagged(target)?;
         let layout = &self.plan.layouts[target.index()];
         if !layout.variants.is_empty() {
             self.extend([I::LocalGet(untagged), I::If(BlockType::Empty)]);
@@ -76,7 +63,7 @@ impl Emitter<'_> {
             decoded,
             Some(error),
         )?;
-        let id = self.table_push(NEWTYPES, decoded, self.width(inner)?);
+        let id = self.table_push(NEWTYPES, decoded, self.width(inner)?, Some(target))?;
         let value = self.value_as(self.key.node, target, self.width(target)?)?;
         self.copy(value, 0, input, LOC_BYTES);
         self.extend([
@@ -112,12 +99,7 @@ impl Emitter<'_> {
         let path = self.read32(0, 24);
         let error = self.read32(0, 28);
         let context = self.alloc(24);
-        for (offset, value) in [
-            (4, path),
-            (8, error),
-            (16, input),
-            (20, error),
-        ] {
+        for (offset, value) in [(4, path), (8, error), (16, input), (20, error)] {
             self.extend([
                 I::LocalGet(context),
                 I::LocalGet(value),

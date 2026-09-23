@@ -60,14 +60,14 @@ impl Emitter<'_> {
                     ..self.key
                 },
                 args[1],
-                &[indent],
+                &[(indent, args[0])],
             );
         }
         let indent = self.local(ValType::I32);
         if name == "stringify_pretty" {
             self.extend([
                 I::LocalGet(0),
-                I::I32Load(memory(0, 2)),
+                I::I32Load(memory(8, 2)),
                 I::I32Load(memory(DATA, 2)),
                 I::LocalSet(indent),
             ]);
@@ -143,7 +143,8 @@ impl Emitter<'_> {
                 "Array" | "Object" => {
                     let object = branch == "Object";
                     let payload = self.enum_payload(ty, index as u32, 1)?;
-                    let base = self.table_data(ARRAYS, payload, if object { DATA + 8 } else { DATA });
+                    let base =
+                        self.table_data(ARRAYS, payload, if object { DATA + 8 } else { DATA });
                     let keys = if object {
                         Some(self.table_data(ARRAYS, payload, DATA))
                     } else {

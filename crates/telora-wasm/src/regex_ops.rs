@@ -27,7 +27,7 @@ impl Emitter<'_> {
                         ..self.key
                     },
                     args[1],
-                    &[pattern],
+                    &[(pattern, args[0])],
                 );
             }
             if args.len() != 3
@@ -39,7 +39,7 @@ impl Emitter<'_> {
             let pattern = self.local(ValType::I32);
             self.extend([
                 I::LocalGet(0),
-                I::I32Load(memory(0, 2)),
+                I::I32Load(memory(8, 2)),
                 I::LocalSet(pattern),
             ]);
             return self.packed_tuple(args[2], &[pattern]);

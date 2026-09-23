@@ -51,7 +51,8 @@ impl Emitter<'_> {
             Some((18, "property")) => self.property_factory(),
             Some((
                 25,
-                name @ ("get_type_prop" | "get_field_prop" | "get_variant_prop" | "evidence"),
+                name @ ("get_type_prop" | "get_field_prop" | "get_variant_prop" | "evidence"
+                | "required" | "optional"),
             )) => self.property_query(name),
             other => Err(format!("Wasm: native ABI not implemented: {other:?}")),
         }
@@ -73,7 +74,7 @@ impl Emitter<'_> {
                     ..self.key
                 },
                 output,
-                &[target],
+                &[(target, args[0])],
             );
         }
         if args.len() != 3
@@ -99,7 +100,7 @@ impl Emitter<'_> {
         let target = self.local(ValType::I32);
         self.extend([
             I::LocalGet(0),
-            I::I32Load(memory(0, 2)),
+            I::I32Load(memory(8, 2)),
             I::I32Load(memory(DATA, 2)),
             I::LocalSet(target),
         ]);
@@ -140,7 +141,7 @@ impl Emitter<'_> {
             I::LocalGet(bits),
             I::I64Store(memory(DATA, 3)),
         ]);
-        let id = self.table_push(RECORDS, field, self.width(integer)?);
+        let id = self.table_push(RECORDS, field, self.width(integer)?, Some(output))?;
         let result = self.value_as(node, output, self.width(output)?)?;
         self.extend([
             I::LocalGet(result),

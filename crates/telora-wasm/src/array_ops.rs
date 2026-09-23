@@ -50,7 +50,17 @@ impl Emitter<'_> {
         count: u32,
         width: u32,
     ) -> Result<u32, String> {
-        self.array_result_at(self.key.node, ty, data, count, width)
+        self.array_result_at(self.key.node, ty, data, count, count, width)
+    }
+    pub fn array_result_with_capacity(
+        &mut self,
+        ty: TypeId,
+        data: u32,
+        count: u32,
+        capacity: u32,
+        width: u32,
+    ) -> Result<u32, String> {
+        self.array_result_at(self.key.node, ty, data, count, capacity, width)
     }
     pub fn array_result_at(
         &mut self,
@@ -58,18 +68,11 @@ impl Emitter<'_> {
         ty: TypeId,
         data: u32,
         count: u32,
-        width: u32,
+        capacity: u32,
+        _width: u32,
     ) -> Result<u32, String> {
-        let id = self.local(ValType::I32);
-        self.extend([
-            I::I32Const(table_address(ARRAYS) as i32),
-            I::LocalGet(data),
-            I::LocalGet(count),
-            I::I32Const(width as i32),
-            I::I32Mul,
-            I::Call(TABLE_PUSH),
-            I::LocalSet(id),
-        ]);
+        let element = self.mir.types[ty.index()].arguments[0];
+        let id = self.array_object(data, count, capacity, element)?;
         let result = self.value_as(node, ty, self.width(ty)?)?;
         self.extend([
             I::LocalGet(result),
@@ -135,7 +138,7 @@ impl Emitter<'_> {
             return self.enum_value(node, output, 1, Some(item));
         }
         if matches!(name, "push" | "enumerate" | "zip" | "concat" | "flat_map") {
-            return self.array_build(name, args, base, count, width);
+            return self.array_build(name, args, value, base, count, width);
         }
         if !matches!(
             name,
@@ -244,7 +247,10 @@ impl Emitter<'_> {
             I::End,
         ]);
         match name {
-            "map" | "filter" => self.array_result(output, data.unwrap(), used, output_width),
+            "map" => self.array_result(output, data.unwrap(), used, output_width),
+            "filter" => {
+                self.array_result_with_capacity(output, data.unwrap(), used, count, output_width)
+            }
             "fold" => Ok(accumulator.unwrap()),
             "fold_control" => self.enum_value(node, output, 1, accumulator),
             "find" => self.enum_value(node, output, 0, None),

@@ -3,22 +3,24 @@ use serde_json::json;
 use std::env;
 use std::path::PathBuf;
 use telora_core::DataLimits;
-mod eval_cli;
 mod build_cli;
-mod wasm_cli;
+mod eval_cli;
 mod source_arg;
 mod static_cli;
+mod wasm_cli;
 use telora::static_input;
 mod test_cli;
 use eval_cli::EvalArgs;
 use source_arg::{NamedSource, parse_named_source};
 use telora::package_host;
 
-static EXECUTION_OPTIONS: std::sync::OnceLock<(Option<u64>, Option<u64>, bool)> = std::sync::OnceLock::new();
+static EXECUTION_OPTIONS: std::sync::OnceLock<(Option<u64>, Option<u64>, Option<u64>, bool)> =
+    std::sync::OnceLock::new();
 const QUERY_SCHEMA: &str = "telora.query/v1";
 
 struct ExecutionConfig {
-    fuel: u64,
+    initialization_fuel: u64,
+    request_fuel: u64,
     memory_limit: usize,
     report_usage: bool,
     data_limits: DataLimits,
@@ -28,13 +30,25 @@ fn execution_config() -> ExecutionConfig {
     execution_config_for(telora_core::RuntimeOptions::default()).expect("validated CLI limits")
 }
 
-fn execution_config_for(mut runtime: telora_core::RuntimeOptions) -> Result<ExecutionConfig, String> {
-    let (fuel, memory, report_usage) = *EXECUTION_OPTIONS.get().unwrap_or(&(None, None, false));
-    if let Some(fuel) = fuel { runtime.fuel = fuel; }
-    if let Some(memory) = memory { runtime.memory_limit = memory; }
-    let (fuel, memory_limit) = runtime.limits()?;
+fn execution_config_for(
+    mut runtime: telora_core::RuntimeOptions,
+) -> Result<ExecutionConfig, String> {
+    let (initialization_fuel, request_fuel, memory, report_usage) = *EXECUTION_OPTIONS
+        .get()
+        .unwrap_or(&(None, None, None, false));
+    if let Some(fuel) = initialization_fuel {
+        runtime.initialization_fuel = fuel;
+    }
+    if let Some(fuel) = request_fuel {
+        runtime.request_fuel = fuel;
+    }
+    if let Some(memory) = memory {
+        runtime.memory_limit = memory;
+    }
+    let (initialization_fuel, request_fuel, memory_limit) = runtime.limits()?;
     Ok(ExecutionConfig {
-        fuel,
+        initialization_fuel,
+        request_fuel,
         memory_limit,
         report_usage,
         data_limits: DataLimits::default(),
@@ -43,7 +57,13 @@ fn execution_config_for(mut runtime: telora_core::RuntimeOptions) -> Result<Exec
 
 fn main() {
     let cli = Cli::parse();
-    EXECUTION_OPTIONS.set((cli.with_fuel, cli.with_memory_limit, cli.report_usage))
+    EXECUTION_OPTIONS
+        .set((
+            cli.initialization_fuel,
+            cli.request_fuel,
+            cli.with_memory_limit,
+            cli.report_usage,
+        ))
         .expect("execution configuration is initialized once");
     match run_cli(cli) {
         Ok(0) => {}
@@ -63,9 +83,12 @@ fn main() {
 #[derive(Parser)]
 #[command(name = "telora", version, about = "The Telora language toolchain")]
 struct Cli {
-    /// Session fuel budget in millions (1 = 1,000,000 fuel).
+    /// Initialization fuel budget in millions (1 = 1,000,000 fuel).
     #[arg(long, global = true, value_parser = clap::value_parser!(u64).range(1..=u64::MAX / 1_000_000))]
-    with_fuel: Option<u64>,
+    initialization_fuel: Option<u64>,
+    /// Request fuel budget in millions (1 = 1,000,000 fuel).
+    #[arg(long, global = true, value_parser = clap::value_parser!(u64).range(1..=u64::MAX / 1_000_000))]
+    request_fuel: Option<u64>,
     /// Wasm linear memory limit in MiB (1 = 1,048,576 bytes).
     #[arg(long, global = true, value_parser = clap::value_parser!(u64).range(1..=(usize::MAX as u64) / (1 << 20)))]
     with_memory_limit: Option<u64>,
@@ -85,10 +108,8 @@ enum Command {
     Build(build_cli::BuildArgs),
     /// Evaluate one exported Value without an Entry or effect system.
     Eval(EvalArgs),
-    /// Transform one JSON input using the module's MainService.
+    /// Transform JSON input using the module's MainService.
     Run(RunArgs),
-    /// Transform JSONL requests using the module's MainService.
-    Serve(ServeArgs),
     /// Resolve package sources and rewrite telora-lock.json.
     Lock,
     /// Check modules through type closure or initialization and emit JSONL diagnostics.
@@ -106,6 +127,9 @@ enum Command {
 struct RunArgs {
     #[command(flatten)]
     application: ApplicationArgs,
+    /// Serve stdio+jsonl://, http://IP:PORT or http+unix:///absolute/path.sock.
+    #[arg(long, value_name = "URI")]
+    serve: Option<telora_run::transport::Bind>,
 }
 
 #[derive(Args)]
@@ -115,16 +139,6 @@ struct ApplicationArgs {
     /// Provide a named Value source: NAME=PATH or NAME=(file|stdin)+(json|yaml|toml)://PATH.
     #[arg(long = "source", value_name = "NAME=SOURCE", value_parser = parse_named_source)]
     sources: Vec<NamedSource>,
-
-}
-
-#[derive(Args)]
-struct ServeArgs {
-    #[command(flatten)]
-    application: ApplicationArgs,
-    /// Serve stdio+jsonl://, http://IP:PORT or http+unix:///absolute/path.sock.
-    #[arg(long, value_name = "URI")]
-    bind: telora_run::transport::Bind,
 }
 
 #[derive(Args)]
@@ -213,7 +227,7 @@ struct QueryAtArgs {
     /// Filter local symbol names by a literal substring; invalid with a position.
     #[arg(short = 'p', long = "pattern", value_name = "SUBSTRING", value_parser = non_empty)]
     pattern: Option<String>,
-    /// Query only these definition kinds: type, let, def, import.
+    /// Query only these definition kinds: type, let, def, use.
     #[arg(short = 'k', long = "kind", value_name = "KINDS", value_parser = parse_kinds)]
     kinds: Option<KindSet>,
 }
@@ -223,7 +237,7 @@ enum ShowKind {
     Type,
     Let,
     Def,
-    Import,
+    Use,
 }
 
 #[derive(Clone)]
@@ -254,7 +268,7 @@ fn parse_kinds(value: &str) -> Result<KindSet, String> {
             "type" => Ok(ShowKind::Type),
             "let" => Ok(ShowKind::Let),
             "def" => Ok(ShowKind::Def),
-            "import" => Ok(ShowKind::Import),
+            "use" => Ok(ShowKind::Use),
             _ => Err(format!("unknown definition kind {item:?}")),
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -301,8 +315,9 @@ fn run_cli(cli: Cli) -> Result<i32, String> {
     match cli.command {
         Command::Build(arguments) => build_cli::execute(context, arguments),
         Command::Eval(arguments) => eval_cli::run(context, arguments),
-        Command::Run(arguments) => wasm_cli::run::execute(context, arguments.application, None),
-        Command::Serve(arguments) => wasm_cli::run::execute(context, arguments.application, Some(arguments.bind)),
+        Command::Run(arguments) => {
+            wasm_cli::run::execute(context, arguments.application, arguments.serve)
+        }
         Command::Lock => package_host::lock(&context)
             .and_then(|path| emit(json!(display_host_path(&path))).map(|()| 0)),
         Command::Check(arguments) => check_command(context, arguments, "telora.check/v1"),
@@ -346,7 +361,7 @@ fn kind_name(kind: ShowKind) -> &'static str {
         ShowKind::Type => "type",
         ShowKind::Let => "let",
         ShowKind::Def => "def",
-        ShowKind::Import => "import",
+        ShowKind::Use => "use",
     }
 }
 fn emit(record: serde_json::Value) -> Result<(), String> {

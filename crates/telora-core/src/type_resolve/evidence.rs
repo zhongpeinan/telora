@@ -7,6 +7,34 @@ mod queue;
 mod tests;
 
 impl Solver<'_> {
+    fn from_dyn_fields_trait(&self, trait_type: TypeId) -> bool {
+        let TypeConstructor::Nominal(symbol) = self.mir.types[trait_type.index()].constructor
+        else {
+            return false;
+        };
+        let definition = &self.mir.symbols[symbol.index()];
+        definition.name == "FromDynFields"
+            && definition.module.is_some_and(|module| {
+                self.mir.modules[module.index()]
+                    .native
+                    .as_ref()
+                    .is_some_and(|native| native.id == 2)
+            })
+    }
+
+    fn from_dyn_fields_subject(&self, subject: TypeId) -> bool {
+        let TypeConstructor::Nominal(symbol) = self.mir.types[subject.index()].constructor else {
+            return false;
+        };
+        self.mir.type_definitions.iter().any(|definition| {
+            definition.symbol == symbol
+                && matches!(
+                    definition.operation,
+                    TypeOperation::Struct | TypeOperation::Newtype
+                )
+        })
+    }
+
     pub(super) fn is_trait(&self, symbol: SymbolId) -> bool {
         self.mir.symbols[symbol.index()].kind == SymbolKind::Declaration(BindingKind::Trait)
     }
@@ -28,6 +56,21 @@ impl Solver<'_> {
                 ));
                 continue;
             }
+            if self.from_dyn_fields_trait(trait_type)
+                && self.mir.symbols[index].module.is_none_or(|module| {
+                    self.mir.modules[module.index()]
+                        .native
+                        .as_ref()
+                        .is_none_or(|native| native.id != 2)
+                })
+            {
+                let declaration = self.mir.symbols[index].declarations[0];
+                self.mir.diagnostics.push(Diagnostic::error(
+                    "FromDynFields is a compiler-owned trait and cannot be implemented by user code",
+                    self.mir.hir[declaration.index()].location,
+                ));
+                continue;
+            }
             let mut requirements = vec![];
             for &parameter in &self.mir.symbol_generics[index] {
                 for &declaration in &self.mir.symbols[parameter.index()].declarations {
@@ -38,15 +81,18 @@ impl Solver<'_> {
                     }
                 }
             }
+            let compiler_fallback =
+                self.compiler_codec_fallback(SymbolId(index as u32), trait_type, &requirements);
             self.mir.trait_implementations.push(TraitImplementation {
                 symbol: SymbolId(index as u32),
                 trait_type,
                 requirements,
+                compiler_fallback,
             });
         }
         for (index, implementation) in self.mir.trait_implementations.iter().enumerate() {
             for other in &self.mir.trait_implementations[..index] {
-                if !self.property_fallback_pair(implementation, other)
+                if self.fallback_rank(implementation) == self.fallback_rank(other)
                     && self.overlapping_patterns(implementation.trait_type, other.trait_type)
                 {
                     let here = self.mir.symbols[implementation.symbol.index()].declarations[0];
@@ -146,7 +192,10 @@ impl Solver<'_> {
                     .known(requirement.bound)
                     .and_then(|ty| self.meta_type(ty))
                     .is_some_and(|ty| {
-                        self.mir.types[ty.index()].constructor == TypeConstructor::PropertyBound
+                        matches!(
+                            self.mir.types[ty.index()].constructor,
+                            TypeConstructor::PropertyBound | TypeConstructor::OptionalPropertyBound
+                        )
                     });
                 let message = match state {
                     BoundState::Rejected if property_bound => {
@@ -214,25 +263,71 @@ impl Solver<'_> {
 
     fn property_blanket(&self, implementation: &TraitImplementation) -> bool {
         let ty = &self.mir.types[implementation.trait_type.index()];
+        let required = implementation
+            .requirements
+            .iter()
+            .filter(|(_, bound)| {
+                !self.meta_type(*bound).is_some_and(|raw| {
+                    self.mir.types[raw.index()].constructor
+                        == TypeConstructor::OptionalPropertyBound
+                })
+            })
+            .collect::<Vec<_>>();
         ty.arguments.len() == 1
             && matches!(
                 self.mir.types[ty.arguments[0].index()].constructor,
                 TypeConstructor::Parameter(_)
             )
-            && !implementation.requirements.is_empty()
-            && implementation.requirements.iter().all(|(_, bound)| {
+            && !required.is_empty()
+            && required.into_iter().any(|(_, bound)| {
                 self.meta_type(*bound).is_some_and(|raw| {
                     self.mir.types[raw.index()].constructor == TypeConstructor::PropertyBound
                 })
             })
     }
 
-    fn property_fallback_pair(
+    fn compiler_codec_fallback(
         &self,
-        left: &TraitImplementation,
-        right: &TraitImplementation,
+        symbol: SymbolId,
+        trait_type: TypeId,
+        requirements: &[(SymbolId, TypeId)],
     ) -> bool {
-        self.property_blanket(left) != self.property_blanket(right)
+        if !requirements.is_empty() {
+            return false;
+        }
+        let Some(module) = self.mir.symbols[symbol.index()].module else {
+            return false;
+        };
+        if self.mir.modules[module.index()]
+            .native
+            .as_ref()
+            .map(|native| native.id)
+            != Some(13)
+        {
+            return false;
+        }
+        let ty = &self.mir.types[trait_type.index()];
+        let TypeConstructor::Nominal(trait_symbol) = ty.constructor else {
+            return false;
+        };
+        matches!(
+            self.mir.symbols[trait_symbol.index()].name.as_str(),
+            "Encode" | "Decode"
+        ) && ty.arguments.len() == 1
+            && matches!(
+                self.mir.types[ty.arguments[0].index()].constructor,
+                TypeConstructor::Parameter(_)
+            )
+    }
+
+    fn fallback_rank(&self, implementation: &TraitImplementation) -> u8 {
+        if implementation.compiler_fallback {
+            0
+        } else if self.property_blanket(implementation) {
+            1
+        } else {
+            2
+        }
     }
 
     fn pattern_root(&self, mut ty: TypeId, substitutions: &BTreeMap<SymbolId, TypeId>) -> TypeId {

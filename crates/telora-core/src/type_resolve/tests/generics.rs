@@ -1,17 +1,51 @@
 use super::*;
 
 #[test]
+fn member_import_through_reexported_type_domain_preserves_enum_identity() {
+    let mut mir = graph(&[
+        (
+            "@src/main",
+            "use self::bridge::Packet::{ Data as Make }; \
+             pub def make: Fn(Int) -> model::Message(Int) = Make;",
+        ),
+        (
+            "@src/bridge",
+            "pub use super::model::{ Message as Packet };",
+        ),
+        (
+            "@src/model",
+            "pub type Message(T) = enum { Data(T), Empty };",
+        ),
+    ]);
+    resolve(&mut mir);
+    assert!(mir.diagnostics.is_empty(), "{:?}", mir.diagnostics);
+    assert!(mir.seal().is_ok());
+}
+
+#[test]
 fn non_callable_diagnostics_render_existing_type_evidence() {
     for (value, expected) in [
-        ("1", "Int"), ("\"text\"", "String"), ("[1]", "Array<Int>"),
-        ("{item: 1}", "{item: Int}"), ("Int", "TypeOf(Int)"),
+        ("1", "Int"),
+        ("\"text\"", "String"),
+        ("[1]", "Array<Int>"),
+        ("{item: 1}", "{item: Int}"),
+        ("Int", "TypeOf(Int)"),
     ] {
-        let source = format!("export def bad = {{ let value = {value}; value(2) }}; export def independent: Int = 42;");
+        let source = format!(
+            "pub def bad = {{ let value = {value}; value(2) }}; pub def independent: Int = 42;"
+        );
         let mut mir = graph(&[("@src/main", &source)]);
         resolve(&mut mir);
         let message = format!("cannot call value of type {expected}");
-        assert!(mir.diagnostics.iter().any(|d| d.message == message), "{}", mir.dump());
-        assert!(matches!(symbol_type(&mir, "independent"), TypeState::Known(_)));
+        assert!(
+            mir.diagnostics.iter().any(|d| d.message == message),
+            "{}",
+            mir.dump()
+        );
+        assert!(matches!(
+            symbol_type(&mir, "independent"),
+            TypeState::Known(_)
+        ));
         assert!(mir.seal().is_err());
     }
 }
@@ -20,53 +54,93 @@ fn non_callable_diagnostics_render_existing_type_evidence() {
 fn function_value_aliases_do_not_become_enum_pattern_constructors() {
     for setup in [
         "def make: Fn(Int) -> Event = Event.Progress;",
-        "import Event.{Progress}; def make: Fn(Int) -> Event = Progress;",
+        "use Event::{Progress}; def make: Fn(Int) -> Event = Progress;",
         "def first = Event.Progress; def make = first;",
     ] {
-        let source = format!("type Event = enum {{Progress(Int), Finished}}; {setup} export def invalid = match Event.Progress(1) {{make(value) => value, _ => 0}}; export def independent: Int = 42;");
+        let source = format!(
+            "type Event = enum {{Progress(Int), Finished}}; {setup} pub def invalid = match Event.Progress(1) {{make(value) => value, _ => 0}}; pub def independent: Int = 42;"
+        );
         let mut mir = graph(&[("@src/main", &source)]);
         resolve(&mut mir);
-        assert!(mir.diagnostics.iter().any(|d| d.message.contains("constructor pattern requires a type declaration")), "{}", mir.dump());
-        assert!(matches!(symbol_type(&mir, "independent"), TypeState::Known(_)));
+        assert!(
+            mir.diagnostics.iter().any(|d| d
+                .message
+                .contains("constructor pattern requires a type declaration")),
+            "{}",
+            mir.dump()
+        );
+        assert!(matches!(
+            symbol_type(&mir, "independent"),
+            TypeState::Known(_)
+        ));
         assert!(mir.seal().is_err());
     }
-    let mut mir = graph(&[("@src/main", "type Event = enum {Progress(Int)}; import Event.{Progress as Advance}; export def read: Int = match Advance(42) {Advance(value) => value};")]);
+    let mut mir = graph(&[(
+        "@src/main",
+        "type Event = enum {Progress(Int)}; use Event::{Progress as Advance}; pub def read: Int = match Advance(42) {Advance(value) => value};",
+    )]);
     resolve(&mut mir);
-    mir.seal().unwrap_or_else(|d| panic!("{d:?}\n{}", mir.dump()));
+    mir.seal()
+        .unwrap_or_else(|d| panic!("{d:?}\n{}", mir.dump()));
 }
 
 #[test]
 fn patterns_close_alias_selections_and_preserve_nested_irrefutability() {
-    let mut mir = graph(&[("@src/main", r#"
-        import Bool.{True as Yes, False as No};
+    let mut mir = graph(&[(
+        "@src/main",
+        r#"
+        use Bool::{True as Yes, False as No};
         type Wrapped(T) = struct(T);
         type Event(T) = enum {Empty, Value(T)};
-        export def read: Fn(Event((Int, String))) -> Int = fn(value) {
+        pub def read: Fn(Event((Int, String))) -> Int = fn(value) {
             match value { Event.Empty => 0, Event.Value((x, _)) => x }
         };
-        export def boolean: Fn(Bool) -> Int = fn(value) { match value { Yes => 1, No => 0 } };
-        export def unwrap: Fn(Wrapped(Int)) -> Int = fn(value) { let Wrapped(x) = value; x };
-    "#)]);
+        pub def boolean: Fn(Bool) -> Int = fn(value) { match value { Yes => 1, No => 0 } };
+        pub def unwrap: Fn(Wrapped(Int)) -> Int = fn(value) { let Wrapped(x) = value; x };
+    "#,
+    )]);
     resolve(&mut mir);
-    mir.seal().unwrap_or_else(|d| panic!("{d:?}\n{}", mir.dump()));
-    let pattern = mir.hir.iter().enumerate().find(|(index, node)| matches!(node.kind, HirKind::ConstructorPattern)
-        && matches!(mir.member_selections[*index], Some(MemberSelection::EnumVariant { .. }))).unwrap().0;
+    mir.seal()
+        .unwrap_or_else(|d| panic!("{d:?}\n{}", mir.dump()));
+    let pattern = mir
+        .hir
+        .iter()
+        .enumerate()
+        .find(|(index, node)| {
+            matches!(node.kind, HirKind::ConstructorPattern)
+                && matches!(
+                    mir.member_selections[*index],
+                    Some(MemberSelection::EnumVariant { .. })
+                )
+        })
+        .unwrap()
+        .0;
     mir.member_selections[pattern] = Some(MemberSelection::EnumVariant { index: 999 });
     assert!(mir.seal().is_err());
 }
 
 #[test]
 fn principal_schemes_preserve_quantified_bounds() {
-    let mut mir = graph(&[("@src/main", r#"
+    let mut mir = graph(&[(
+        "@src/main",
+        r#"
         trait Named { name: Fn(Self) -> String };
-        export def plain: for(T) Fn(T) -> T = fn(value) { value };
-        export def first: for(T: Named) Fn(T) -> T = fn(value) { value };
-        export def second: for(U: Named) Fn(U) -> U = fn(value) { value };
-    "#)]);
+        pub def plain: for(T) Fn(T) -> T = fn(value) { value };
+        pub def first: for(T: Named) Fn(T) -> T = fn(value) { value };
+        pub def second: for(U: Named) Fn(U) -> U = fn(value) { value };
+    "#,
+    )]);
     resolve(&mut mir);
-    mir.seal().unwrap_or_else(|d| panic!("{d:?}\n{}", mir.dump()));
+    mir.seal()
+        .unwrap_or_else(|d| panic!("{d:?}\n{}", mir.dump()));
     let scheme = |name| {
-        let index = mir.symbols.iter().position(|symbol| symbol.name == name && matches!(symbol.kind, SymbolKind::Declaration(_))).unwrap();
+        let index = mir
+            .symbols
+            .iter()
+            .position(|symbol| {
+                symbol.name == name && matches!(symbol.kind, SymbolKind::Declaration(_))
+            })
+            .unwrap();
         mir.symbol_schemes[index].unwrap()
     };
     let first = scheme("first");
@@ -80,88 +154,176 @@ fn principal_schemes_preserve_quantified_bounds() {
 #[test]
 fn recursive_family_growth_is_a_static_conflict_but_permutations_and_resets_close() {
     for source in [
-        "type Grow(A) = struct {next: Grow(Array(A))}; export {Grow}; export def independent: Int = 42;",
-        "type Left(A) = struct {next: Right(Array(A))}; type Right(B) = struct {next: Left(B)}; export {Left}; export def independent: Int = 42;",
+        "type Grow(A) = struct {next: Grow(Array(A))}; pub use self::{Grow}; pub def independent: Int = 42;",
+        "type Left(A) = struct {next: Right(Array(A))}; type Right(B) = struct {next: Left(B)}; pub use self::{Left}; pub def independent: Int = 42;",
     ] {
         let mut mir = graph(&[("@src/main", source)]);
         resolve(&mut mir);
-        assert!(mir.diagnostics.iter().any(|d| d.message.contains("recursive type family expands")), "{}", mir.dump());
+        assert!(
+            mir.diagnostics
+                .iter()
+                .any(|d| d.message.contains("recursive type family expands")),
+            "{}",
+            mir.dump()
+        );
         assert!(!mir.type_conflicts.is_empty());
-        assert!(mir.types.len() < 1000, "{} types: {:?}", mir.types.len(), mir.diagnostics);
-        let symbol = mir.symbols.iter().position(|s| s.name == "independent" && matches!(s.kind, SymbolKind::Declaration(_))).unwrap();
-        let TypeState::Known(ty) = mir.ty_slots[mir.symbol_types[symbol].index()] else { panic!("independent result stays solved") };
+        assert!(
+            mir.types.len() < 1000,
+            "{} types: {:?}",
+            mir.types.len(),
+            mir.diagnostics
+        );
+        let symbol = mir
+            .symbols
+            .iter()
+            .position(|s| s.name == "independent" && matches!(s.kind, SymbolKind::Declaration(_)))
+            .unwrap();
+        let TypeState::Known(ty) = mir.ty_slots[mir.symbol_types[symbol].index()] else {
+            panic!("independent result stays solved")
+        };
         assert_eq!(mir.types[ty.index()].constructor, TypeConstructor::Int);
         assert!(mir.seal().is_err());
     }
     for source in [
-        "type Swap(A, B) = struct {next: Swap(B, A)}; export {Swap};",
-        "type Left(A) = struct {next: Right(Array(A))}; type Right(B) = struct {next: Left(Int)}; export {Left};",
-        "type Tree(A) = struct {children: Array(Tree(A))}; export {Tree};",
-        "type Wrapped(A) = struct {next: Wrapped(Unchecked(A))}; export {Wrapped};",
+        "type Swap(A, B) = struct {next: Swap(B, A)}; pub use self::{Swap};",
+        "type Left(A) = struct {next: Right(Array(A))}; type Right(B) = struct {next: Left(Int)}; pub use self::{Left};",
+        "type Tree(A) = struct {children: Array(Tree(A))}; pub use self::{Tree};",
+        "type Wrapped(A) = struct {next: Wrapped(Unchecked(A))}; pub use self::{Wrapped};",
     ] {
         let mut mir = graph(&[("@src/main", source)]);
         resolve(&mut mir);
-        mir.seal().unwrap_or_else(|d| panic!("{source}\n{d:?}\n{}", mir.dump()));
+        mir.seal()
+            .unwrap_or_else(|d| panic!("{source}\n{d:?}\n{}", mir.dump()));
         assert!(mir.types.len() < 1000, "{} types", mir.types.len());
     }
 }
 
 #[test]
 fn generic_references_distinguish_exported_schemes_and_call_instances() {
-    let mut mir = graph(&[("@src/main", r#"
-        export def identity: for(T) Fn(T) -> T = fn(value) { value };
-        export def answer: Int = identity(42);
-        export def same: Bool = identity@[Int] == identity@[Int];
-    "#)]);
+    let mut mir = graph(&[(
+        "@src/main",
+        r#"
+        pub def identity: for(T) Fn(T) -> T = fn(value) { value };
+        pub def answer: Int = identity(42);
+        pub def same: Bool = identity@[Int] == identity@[Int];
+    "#,
+    )]);
     resolve(&mut mir);
-    mir.seal().unwrap_or_else(|d| panic!("{d:?}\n{}", mir.dump()));
-    let (scheme_node, scheme) = mir.generic_references.iter().enumerate()
+    mir.seal()
+        .unwrap_or_else(|d| panic!("{d:?}\n{}", mir.dump()));
+    let (scheme_node, scheme) = mir
+        .generic_references
+        .iter()
+        .enumerate()
         .find_map(|(node, reference)| match reference {
             Some(reference @ GenericReference::Scheme { .. }) => Some((node, *reference)),
             _ => None,
-        }).expect("export preserves its quantified contract");
-    let (instance_node, instance) = mir.generic_references.iter().enumerate()
+        })
+        .expect("export preserves its quantified contract");
+    let (instance_node, instance) = mir
+        .generic_references
+        .iter()
+        .enumerate()
         .find_map(|(node, reference)| match reference {
             Some(reference @ GenericReference::Instance(_)) => Some((node, *reference)),
             _ => None,
-        }).expect("call selects its concrete instance");
-    let GenericReference::Instance(id) = instance else { unreachable!() };
+        })
+        .expect("call selects its concrete instance");
+    let GenericReference::Instance(id) = instance else {
+        unreachable!()
+    };
     assert!(mir.generic_instances[id.index()].concrete);
     mir.generic_references[scheme_node] = None;
-    assert!(mir.seal().is_err(), "generic references must carry the type pass outcome");
+    assert!(
+        mir.seal().is_err(),
+        "generic references must carry the type pass outcome"
+    );
     mir.generic_references[scheme_node] = Some(instance);
-    assert!(mir.seal().is_err(), "a scheme export is not a call instance");
+    assert!(
+        mir.seal().is_err(),
+        "a scheme export is not a call instance"
+    );
     mir.generic_references[scheme_node] = Some(scheme);
     mir.generic_references[instance_node] = Some(scheme);
-    assert!(mir.seal().is_err(), "a concrete use cannot discard its arguments");
-    mir.generic_references[instance_node] = Some(GenericReference::Instance(GenericInstanceId(u32::MAX)));
-    assert!(mir.seal().is_err(), "references must close over admitted instances");
+    assert!(
+        mir.seal().is_err(),
+        "a concrete use cannot discard its arguments"
+    );
+    mir.generic_references[instance_node] =
+        Some(GenericReference::Instance(GenericInstanceId(u32::MAX)));
+    assert!(
+        mir.seal().is_err(),
+        "references must close over admitted instances"
+    );
 }
 
 #[test]
 fn principal_schemes_share_alpha_equivalent_contracts_but_not_function_symbols() {
-    let mut mir = graph(&[("@src/main", r#"
-        export def first: for(T) Fn(T) -> T = fn(value) { value };
-        export def second: for(U) Fn(U) -> U = fn(value) { value };
-        export def closed: for(T) Fn(T) -> Int = fn(value) { 42 };
-        export def unused: for(T, U) Fn(T) -> T = fn(value) { value };
-    "#)]);
+    let mut mir = graph(&[(
+        "@src/main",
+        r#"
+        pub def first: for(T) Fn(T) -> T = fn(value) { value };
+        pub def second: for(U) Fn(U) -> U = fn(value) { value };
+        pub def closed: for(T) Fn(T) -> Int = fn(value) { 42 };
+        pub def unused: for(T, U) Fn(T) -> T = fn(value) { value };
+    "#,
+    )]);
     resolve(&mut mir);
-    mir.seal().unwrap_or_else(|d| panic!("{d:?}\n{}", mir.dump()));
-    let symbol = |name| mir.symbols.iter().position(|symbol| symbol.name == name && matches!(symbol.kind, SymbolKind::Declaration(_))).unwrap();
+    mir.seal()
+        .unwrap_or_else(|d| panic!("{d:?}\n{}", mir.dump()));
+    let symbol = |name| {
+        mir.symbols
+            .iter()
+            .position(|symbol| {
+                symbol.name == name && matches!(symbol.kind, SymbolKind::Declaration(_))
+            })
+            .unwrap()
+    };
     assert_ne!(symbol("first"), symbol("second"));
-    assert_eq!(mir.symbol_schemes[symbol("first")], mir.symbol_schemes[symbol("second")]);
-    assert_ne!(mir.symbol_schemes[symbol("first")], mir.symbol_schemes[symbol("closed")]);
-    assert_ne!(mir.symbol_schemes[symbol("first")], mir.symbol_schemes[symbol("unused")]);
+    assert_eq!(
+        mir.symbol_schemes[symbol("first")],
+        mir.symbol_schemes[symbol("second")]
+    );
+    assert_ne!(
+        mir.symbol_schemes[symbol("first")],
+        mir.symbol_schemes[symbol("closed")]
+    );
+    assert_ne!(
+        mir.symbol_schemes[symbol("first")],
+        mir.symbol_schemes[symbol("unused")]
+    );
     let scheme = &mir.type_schemes[mir.symbol_schemes[symbol("closed")].unwrap().index()];
-    let SchemeNode::Apply { constructor: TypeConstructor::Function, arguments } = &mir.scheme_nodes[scheme.body.index()] else { panic!("function scheme") };
+    let SchemeNode::Apply {
+        constructor: TypeConstructor::Function,
+        arguments,
+    } = &mir.scheme_nodes[scheme.body.index()]
+    else {
+        panic!("function scheme")
+    };
     assert_eq!(mir.scheme_nodes[arguments[0].index()], SchemeNode::Bound(0));
-    let SchemeNode::Known(result) = mir.scheme_nodes[arguments[1].index()] else { panic!("closed result reuses TypeId") };
+    let SchemeNode::Known(result) = mir.scheme_nodes[arguments[1].index()] else {
+        panic!("closed result reuses TypeId")
+    };
     assert_eq!(mir.types[result.index()].constructor, TypeConstructor::Int);
-    let original = (mir.type_schemes.clone(), mir.scheme_nodes.clone(), mir.symbol_schemes.clone());
+    let original = (
+        mir.type_schemes.clone(),
+        mir.scheme_nodes.clone(),
+        mir.symbol_schemes.clone(),
+    );
     mir.build_type_schemes();
-    assert_eq!(original, (mir.type_schemes.clone(), mir.scheme_nodes.clone(), mir.symbol_schemes.clone()));
-    let bound = mir.scheme_nodes.iter().position(|node| matches!(node, SchemeNode::Bound(0))).unwrap();
+    assert_eq!(
+        original,
+        (
+            mir.type_schemes.clone(),
+            mir.scheme_nodes.clone(),
+            mir.symbol_schemes.clone()
+        )
+    );
+    let bound = mir
+        .scheme_nodes
+        .iter()
+        .position(|node| matches!(node, SchemeNode::Bound(0)))
+        .unwrap();
     mir.scheme_nodes[bound] = SchemeNode::Bound(999);
     assert!(mir.seal().is_err());
 }
@@ -169,57 +331,123 @@ fn principal_schemes_share_alpha_equivalent_contracts_but_not_function_symbols()
 #[test]
 fn interpreter_contracts_reject_invalid_witnesses_and_nested_parameters() {
     for (source, message) in [
-        ("export def bad = interpreter!(fn(x) { True });", "directly annotated generic def"),
-        ("export def bad: for(T) Fn(TypeOf(T), TypeOf(T)) -> Fn(T) -> Bool = interpreter!(fn(x) { True });", "unique witness"),
-        ("export def bad: for(T, U) Fn(TypeOf(T)) -> Fn(T) -> Bool = interpreter!(fn(x) { True });", "missing a type parameter witness"),
-        ("export def bad: for(T) Fn(Int) -> Fn(T) -> Bool = interpreter!(fn(x) { True });", "TypeOf witnesses"),
-        ("export def bad: for(T) Fn(TypeOf(Int)) -> Fn(T) -> Bool = interpreter!(fn(x) { True });", "quantified type parameter"),
-        ("export def bad: for(T) Fn(TypeOf(T)) -> Fn(Array(T)) -> Bool = interpreter!(fn(x) { True });", "cannot nest"),
-        ("export def bad: for(T) Fn(TypeOf(T)) -> Fn(T) -> Array(T) = interpreter!(fn(x) { [] });", "result cannot contain"),
-        ("def erased: Fn(Int) -> Bool = fn(x) { True }; export def bad: for(T) Fn(TypeOf(T)) -> Fn(T) -> Bool = interpreter!(erased);", "type mismatch"),
+        (
+            "pub def bad = interpreter!(fn(x) { True });",
+            "directly annotated generic def",
+        ),
+        (
+            "pub def bad: for(T) Fn(TypeOf(T), TypeOf(T)) -> Fn(T) -> Bool = interpreter!(fn(x) { True });",
+            "unique witness",
+        ),
+        (
+            "pub def bad: for(T, U) Fn(TypeOf(T)) -> Fn(T) -> Bool = interpreter!(fn(x) { True });",
+            "missing a type parameter witness",
+        ),
+        (
+            "pub def bad: for(T) Fn(Int) -> Fn(T) -> Bool = interpreter!(fn(x) { True });",
+            "TypeOf witnesses",
+        ),
+        (
+            "pub def bad: for(T) Fn(TypeOf(Int)) -> Fn(T) -> Bool = interpreter!(fn(x) { True });",
+            "quantified type parameter",
+        ),
+        (
+            "pub def bad: for(T) Fn(TypeOf(T)) -> Fn(Array(T)) -> Bool = interpreter!(fn(x) { True });",
+            "cannot nest",
+        ),
+        (
+            "pub def bad: for(T) Fn(TypeOf(T)) -> Fn(T) -> Array(T) = interpreter!(fn(x) { [] });",
+            "result cannot contain",
+        ),
+        (
+            "def erased: Fn(Int) -> Bool = fn(x) { True }; pub def bad: for(T) Fn(TypeOf(T)) -> Fn(T) -> Bool = interpreter!(erased);",
+            "type mismatch",
+        ),
     ] {
         let mut mir = graph(&[("@src/main", source)]);
         resolve(&mut mir);
         assert!(mir.seal().is_err(), "{source}");
-        assert!(mir.diagnostics.iter().any(|diagnostic| diagnostic.message.contains(message)), "{source}\n{}", mir.dump());
+        assert!(
+            mir.diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains(message)),
+            "{source}\n{}",
+            mir.dump()
+        );
     }
     for source in [
-        "export def adapt: for(T) Fn(TypeOf(T)) -> Fn(Int) -> Bool = interpreter!(fn(x) { True });",
-        "def erased: Fn(Dyn) -> Never = fn(x) { fail!(\"stop\") }; export def adapt: for(T) Fn(TypeOf(T)) -> Fn(T) -> Bool = interpreter!(erased);",
+        "pub def adapt: for(T) Fn(TypeOf(T)) -> Fn(Int) -> Bool = interpreter!(fn(x) { True });",
+        "def erased: Fn(Dyn) -> Never = fn(x) { fail!(\"stop\") }; pub def adapt: for(T) Fn(TypeOf(T)) -> Fn(T) -> Bool = interpreter!(erased);",
     ] {
         let mut mir = graph(&[("@src/main", source)]);
         resolve(&mut mir);
-        mir.seal().unwrap_or_else(|d| panic!("{source}\n{d:?}\n{}", mir.dump()));
+        mir.seal()
+            .unwrap_or_else(|d| panic!("{source}\n{d:?}\n{}", mir.dump()));
     }
 }
 
 #[test]
 fn interpreter_plans_derive_from_resolved_signatures_without_hidden_references() {
-    let mut mir = graph(&[("@src/main", r#"
+    let mut mir = graph(&[(
+        "@src/main",
+        r#"
         type Witness(T) = TypeOf(T);
         def erased: Fn(String, Dyn, Bool, Dyn, Dyn) -> Bool = fn(text, a, flag, b, again) { flag };
-        export def adapt: for(A, B) Fn(Witness(B), Witness(A)) -> Fn(String, A, Bool, B, A) -> Bool = interpreter!(erased);
-        export def answer: Bool = adapt(Int.type, String.type)("text", "a", True, 42, "b");
-    "#)]);
+        pub def adapt: for(A, B) Fn(Witness(B), Witness(A)) -> Fn(String, A, Bool, B, A) -> Bool = interpreter!(erased);
+        pub def answer: Bool = adapt(Int.type, String.type)("text", "a", True, 42, "b");
+    "#,
+    )]);
     resolve(&mut mir);
-    mir.seal().unwrap_or_else(|d| panic!("{d:?}\n{}", mir.dump()));
-    assert!(!mir.hir.iter().any(|node| matches!(&node.kind, HirKind::Variable(name) if name.starts_with('\0'))));
-    let index = mir.interpreter_plans.iter().position(Option::is_some).unwrap();
-    assert_eq!(mir.interpreter_plans[index], Some(InterpreterPlan { witness_count: 2, parameters: vec![None, Some(1), None, Some(0), Some(1)] }));
+    mir.seal()
+        .unwrap_or_else(|d| panic!("{d:?}\n{}", mir.dump()));
+    assert!(
+        !mir.hir
+            .iter()
+            .any(|node| matches!(&node.kind, HirKind::Variable(name) if name.starts_with('\0')))
+    );
+    let index = mir
+        .interpreter_plans
+        .iter()
+        .position(Option::is_some)
+        .unwrap();
+    assert_eq!(
+        mir.interpreter_plans[index],
+        Some(InterpreterPlan {
+            witness_count: 2,
+            parameters: vec![None, Some(1), None, Some(0), Some(1)]
+        })
+    );
     mir.interpreter_plans[index].as_mut().unwrap().parameters[1] = Some(0);
     assert!(mir.seal().is_err());
 }
 
 #[test]
 fn empty_option_bottom_evidence_does_not_default_arbitrary_generic_results() {
-    let mut mir = graph(&[("@src/main", "def inspect: for(T) Fn(Option(T)) -> Bool = fn(value) { match value { None => False, Some(_) => True } }; export def constrained: Option(Int) = None; export def observed: Bool = do { let empty = Option.None; inspect(empty) };")]);
+    let mut mir = graph(&[(
+        "@src/main",
+        "def inspect: for(T) Fn(Option(T)) -> Bool = fn(value) { match value { None => False, Some(_) => True } }; pub def constrained: Option(Int) = None; pub def observed: Bool = do { let empty = Option.None; inspect(empty) };",
+    )]);
     resolve(&mut mir);
-    mir.seal().unwrap_or_else(|d| panic!("{d:?}\n{}", mir.dump()));
-    let TypeState::Known(empty) = symbol_type(&mir, "empty") else { panic!("empty") };
-    let TypeState::Known(constrained) = symbol_type(&mir, "constrained") else { panic!("constrained") };
-    assert_eq!(mir.types[empty.index()].constructor, TypeConstructor::Option);
-    assert!(matches!(mir.types[mir.types[empty.index()].arguments[0].index()].constructor, TypeConstructor::Never));
-    assert_eq!(mir.types[mir.types[constrained.index()].arguments[0].index()].constructor, TypeConstructor::Int);
+    mir.seal()
+        .unwrap_or_else(|d| panic!("{d:?}\n{}", mir.dump()));
+    let TypeState::Known(empty) = symbol_type(&mir, "empty") else {
+        panic!("empty")
+    };
+    let TypeState::Known(constrained) = symbol_type(&mir, "constrained") else {
+        panic!("constrained")
+    };
+    assert_eq!(
+        mir.types[empty.index()].constructor,
+        TypeConstructor::Option
+    );
+    assert!(matches!(
+        mir.types[mir.types[empty.index()].arguments[0].index()].constructor,
+        TypeConstructor::Never
+    ));
+    assert_eq!(
+        mir.types[mir.types[constrained.index()].arguments[0].index()].constructor,
+        TypeConstructor::Int
+    );
     assert!(mir.hir.iter().enumerate().any(|(index, node)| {
         matches!(&node.kind, HirKind::Variable(name) if name == "empty")
             && matches!(mir.ty_slots[index], TypeState::Known(instance)
@@ -227,27 +455,42 @@ fn empty_option_bottom_evidence_does_not_default_arbitrary_generic_results() {
                     && mir.types[mir.types[instance.index()].arguments[0].index()].constructor == TypeConstructor::Never)
     }), "{}", mir.dump());
 
-    let mut mir = graph(&[("@src/main", "native unknown: for(T) Fn() -> Option(T); export def answer = unknown();")]);
+    let mut mir = graph(&[(
+        "@src/main",
+        "native unknown: for(T) Fn() -> Option(T); pub def answer = unknown();",
+    )]);
     resolve(&mut mir);
     assert!(mir.seal().is_err());
-    assert!(mir.diagnostics.iter().any(|d| d.message.starts_with("unknown generic argument")), "{}", mir.dump());
+    assert!(
+        mir.diagnostics
+            .iter()
+            .any(|d| d.message.starts_with("unknown generic argument")),
+        "{}",
+        mir.dump()
+    );
 }
 
 #[test]
 fn imported_generic_constructor_uses_have_independent_type_arguments() {
     for source in [
-        "type Message(T) = enum { Data(T), Empty }; import Message.{Data}; export def completed: Bool = do { let answer = (Data(1), Data@[String](\"text\")); True };",
-        "import Option.{Some as Make}; export def completed: Bool = do { let answer = (Make(1), Make@[String](\"text\")); True };",
-        "type Message(T) = enum { Data(T), Empty }; export def completed: Bool = do { let answer = (Message.Data(1), Message.Data@[String](\"text\")); True };",
-        "import \"std/prelude\" { Option as Family }; export def completed: Bool = do { let answer = (Family.Some@[Int](1), Family.Some@[String](\"text\")); True };",
+        "type Message(T) = enum { Data(T), Empty }; use Message::{Data}; pub def completed: Bool = do { let answer = (Data(1), Data@[String](\"text\")); True };",
+        "use Option::{Some as Make}; pub def completed: Bool = do { let answer = (Make(1), Make@[String](\"text\")); True };",
+        "type Message(T) = enum { Data(T), Empty }; pub def completed: Bool = do { let answer = (Message.Data(1), Message.Data@[String](\"text\")); True };",
+        "use std::prelude::{ Option as Family }; pub def completed: Bool = do { let answer = (Family.Some@[Int](1), Family.Some@[String](\"text\")); True };",
     ] {
         let mut mir = graph(&[("@src/main", source)]);
         resolve(&mut mir);
-        mir.seal().unwrap_or_else(|d| panic!("{source}\n{d:?}\n{}", mir.dump()));
-        let TypeState::Known(ty) = symbol_type(&mir, "answer") else { panic!("closed tuple") };
+        mir.seal()
+            .unwrap_or_else(|d| panic!("{source}\n{d:?}\n{}", mir.dump()));
+        let TypeState::Known(ty) = symbol_type(&mir, "answer") else {
+            panic!("closed tuple")
+        };
         let items = &mir.types[ty.index()].arguments;
         assert_eq!(items.len(), 2);
-        for (&item, expected) in items.iter().zip([TypeConstructor::Int, TypeConstructor::String]) {
+        for (&item, expected) in items
+            .iter()
+            .zip([TypeConstructor::Int, TypeConstructor::String])
+        {
             let argument = mir.types[item.index()].arguments[0];
             assert_eq!(mir.types[argument.index()].constructor, expected);
         }
@@ -257,19 +500,20 @@ fn imported_generic_constructor_uses_have_independent_type_arguments() {
 #[test]
 fn constructor_alias_arguments_follow_family_order_and_reject_wrong_arity() {
     for source in [
-        "import Result.{Err as Reject, Ok as Accept}; export def answer: (Result(Int, String), Result(Int, String)) = (Reject@[Int, String](\"text\"), Accept@[Int, String](1));",
-        "type Outcome(T, E) = enum { Accept(T), Reject(E) }; import Outcome.{Reject}; export def answer: Outcome(Int, String) = Reject@[Int, String](\"text\");",
-        "def flip: for(T, E) Fn(E, T) -> (T, E) = fn(e, t) { (t, e) }; export def completed: Bool = do { def alias = flip@[Int, String]; let answer = alias(\"text\", 1); True };",
+        "use Result::{Err as Reject, Ok as Accept}; pub def answer: (Result(Int, String), Result(Int, String)) = (Reject@[Int, String](\"text\"), Accept@[Int, String](1));",
+        "type Outcome(T, E) = enum { Accept(T), Reject(E) }; use Outcome::{Reject}; pub def answer: Outcome(Int, String) = Reject@[Int, String](\"text\");",
+        "def flip: for(T, E) Fn(E, T) -> (T, E) = fn(e, t) { (t, e) }; pub def completed: Bool = do { def alias = flip@[Int, String]; let answer = alias(\"text\", 1); True };",
     ] {
         let mut mir = graph(&[("@src/main", source)]);
         resolve(&mut mir);
-        mir.seal().unwrap_or_else(|d| panic!("{source}\n{d:?}\n{}", mir.dump()));
+        mir.seal()
+            .unwrap_or_else(|d| panic!("{source}\n{d:?}\n{}", mir.dump()));
     }
     for source in [
-        "export def answer = Option.Some@[Int, String](1);",
-        "type Message(T) = enum { Data(T) }; export def answer = Message.Data@[Int, String](1);",
-        "export def answer = Option.Some@[String](1);",
-        "type Message(T) = enum { Data(T) }; export def answer = Message(Int).Data@[String](\"text\");",
+        "pub def answer = Option.Some@[Int, String](1);",
+        "type Message(T) = enum { Data(T) }; pub def answer = Message.Data@[Int, String](1);",
+        "pub def answer = Option.Some@[String](1);",
+        "type Message(T) = enum { Data(T) }; pub def answer = Message(Int).Data@[String](\"text\");",
     ] {
         let mut mir = graph(&[("@src/main", source)]);
         resolve(&mut mir);
@@ -280,56 +524,92 @@ fn constructor_alias_arguments_follow_family_order_and_reject_wrong_arity() {
 
 #[test]
 fn callable_value_evidence_closes_nested_results_and_aliases_without_call_sites() {
-    let mut mir = graph(&[("@src/main", "export def completed: Bool = do { def invoke = fn(factory) { factory()() }; def alias = fn(callback, value) { let saved = callback; saved(value) }; def compose = fn(outer, inner, value) { outer(inner(value)) }; True };")]);
+    let mut mir = graph(&[(
+        "@src/main",
+        "pub def completed: Bool = do { def invoke = fn(factory) { factory()() }; def alias = fn(callback, value) { let saved = callback; saved(value) }; def compose = fn(outer, inner, value) { outer(inner(value)) }; True };",
+    )]);
     resolve(&mut mir);
-    mir.seal().unwrap_or_else(|d| panic!("{d:?}\n{}", mir.dump()));
+    mir.seal()
+        .unwrap_or_else(|d| panic!("{d:?}\n{}", mir.dump()));
     let query = crate::mir_query::MirQuery::new(&mir);
     for (name, expected) in [
         ("invoke", "for(A) Fn(Fn() -> Fn() -> A) -> A"),
         ("alias", "for(A, B) Fn(Fn(A) -> B, A) -> B"),
         ("compose", "for(A, B, C) Fn(Fn(A) -> B, Fn(C) -> A, C) -> B"),
     ] {
-        let symbol = mir.symbols.iter().position(|symbol| symbol.name == name && symbol.kind == SymbolKind::Declaration(BindingKind::Def)).unwrap();
-        assert_eq!(query.symbol_signature(SymbolId(symbol as u32)).as_deref(), Some(expected));
+        let symbol = mir
+            .symbols
+            .iter()
+            .position(|symbol| {
+                symbol.name == name && symbol.kind == SymbolKind::Declaration(BindingKind::Def)
+            })
+            .unwrap();
+        assert_eq!(
+            query.symbol_signature(SymbolId(symbol as u32)).as_deref(),
+            Some(expected)
+        );
     }
 }
 
 #[test]
 fn implicit_schemes_fill_independent_reference_arguments_in_dependency_order() {
     for source in [
-        "export def completed: Bool = do { def identity = fn(value) { value }; def alias = identity; def answer = (alias(1), alias(2)); True };",
-        "export def completed: Bool = do { def identity = fn(value) { value }; def answer = (identity(1), identity(\"text\"), identity@[Int](3)); True };",
-        "export def completed: Bool = do { def answer = { let identity = fn(value) { value }; (identity(1), identity(\"text\"), identity@[Int](3)) }; True };",
-        "export def completed: Bool = do { def first = fn(value) { second(value) }; def second = fn(value) { value }; def answer = (first(1), first(\"text\")); True };",
-        "export def completed: Bool = do { def second = fn(value) { value }; def first = fn(value) { second(value) }; def answer = (first(1), first(\"text\")); True };",
-        "export def completed: Bool = do { def keep = fn(left: Int, right) { left }; def answer = (keep(1, True), keep(2, \"text\")); True };",
-        "export def completed: Bool = do { def pair = fn(value) { (value, value) }; def answer = (pair(1), pair(\"text\")); True };",
-        "export def completed: Bool = do { def outer = fn(value) { let keep = fn(other) { value }; (keep(True), keep(\"text\")) }; def answer = (outer(1), outer(\"text\")); True };",
-        "export def completed: Bool = do { def apply = fn(callback, value) { callback(value) }; True };",
-        "export def completed: Bool = do { def select = fn(condition, value) { if condition { value } else { value } }; True };",
-        "export def completed: Bool = do { def wrap = fn(value) { [value] }; True };",
-        "export def completed: Bool = do { def mixed = fn(value, unused) { value + value }; def answer = mixed(21, True); True };",
+        "pub def completed: Bool = do { def identity = fn(value) { value }; def alias = identity; def answer = (alias(1), alias(2)); True };",
+        "pub def completed: Bool = do { def identity = fn(value) { value }; def answer = (identity(1), identity(\"text\"), identity@[Int](3)); True };",
+        "pub def completed: Bool = do { def answer = { let identity = fn(value) { value }; (identity(1), identity(\"text\"), identity@[Int](3)) }; True };",
+        "pub def completed: Bool = do { def first = fn(value) { second(value) }; def second = fn(value) { value }; def answer = (first(1), first(\"text\")); True };",
+        "pub def completed: Bool = do { def second = fn(value) { value }; def first = fn(value) { second(value) }; def answer = (first(1), first(\"text\")); True };",
+        "pub def completed: Bool = do { def keep = fn(left: Int, right) { left }; def answer = (keep(1, True), keep(2, \"text\")); True };",
+        "pub def completed: Bool = do { def pair = fn(value) { (value, value) }; def answer = (pair(1), pair(\"text\")); True };",
+        "pub def completed: Bool = do { def outer = fn(value) { let keep = fn(other) { value }; (keep(True), keep(\"text\")) }; def answer = (outer(1), outer(\"text\")); True };",
+        "pub def completed: Bool = do { def apply = fn(callback, value) { callback(value) }; True };",
+        "pub def completed: Bool = do { def select = fn(condition, value) { if condition { value } else { value } }; True };",
+        "pub def completed: Bool = do { def wrap = fn(value) { [value] }; True };",
+        "pub def completed: Bool = do { def mixed = fn(value, unused) { value + value }; def answer = mixed(21, True); True };",
     ] {
         let mut mir = graph(&[("@src/main", source)]);
         resolve(&mut mir);
-        mir.seal().unwrap_or_else(|d| panic!("{source}\n{d:?}\n{}", mir.dump()));
+        mir.seal()
+            .unwrap_or_else(|d| panic!("{source}\n{d:?}\n{}", mir.dump()));
     }
 }
 
 #[test]
 fn implicit_schemes_publish_deterministic_signatures_without_renumbering_resolved_symbols() {
-    let sources = [("@src/main", "export def completed: Bool = do { def apply = fn(callback, value) { callback(value) }; def identity = fn(value) { value }; True };")];
+    let sources = [(
+        "@src/main",
+        "pub def completed: Bool = do { def apply = fn(callback, value) { callback(value) }; def identity = fn(value) { value }; True };",
+    )];
     let mut first = graph(&sources);
-    let identities = first.symbols.iter().map(|symbol| (symbol.name.clone(), symbol.declarations.clone())).collect::<Vec<_>>();
+    let identities = first
+        .symbols
+        .iter()
+        .map(|symbol| (symbol.name.clone(), symbol.declarations.clone()))
+        .collect::<Vec<_>>();
     resolve(&mut first);
     first.seal().unwrap();
     for (symbol, identity) in first.symbols.iter().zip(identities) {
-        assert_eq!((&symbol.name, &symbol.declarations), (&identity.0, &identity.1));
+        assert_eq!(
+            (&symbol.name, &symbol.declarations),
+            (&identity.0, &identity.1)
+        );
     }
     let query = crate::mir_query::MirQuery::new(&first);
-    for (name, expected) in [("apply", "for(A, B) Fn(Fn(A) -> B, A) -> B"), ("identity", "for(A) Fn(A) -> A")] {
-        let symbol = first.symbols.iter().position(|symbol| symbol.name == name && symbol.kind == SymbolKind::Declaration(BindingKind::Def)).unwrap();
-        assert_eq!(query.symbol_signature(SymbolId(symbol as u32)).as_deref(), Some(expected));
+    for (name, expected) in [
+        ("apply", "for(A, B) Fn(Fn(A) -> B, A) -> B"),
+        ("identity", "for(A) Fn(A) -> A"),
+    ] {
+        let symbol = first
+            .symbols
+            .iter()
+            .position(|symbol| {
+                symbol.name == name && symbol.kind == SymbolKind::Declaration(BindingKind::Def)
+            })
+            .unwrap();
+        assert_eq!(
+            query.symbol_signature(SymbolId(symbol as u32)).as_deref(),
+            Some(expected)
+        );
     }
     let mut second = graph(&sources);
     resolve(&mut second);
@@ -339,14 +619,14 @@ fn implicit_schemes_publish_deterministic_signatures_without_renumbering_resolve
 #[test]
 fn implicit_schemes_do_not_generalize_recursive_captured_or_constrained_slots() {
     for source in [
-        "def recur = fn(value) { if True { value } else { recur(value) } }; export def answer = (recur(1), recur(\"text\"));",
-        "def left = fn(value) { right(value) }; def right = fn(value) { left(value) }; export def answer = (left(1), left(\"text\"));",
-        "def add = fn(left, right) { left + right }; export def answer = (add(1, 2), add(1.0, 2.0));",
-        "def mixed = fn(value, unused) { value + value }; export def answer = (mixed(21, True), mixed(21, \"text\"));",
-        "def before = fn(left, right) { left < right }; export def answer = (before(1, 2), before(\"a\", \"b\"));",
-        "def before = fn(left, right) { left < right }; export def answer = before(True, False);",
-        "def factory = fn() { { make: fn(value) { value } } }; def alias = factory().make; export def answer = (alias(1), alias(\"text\"));",
-        "export def answer = { let values = []; let keep = fn(value) { [...values, value] }; (keep(1), keep(\"text\")) };",
+        "def recur = fn(value) { if True { value } else { recur(value) } }; pub def answer = (recur(1), recur(\"text\"));",
+        "def left = fn(value) { right(value) }; def right = fn(value) { left(value) }; pub def answer = (left(1), left(\"text\"));",
+        "def add = fn(left, right) { left + right }; pub def answer = (add(1, 2), add(1.0, 2.0));",
+        "def mixed = fn(value, unused) { value + value }; pub def answer = (mixed(21, True), mixed(21, \"text\"));",
+        "def before = fn(left, right) { left < right }; pub def answer = (before(1, 2), before(\"a\", \"b\"));",
+        "def before = fn(left, right) { left < right }; pub def answer = before(True, False);",
+        "def factory = fn() { { make: fn(value) { value } } }; def alias = factory().make; pub def answer = (alias(1), alias(\"text\"));",
+        "pub def answer = { let values = []; let keep = fn(value) { [...values, value] }; (keep(1), keep(\"text\")) };",
     ] {
         let mut mir = graph(&[("@src/main", source)]);
         resolve(&mut mir);
@@ -357,55 +637,100 @@ fn implicit_schemes_do_not_generalize_recursive_captured_or_constrained_slots() 
 
 #[test]
 fn alias_cycles_are_conflicted_before_generic_expansion_without_blocking_other_types() {
-    let mut mir = graph(&[("@src/main", r#"
+    let mut mir = graph(&[(
+        "@src/main",
+        r#"
         type Family(A) = (Concrete, A);
         type Concrete = Family(Int);
         type Direct(A) = Direct(A);
         type Node = struct { next: Option(Link) };
         type Link = Node;
-        export def healthy = 42;
-        export { Family, Concrete, Direct, Link };
-    "#)]);
+        pub def healthy = 42;
+        pub use self::{ Family, Concrete, Direct, Link };
+    "#,
+    )]);
     resolve(&mut mir);
     assert!(mir.types_solved);
     for name in ["Family", "Concrete", "Direct"] {
-        assert!(matches!(symbol_type(&mir, name), TypeState::Conflicted(_)), "{name}: {:?}", symbol_type(&mir, name));
+        assert!(
+            matches!(symbol_type(&mir, name), TypeState::Conflicted(_)),
+            "{name}: {:?}",
+            symbol_type(&mir, name)
+        );
     }
     assert!(matches!(symbol_type(&mir, "Link"), TypeState::Known(_)));
     assert!(matches!(symbol_type(&mir, "healthy"), TypeState::Known(_)));
-    assert_eq!(mir.diagnostics.iter().filter(|d| d.message == "recursive type alias component").count(), 3);
-    assert!(mir.ty_slots.len() < 10_000, "alias rejection must precede unbounded slot expansion");
+    assert_eq!(
+        mir.diagnostics
+            .iter()
+            .filter(|d| d.message == "recursive type alias component")
+            .count(),
+        3
+    );
+    assert!(
+        mir.ty_slots.len() < 10_000,
+        "alias rejection must precede unbounded slot expansion"
+    );
 }
 
 #[test]
 fn nominal_member_layouts_close_generic_and_recursive_type_references() {
-    let mut mir = graph(&[("@src/main", r#"
+    let mut mir = graph(&[(
+        "@src/main",
+        r#"
         type Tree(T) = enum { Leaf(T), Branch(Array(Tree(T))), Empty };
         type Box(T) = struct { value: T, children: Array(Box(T)) };
-        export def tree: Tree(Int) = Tree(Int).Leaf(42);
-        export def boxed: Box(String) = { value: "ok", children: [] };
-    "#)]);
+        pub def tree: Tree(Int) = Tree(Int).Leaf(42);
+        pub def boxed: Box(String) = { value: "ok", children: [] };
+    "#,
+    )]);
     resolve(&mut mir);
     assert!(mir.diagnostics.is_empty(), "{}", mir.dump());
-    let TypeState::Known(tree) = symbol_type(&mir, "tree") else { panic!("tree"); };
-    let TypeState::Known(boxed) = symbol_type(&mir, "boxed") else { panic!("boxed"); };
+    let TypeState::Known(tree) = symbol_type(&mir, "tree") else {
+        panic!("tree");
+    };
+    let TypeState::Known(boxed) = symbol_type(&mir, "boxed") else {
+        panic!("boxed");
+    };
     mir.seal().unwrap();
     let image = crate::type_image::TypeImage::from_mir(&mir).unwrap();
     drop(mir);
     let layout = image.layout(tree).unwrap();
     assert_eq!(layout.members.len(), 3);
-    assert_eq!(image.types[layout.members[2].unwrap().index()].constructor, TypeConstructor::Int);
+    assert_eq!(
+        image.types[layout.members[2].unwrap().index()].constructor,
+        TypeConstructor::Int
+    );
     let branch = &image.types[layout.members[0].unwrap().index()];
     assert_eq!(branch.constructor, TypeConstructor::Array);
     assert_eq!(branch.arguments, [tree]);
     assert_eq!(layout.members[1], None);
     let body = &image.types[layout.body.index()];
-    assert_eq!(body.constructor, TypeConstructor::Enum(vec![("Branch".into(), true), ("Empty".into(), false), ("Leaf".into(), true)]));
-    assert_eq!(body.arguments, layout.members.iter().flatten().copied().collect::<Vec<_>>());
+    assert_eq!(
+        body.constructor,
+        TypeConstructor::Enum(vec![
+            ("Branch".into(), true),
+            ("Empty".into(), false),
+            ("Leaf".into(), true)
+        ])
+    );
+    assert_eq!(
+        body.arguments,
+        layout.members.iter().flatten().copied().collect::<Vec<_>>()
+    );
     let layout = image.layout(boxed).unwrap();
-    assert_eq!(image.types[layout.body.index()].constructor, TypeConstructor::Record(vec!["children".into(), "value".into()]));
-    assert_eq!(image.types[layout.body.index()].arguments, layout.members.iter().flatten().copied().collect::<Vec<_>>());
-    assert_eq!(image.types[layout.members[1].unwrap().index()].constructor, TypeConstructor::String);
+    assert_eq!(
+        image.types[layout.body.index()].constructor,
+        TypeConstructor::Record(vec!["children".into(), "value".into()])
+    );
+    assert_eq!(
+        image.types[layout.body.index()].arguments,
+        layout.members.iter().flatten().copied().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        image.types[layout.members[1].unwrap().index()].constructor,
+        TypeConstructor::String
+    );
     let children = &image.types[layout.members[0].unwrap().index()];
     assert_eq!(children.constructor, TypeConstructor::Array);
     assert_eq!(children.arguments, [boxed]);
@@ -413,29 +738,47 @@ fn nominal_member_layouts_close_generic_and_recursive_type_references() {
 
 #[test]
 fn generic_instances_close_body_types_and_transitive_references() {
-    let mut mir = graph(&[("@src/main", r#"
+    let mut mir = graph(&[(
+        "@src/main",
+        r#"
         def metadata: for(T) Fn(T) -> TypeOf(Array(T)) = fn(value) { Array(T).type };
         def forward: for(U) Fn(U) -> TypeOf(Array(U)) = fn(value) { metadata(value) };
-        export def number: TypeOf(Array(Int)) = forward(1);
-        export def text: TypeOf(Array(String)) = forward("ok");
-    "#)]);
+        pub def number: TypeOf(Array(Int)) = forward(1);
+        pub def text: TypeOf(Array(String)) = forward("ok");
+    "#,
+    )]);
     resolve(&mut mir);
     assert!(mir.diagnostics.is_empty(), "{}", mir.dump());
     mir.seal().expect("all instance slots close before codegen");
     for expected in [TypeConstructor::Int, TypeConstructor::String] {
-        let outer = mir.generic_instances.iter().find(|instance| {
-            mir.symbols[instance.symbol.index()].name == "forward"
-                && mir.types[instance.arguments[0].1.index()].constructor == expected
-        }).expect("concrete forward instance");
-        let inner = outer.references.iter().find_map(|(_, id)| {
-            let inner = &mir.generic_instances[id.index()];
-            (mir.symbols[inner.symbol.index()].name == "metadata").then_some(inner)
-        }).expect("reference to instantiated metadata body");
-        assert_eq!(mir.types[inner.arguments[0].1.index()].constructor, expected);
-        let represented = inner.types.iter().find_map(|(node, ty)| {
-            matches!(mir.hir[node.index()].kind, HirKind::TypeMetadata)
-                .then(|| mir.types[ty.index()].arguments[0])
-        }).expect("metadata expression has an instance-specific TypeId");
+        let outer = mir
+            .generic_instances
+            .iter()
+            .find(|instance| {
+                mir.symbols[instance.symbol.index()].name == "forward"
+                    && mir.types[instance.arguments[0].1.index()].constructor == expected
+            })
+            .expect("concrete forward instance");
+        let inner = outer
+            .references
+            .iter()
+            .find_map(|(_, id)| {
+                let inner = &mir.generic_instances[id.index()];
+                (mir.symbols[inner.symbol.index()].name == "metadata").then_some(inner)
+            })
+            .expect("reference to instantiated metadata body");
+        assert_eq!(
+            mir.types[inner.arguments[0].1.index()].constructor,
+            expected
+        );
+        let represented = inner
+            .types
+            .iter()
+            .find_map(|(node, ty)| {
+                matches!(mir.hir[node.index()].kind, HirKind::TypeMetadata)
+                    .then(|| mir.types[ty.index()].arguments[0])
+            })
+            .expect("metadata expression has an instance-specific TypeId");
         let array = &mir.types[represented.index()];
         assert_eq!(array.constructor, TypeConstructor::Array);
         assert_eq!(mir.types[array.arguments[0].index()].constructor, expected);
@@ -445,16 +788,40 @@ fn generic_instances_close_body_types_and_transitive_references() {
 #[test]
 fn generic_instance_closure_reports_all_unsolved_arguments() {
     for (declaration, call, expected) in [
-        ("def phantom: for(A, B, C) Fn() -> Int = fn() {42};", "phantom@[_ , _, _]()", vec!["A", "B", "C"]),
-        ("def phantom: for(A, B, C) Fn() -> Int = fn() {42};", "phantom@[Int, _, _]()", vec!["B", "C"]),
-        ("def accept: for(A, B) Fn(A) -> Int = fn(value) {42};", "accept@[String, _](1)", vec!["B"]),
+        (
+            "def phantom: for(A, B, C) Fn() -> Int = fn() {42};",
+            "phantom@[_ , _, _]()",
+            vec!["A", "B", "C"],
+        ),
+        (
+            "def phantom: for(A, B, C) Fn() -> Int = fn() {42};",
+            "phantom@[Int, _, _]()",
+            vec!["B", "C"],
+        ),
+        (
+            "def accept: for(A, B) Fn(A) -> Int = fn(value) {42};",
+            "accept@[String, _](1)",
+            vec!["B"],
+        ),
     ] {
-        let source = format!("{declaration} export def bad = {call}; export def independent: Int = 42;");
+        let source = format!("{declaration} pub def bad = {call}; pub def independent: Int = 42;");
         let mut mir = graph(&[("@src/main", &source)]);
         resolve(&mut mir);
-        let messages = mir.diagnostics.iter().filter(|d| d.message.starts_with("unknown generic argument"))
-            .map(|d| d.message.clone()).collect::<Vec<_>>();
-        assert_eq!(messages, expected.iter().map(|name| format!("unknown generic argument for parameter {name:?}")).collect::<Vec<_>>(), "{}", mir.dump());
+        let messages = mir
+            .diagnostics
+            .iter()
+            .filter(|d| d.message.starts_with("unknown generic argument"))
+            .map(|d| d.message.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            messages,
+            expected
+                .iter()
+                .map(|name| format!("unknown generic argument for parameter {name:?}"))
+                .collect::<Vec<_>>(),
+            "{}",
+            mir.dump()
+        );
         for arguments in &mir.type_instances {
             for &(_, slot) in arguments {
                 if mir.ty_slots[slot.index()] == TypeState::Unknown {
@@ -462,19 +829,29 @@ fn generic_instance_closure_reports_all_unsolved_arguments() {
                 }
             }
         }
-        assert!(matches!(symbol_type(&mir, "independent"), TypeState::Known(_)));
+        assert!(matches!(
+            symbol_type(&mir, "independent"),
+            TypeState::Known(_)
+        ));
         assert!(mir.seal().is_err());
     }
 }
 
 #[test]
 fn an_unfilled_implicit_generic_argument_prevents_sealing() {
-    let mut mir = graph(&[("@src/main", r#"
+    let mut mir = graph(&[(
+        "@src/main",
+        r#"
         def phantom: for(T) Fn() -> Int = fn() { 42 };
-        export def answer = phantom();
-    "#)]);
+        pub def answer = phantom();
+    "#,
+    )]);
     resolve(&mut mir);
-    assert!(mir.diagnostics.iter().any(|d| d.message.starts_with("unknown generic argument")));
+    assert!(
+        mir.diagnostics
+            .iter()
+            .any(|d| d.message.starts_with("unknown generic argument"))
+    );
     assert!(!mir.type_unknowns.is_empty());
     assert!(mir.seal().is_err());
 }
@@ -482,84 +859,194 @@ fn an_unfilled_implicit_generic_argument_prevents_sealing() {
 #[test]
 fn generic_templates_are_static_and_value_uses_require_concrete_instances() {
     for expression in ["identity == identity", "[identity]", "(identity, 1)"] {
-        let source = format!("export def identity: for(T) Fn(T) -> T = fn(value) {{ value }}; export def bad = {expression};");
+        let source = format!(
+            "pub def identity: for(T) Fn(T) -> T = fn(value) {{ value }}; pub def bad = {expression};"
+        );
         let mut mir = graph(&[("@src/main", &source)]);
         resolve(&mut mir);
         assert!(mir.seal().is_err(), "{expression}\n{}", mir.dump());
         assert!(!mir.type_unknowns.is_empty(), "{}", mir.dump());
     }
-    let mut mir = graph(&[("@src/main", r#"
-        export def unused: for(T) Fn(T) -> T = fn(value) { value };
+    let mut mir = graph(&[(
+        "@src/main",
+        r#"
+        pub def unused: for(T) Fn(T) -> T = fn(value) { value };
         def identity: for(T) Fn(T) -> T = fn(value) { value };
-        export def concrete: Fn(Int) -> Int = identity;
-        export def answer: Int = concrete(42);
-    "#)]);
+        pub def concrete: Fn(Int) -> Int = identity;
+        pub def answer: Int = concrete(42);
+    "#,
+    )]);
     resolve(&mut mir);
-    mir.seal().unwrap_or_else(|d| panic!("{d:?}\n{}", mir.dump()));
-    let unused = mir.symbols.iter().position(|symbol| symbol.name == "unused"
-        && matches!(symbol.kind, SymbolKind::Declaration(_))).unwrap();
-    assert!(!mir.generic_instances.iter().any(|instance| instance.symbol.index() == unused && instance.concrete));
+    mir.seal()
+        .unwrap_or_else(|d| panic!("{d:?}\n{}", mir.dump()));
+    let unused = mir
+        .symbols
+        .iter()
+        .position(|symbol| {
+            symbol.name == "unused" && matches!(symbol.kind, SymbolKind::Declaration(_))
+        })
+        .unwrap();
+    assert!(
+        !mir.generic_instances
+            .iter()
+            .any(|instance| instance.symbol.index() == unused && instance.concrete)
+    );
     let sealed = mir.seal().unwrap();
-    let template = ExecutionRoot { node: *mir.symbols[unused].declarations.last().unwrap(), instance: None };
-    assert!(sealed.validate_execution_roots(&[template]).is_err(), "a static template cannot be an execution root");
-    let answer = mir.symbols.iter().find(|symbol| symbol.name == "answer"
-        && matches!(symbol.kind, SymbolKind::Declaration(_))).unwrap();
-    let root = ExecutionRoot { node: *answer.declarations.last().unwrap(), instance: None };
+    let template = ExecutionRoot {
+        node: *mir.symbols[unused].declarations.last().unwrap(),
+        instance: None,
+    };
+    assert!(
+        sealed.validate_execution_roots(&[template]).is_err(),
+        "a static template cannot be an execution root"
+    );
+    let answer = mir
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "answer" && matches!(symbol.kind, SymbolKind::Declaration(_)))
+        .unwrap();
+    let root = ExecutionRoot {
+        node: *answer.declarations.last().unwrap(),
+        instance: None,
+    };
     sealed.validate_execution_roots(&[root]).unwrap();
     let symbol = mir.hir_symbols[root.node.index()].unwrap();
     let executable = mir.seal_export(symbol).unwrap();
     assert_eq!(executable.root(), root.node);
-    assert!(!executable.globals().iter().any(|symbol| symbol.index() == unused));
+    assert!(
+        !executable
+            .globals()
+            .iter()
+            .any(|symbol| symbol.index() == unused)
+    );
     assert!(!executable.instances().is_empty());
-    assert!(executable.closure().nodes().windows(2).all(|pair| pair[0] < pair[1]));
-    assert_eq!(executable.closure().nodes(), mir.seal_export(symbol).unwrap().closure().nodes());
+    assert!(
+        executable
+            .closure()
+            .nodes()
+            .windows(2)
+            .all(|pair| pair[0] < pair[1])
+    );
+    assert_eq!(
+        executable.closure().nodes(),
+        mir.seal_export(symbol).unwrap().closure().nodes()
+    );
+}
+
+#[test]
+fn executable_admission_ignores_closed_but_unreachable_top_level_values() {
+    let mut mir = graph(&[(
+        "@src/main",
+        r#"
+        def used: String = "used";
+        def unused: String = "unused";
+        pub def answer: String = used;
+    "#,
+    )]);
+    resolve(&mut mir);
+    assert!(mir.diagnostics.is_empty(), "{}", mir.dump());
+    let symbol = |name: &str| {
+        mir.symbols
+            .iter()
+            .enumerate()
+            .find(|(_, symbol)| {
+                symbol.name == name && matches!(symbol.kind, SymbolKind::Declaration(_))
+            })
+            .map(|(index, _)| SymbolId(index as u32))
+            .unwrap()
+    };
+    let unused = symbol("unused");
+    let unused_node = *mir.symbols[unused.index()].declarations.last().unwrap();
+    assert!(matches!(
+        mir.ty_slots[unused_node.index()],
+        TypeState::Known(_)
+    ));
+    let executable = mir.seal_export(symbol("answer")).unwrap();
+    assert!(!executable.globals().contains(&unused));
+    assert!(
+        executable
+            .closure()
+            .nodes()
+            .iter()
+            .all(|root| root.node != unused_node)
+    );
 }
 
 #[test]
 fn recursive_generic_references_close_to_the_same_instance() {
-    let mut mir = graph(&[("@src/main", r#"
+    let mut mir = graph(&[(
+        "@src/main",
+        r#"
         def repeat: for(T) Fn(T, Int) -> T = fn(value, n) {
             if n > 0 { repeat(value, n - 1) } else { value }
         };
-        export def answer: Int = repeat(42, 3);
-    "#)]);
+        pub def answer: Int = repeat(42, 3);
+    "#,
+    )]);
     resolve(&mut mir);
     assert!(mir.diagnostics.is_empty(), "{}", mir.dump());
     mir.seal().unwrap();
-    let (index, instance) = mir.generic_instances.iter().enumerate().find(|(_, instance)| {
-        mir.symbols[instance.symbol.index()].name == "repeat"
-            && mir.types[instance.arguments[0].1.index()].constructor == TypeConstructor::Int
-    }).unwrap();
-    assert!(instance.references.iter().any(|(_, id)| id.index() == index));
+    let (index, instance) = mir
+        .generic_instances
+        .iter()
+        .enumerate()
+        .find(|(_, instance)| {
+            mir.symbols[instance.symbol.index()].name == "repeat"
+                && mir.types[instance.arguments[0].1.index()].constructor == TypeConstructor::Int
+        })
+        .unwrap();
+    assert!(
+        instance
+            .references
+            .iter()
+            .any(|(_, id)| id.index() == index)
+    );
 }
 
 #[test]
 fn retains_per_reference_generic_arguments_for_codegen() {
-    let source = [("@src/main", r#"
+    let source = [(
+        "@src/main",
+        r#"
         def identity: for(T) Fn(T) -> T = fn(value) { value };
         def forward: for(U) Fn(U) -> U = fn(value) { identity(value) };
-        export def number: Int = identity(1);
-        export def text: String = identity("ok");
-        export def forwarded: Bool = forward(True);
-    "#)];
+        pub def number: Int = identity(1);
+        pub def text: String = identity("ok");
+        pub def forwarded: Bool = forward(True);
+    "#,
+    )];
     let mut mir = graph(&source);
     resolve(&mut mir);
     assert!(mir.diagnostics.is_empty(), "{}", mir.dump());
-    let identity = mir.symbols.iter().position(|s| s.name == "identity").unwrap();
+    let identity = mir
+        .symbols
+        .iter()
+        .position(|s| s.name == "identity")
+        .unwrap();
     let parameter = mir.symbol_generics[identity][0];
-    let arguments = mir.type_instances.iter().filter_map(|instance| {
-        let &(p, slot) = instance.first()?;
-        if p != parameter { return None; }
-        assert_eq!(instance.len(), 1);
-        let TypeState::Known(ty) = mir.ty_slots[slot.index()] else {
-            panic!("generic argument was not normalized: {}", mir.dump());
-        };
-        Some(mir.types[ty.index()].constructor.clone())
-    }).collect::<Vec<_>>();
+    let arguments = mir
+        .type_instances
+        .iter()
+        .filter_map(|instance| {
+            let &(p, slot) = instance.first()?;
+            if p != parameter {
+                return None;
+            }
+            assert_eq!(instance.len(), 1);
+            let TypeState::Known(ty) = mir.ty_slots[slot.index()] else {
+                panic!("generic argument was not normalized: {}", mir.dump());
+            };
+            Some(mir.types[ty.index()].constructor.clone())
+        })
+        .collect::<Vec<_>>();
     assert_eq!(arguments.len(), 3);
     assert!(arguments.contains(&TypeConstructor::Int));
     assert!(arguments.contains(&TypeConstructor::String));
-    assert!(arguments.iter().any(|ty| matches!(ty, TypeConstructor::Parameter(_))));
+    assert!(
+        arguments
+            .iter()
+            .any(|ty| matches!(ty, TypeConstructor::Parameter(_)))
+    );
     mir.seal().expect("closed generic argument graph");
 
     let mut repeated = graph(&source);
@@ -570,18 +1057,31 @@ fn retains_per_reference_generic_arguments_for_codegen() {
 
 #[test]
 fn phantom_generic_results_keep_their_argument_evidence_across_calls() {
-    let mut mir = graph(&[("@src/main", r#"
-        import "./lib" as lib;
-        import "./app" {main as selected};
-        def consume: for(T) Fn(lib.Phantom(T)) -> Int = fn(x) { x.n };
-        export def answer: Int = consume(selected);
-    "#), ("@src/lib", r#"
-        export type Phantom(T) = struct { n: Int };
-        export def make: for(T) Fn(TypeOf(T), Int) -> Phantom(T) = fn(target, n) { {n} };
-    "#), ("@src/app", r#"
-        import "./lib" as lib;
-        export def main: lib.Phantom(Int) = lib.make(Int.type, 42);
-    "#)]);
+    let mut mir = graph(&[
+        (
+            "@src/main",
+            r#"
+        use self::lib as lib;
+        use self::app::{main as selected};
+        def consume: for(T) Fn(lib::Phantom(T)) -> Int = fn(x) { x.n };
+        pub def answer: Int = consume(selected);
+    "#,
+        ),
+        (
+            "@src/lib",
+            r#"
+        pub type Phantom(T) = struct { n: Int };
+        pub def make: for(T) Fn(TypeOf(T), Int) -> Phantom(T) = fn(target, n) { {n} };
+    "#,
+        ),
+        (
+            "@src/app",
+            r#"
+        use crate::lib as lib;
+        pub def main: lib::Phantom(Int) = lib::make(Int.type, 42);
+    "#,
+        ),
+    ]);
     resolve(&mut mir);
     assert!(mir.type_unknowns.is_empty(), "{:?}", mir.diagnostics);
     assert!(mir.diagnostics.is_empty(), "{:?}", mir.diagnostics);
@@ -589,21 +1089,34 @@ fn phantom_generic_results_keep_their_argument_evidence_across_calls() {
 
 #[test]
 fn generic_alias_application_uses_declared_parameters_including_unused_parameters() {
-    let mut mir = graph(&[("@src/main", r#"
+    let mut mir = graph(&[(
+        "@src/main",
+        r#"
         type Pair(A, B) = Tuple([B, A]);
         type Keep(A, B) = Array(A);
         def pair: Pair(Int, String) = ("text", 42);
-        export def number: Int = pair.1;
-        export def values: Keep(Int, String) = [1, 2];
-    "#)]);
+        pub def number: Int = pair.1;
+        pub def values: Keep(Int, String) = [1, 2];
+    "#,
+    )]);
     resolve(&mut mir);
     assert!(mir.diagnostics.is_empty(), "{:?}", mir.diagnostics);
     assert!(mir.type_unknowns.is_empty());
-    let TypeState::Known(number) = symbol_type(&mir, "number") else { panic!("known number"); };
+    let TypeState::Known(number) = symbol_type(&mir, "number") else {
+        panic!("known number");
+    };
     assert_eq!(mir.types[number.index()].constructor, TypeConstructor::Int);
-    let TypeState::Known(values) = symbol_type(&mir, "values") else { panic!("known values"); };
-    assert_eq!(mir.types[values.index()].constructor, TypeConstructor::Array);
-    assert_eq!(mir.types[mir.types[values.index()].arguments[0].index()].constructor, TypeConstructor::Int);
+    let TypeState::Known(values) = symbol_type(&mir, "values") else {
+        panic!("known values");
+    };
+    assert_eq!(
+        mir.types[values.index()].constructor,
+        TypeConstructor::Array
+    );
+    assert_eq!(
+        mir.types[mir.types[values.index()].arguments[0].index()].constructor,
+        TypeConstructor::Int
+    );
 }
 
 #[test]
@@ -611,12 +1124,12 @@ fn native_type_identity_survives_aliases_and_ordinary_names_can_be_shadowed() {
     let mut mir = graph(&[(
         "@src/main",
         r#"
-        import "std/prelude" { Int as Number };
+        use std::prelude::{ Int as Number };
         type Int = String;
         type Array = String;
-        export def number: Number = 42;
-        export def text: Int = "ok";
-        export def other: Array = "also text";
+        pub def number: Number = 42;
+        pub def text: Int = "ok";
+        pub def other: Array = "also text";
     "#,
     )]);
     resolve(&mut mir);
@@ -642,9 +1155,9 @@ fn instantiates_generics_and_solves_recursive_nominal_skeletons() {
         type Pair(T) = struct { first: T, second: T };
         type Tree = enum { Leaf(Int), Branch((Tree, Tree)) };
         def pair: Pair(Int) = { first: id(1), second: id(2) };
-        export def text: String = id("ok");
-        export def number: Int = pair.first;
-        export def tree: Tree = Tree.Branch((Tree.Leaf(1), Tree.Leaf(2)));
+        pub def text: String = id("ok");
+        pub def number: Int = pair.first;
+        pub def tree: Tree = Tree.Branch((Tree.Leaf(1), Tree.Leaf(2)));
     "#,
     )]);
     resolve(&mut mir);
@@ -659,9 +1172,10 @@ fn instantiates_generics_and_solves_recursive_nominal_skeletons() {
 
 #[test]
 fn higher_order_native_calls_use_only_their_declared_generic_signature() {
-    let mut mir = graph(&[(
-        "@src/main",
-        r#"
+    let mut mir = graph(&[
+        (
+            "@src/main",
+            r#"
         native unrelated_name: for(A, B) Fn(Array(A), Fn(A) -> B) -> Array(B);
         native find: for(A) Fn(Array(A), Fn(A) -> Bool) -> Option(A);
         def ordinary: for(A, B) Fn(A, Fn(A) -> B) -> B = fn(value, callback) { callback(value) };
@@ -671,17 +1185,22 @@ fn higher_order_native_calls_use_only_their_declared_generic_signature() {
                 None => None,
             }
         };
-        export def mapped: Array(Bool) = unrelated_name([1, 2, 3], fn(x) { x > 1 });
-        export def explicit: Array(String) = unrelated_name@[Int, _]([1], fn(x) { "ok" });
-        export def text: String = ordinary(1, fn(x) { "ok" });
-        export def result: Option(String) = read([(1, "one")]);
+        pub def mapped: Array(Bool) = unrelated_name([1, 2, 3], fn(x) { x > 1 });
+        pub def explicit: Array(String) = unrelated_name@[Int, _]([1], fn(x) { "ok" });
+        pub def text: String = ordinary(1, fn(x) { "ok" });
+        pub def result: Option(String) = read([(1, "one")]);
     "#,
-    ), ("std/fmt", r#"
+        ),
+        (
+            "std/fmt",
+            r#"
         type Fmt = struct(String);
         trait Display { display: Fn(Self) -> Fmt };
         impl Display for Int { display: fn(value) { Fmt("int") } };
-        export { Display };
-    "#)]);
+        pub use self::{ Display };
+    "#,
+        ),
+    ]);
     resolve(&mut mir);
     assert!(mir.diagnostics.is_empty(), "{:?}", mir.diagnostics);
     assert!(mir.type_unknowns.is_empty(), "{}", mir.dump());
@@ -703,8 +1222,8 @@ fn generic_call_conflicts_keep_the_use_site_and_other_instances_stay_independent
         "@src/main",
         r#"
         native map: for(A, B) Fn(Array(A), Fn(A) -> B) -> Array(B);
-        export def bad: Array(String) = map([1], fn(x) { x > 0 });
-        export def good: Array(Int) = map(["ok"], fn(x) { 42 });
+        pub def bad: Array(String) = map([1], fn(x) { x > 0 });
+        pub def good: Array(Int) = map(["ok"], fn(x) { 42 });
     "#,
     )]);
     resolve(&mut mir);
@@ -723,5 +1242,218 @@ fn generic_call_conflicts_keep_the_use_site_and_other_instances_stay_independent
     assert_eq!(
         mir.types[array.arguments[0].index()].constructor,
         TypeConstructor::Int
+    );
+}
+
+#[test]
+fn sealed_function_bodies_record_resolved_behavioral_dependencies() {
+    let mut mir = graph(&[(
+        "@src/main",
+        r#"
+        def base: Int = 1;
+        def unrelated_base: Int = 2;
+        def apply: Fn(Fn(Int) -> Int, Int) -> Int = fn(f, value) { f(value) };
+        def forward: Fn(Fn(Int) -> Int, Int) -> Int = fn(f, value) { apply(f, value) };
+        def helper: Fn(Int) -> Int = fn(value) { value + base };
+        def unused: Fn(Int) -> Int = fn(value) { value + unrelated_base };
+        pub def answer: Fn(Int) -> Int = fn(value) { forward(helper, value) };
+    "#,
+    )]);
+    resolve(&mut mir);
+    assert!(mir.diagnostics.is_empty(), "{}", mir.dump());
+    let export = mir
+        .symbols
+        .iter()
+        .position(|symbol| {
+            symbol.name == "answer" && matches!(symbol.resolution, ResolveState::Bound(_))
+        })
+        .unwrap();
+    let executable = mir.seal_export(SymbolId(export as u32)).unwrap();
+    let symbol = |name: &str| {
+        SymbolId(
+            mir.symbols
+                .iter()
+                .position(|symbol| {
+                    symbol.name == name && matches!(symbol.kind, SymbolKind::Declaration(_))
+                })
+                .unwrap() as u32,
+        )
+    };
+    let graph = executable.function_dependencies();
+    assert!(graph.functions().iter().any(|function| {
+        function
+            .dependencies
+            .contains(&FunctionBodyDependency::TopLevel(symbol("base")))
+    }));
+    let entry = graph
+        .functions()
+        .iter()
+        .find(|function| {
+            function
+                .dependencies
+                .contains(&FunctionBodyDependency::TopLevel(symbol("forward")))
+                && function
+                    .dependencies
+                    .contains(&FunctionBodyDependency::TopLevel(symbol("helper")))
+        })
+        .unwrap();
+    assert!(graph.reachable_state(entry.id).0.contains(&symbol("base")));
+    assert!(
+        !graph
+            .reachable_state(entry.id)
+            .0
+            .contains(&symbol("unrelated_base"))
+    );
+    assert!(graph.functions().iter().all(|function| {
+        function.dependencies.iter().all(|dependency| {
+            !matches!(
+                dependency,
+                FunctionBodyDependency::Conservative(FunctionDependencyFallback::Parameter { .. })
+            )
+        })
+    }));
+}
+
+#[test]
+fn local_closure_captures_remain_data_edges() {
+    let mut mir = graph(&[(
+        "@src/main",
+        r#"
+        pub def answer: Fn(Int) -> Int = fn(value) {
+            let offset: Int = 1;
+            let add: Fn(Int) -> Int = fn(input) { input + offset };
+            add(value)
+        };
+    "#,
+    )]);
+    resolve(&mut mir);
+    assert!(mir.diagnostics.is_empty(), "{}", mir.dump());
+    let export = mir
+        .symbols
+        .iter()
+        .position(|symbol| {
+            symbol.name == "answer" && matches!(symbol.resolution, ResolveState::Bound(_))
+        })
+        .unwrap();
+    let executable = mir.seal_export(SymbolId(export as u32)).unwrap();
+    let graph = executable.function_dependencies();
+    assert_eq!(graph.functions().len(), 2);
+    assert!(graph.functions().iter().all(|function| {
+        function
+            .dependencies
+            .iter()
+            .all(|dependency| !matches!(dependency, FunctionBodyDependency::TopLevel(_)))
+    }));
+    assert!(graph.functions().iter().any(|function| {
+        function
+            .dependencies
+            .iter()
+            .any(|dependency| matches!(dependency, FunctionBodyDependency::Function(_)))
+    }));
+}
+
+#[test]
+fn sealed_generic_functions_share_a_prototype_but_keep_instance_identity() {
+    let mut mir = graph(&[(
+        "@src/main",
+        r#"
+        def identity: for(T) Fn(T) -> T = fn(value) { value };
+        pub def answer: (Int, String) = (identity(1), identity("ok"));
+    "#,
+    )]);
+    resolve(&mut mir);
+    assert!(mir.diagnostics.is_empty(), "{}", mir.dump());
+    let export = mir
+        .symbols
+        .iter()
+        .position(|symbol| {
+            symbol.name == "answer" && matches!(symbol.resolution, ResolveState::Bound(_))
+        })
+        .unwrap();
+    let executable = mir.seal_export(SymbolId(export as u32)).unwrap();
+    let identity = mir
+        .symbols
+        .iter()
+        .position(|symbol| {
+            symbol.name == "identity" && matches!(symbol.kind, SymbolKind::Declaration(_))
+        })
+        .unwrap();
+    let functions = executable
+        .function_dependencies()
+        .functions()
+        .iter()
+        .filter(|function| {
+            function.root.instance.is_some_and(|instance| {
+                mir.generic_instances[instance.index()].symbol.index() == identity
+            })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(functions.len(), 2, "{}", mir.dump());
+    assert_ne!(functions[0].id, functions[1].id);
+    assert_eq!(functions[0].prototype, functions[1].prototype);
+}
+
+#[test]
+fn sealed_function_dependency_dump_is_deterministic() {
+    let source = r#"
+        def base: Int = 1;
+        def helper: for(T) Fn(T) -> Int = fn(value) { base };
+        pub def answer: (Int, Int) = (helper(base), helper("ok"));
+    "#;
+    let build = || {
+        let mut mir = graph(&[("@src/main", source)]);
+        resolve(&mut mir);
+        assert!(mir.diagnostics.is_empty(), "{}", mir.dump());
+        let export = mir
+            .symbols
+            .iter()
+            .position(|symbol| {
+                symbol.name == "answer" && matches!(symbol.resolution, ResolveState::Bound(_))
+            })
+            .unwrap();
+        mir.seal_export(SymbolId(export as u32))
+            .unwrap()
+            .function_dependencies()
+            .dump()
+    };
+    let first = build();
+    let second = build();
+    assert_eq!(first.as_bytes(), second.as_bytes());
+    assert!(first.contains("top-level"), "{first}");
+    assert!(first.contains("proto"), "{first}");
+}
+
+#[test]
+fn unbound_higher_order_parameters_keep_a_structured_fallback() {
+    let mut mir = graph(&[(
+        "@src/main",
+        r#"
+        pub def apply: Fn(Fn(Int) -> Int, Int) -> Int =
+            fn(f, value) { f(value) };
+    "#,
+    )]);
+    resolve(&mut mir);
+    assert!(mir.diagnostics.is_empty(), "{}", mir.dump());
+    let export = mir
+        .symbols
+        .iter()
+        .position(|symbol| {
+            symbol.name == "apply" && matches!(symbol.resolution, ResolveState::Bound(_))
+        })
+        .unwrap();
+    let executable = mir.seal_export(SymbolId(export as u32)).unwrap();
+    assert!(
+        executable
+            .function_dependencies()
+            .functions()
+            .iter()
+            .any(
+                |function| function.dependencies.iter().any(|dependency| matches!(
+                    dependency,
+                    FunctionBodyDependency::Conservative(
+                        FunctionDependencyFallback::Parameter { .. }
+                    )
+                ))
+            )
     );
 }

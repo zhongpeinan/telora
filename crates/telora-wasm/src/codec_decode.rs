@@ -1,4 +1,4 @@
-//! Context: three property identities, padding, path, rejection cell.
+//! Context: reserved words, path, rejection cell.
 //! Rejection cell: message, subject, original checker Blame (all pointers).
 use crate::{
     abi::*,
@@ -25,10 +25,7 @@ impl Emitter<'_> {
             return Err("Wasm: codec decode result mismatch".into());
         }
         let input = self.parameter(2);
-        let properties = self.parameter(0);
-        let properties = self.codec_property_context(args[0], properties)?;
         let context = self.alloc(32);
-        self.copy(context, 0, properties, 12);
         let path = self.text_as(self.key.node, self.string_type()?, b"$")?;
         let error = self.alloc(12);
         self.store32(error, 0, 0);
@@ -220,7 +217,7 @@ impl Emitter<'_> {
         self.store32(object, BLAME_COUNT as u64, 1);
         self.store32(object, BLAME_COUNT as u64 + 4, 0);
         self.copy(object, BLAME_SUBJECTS, input, LOC_BYTES);
-        let id = self.table_push(BLAMES, object, BLAME_SUBJECTS + LOC_BYTES);
+        let id = self.table_push(BLAMES, object, BLAME_SUBJECTS + LOC_BYTES, None)?;
         let blame = self.value_as(self.key.node, ty, SCALAR_BYTES)?;
         self.extend([
             I::LocalGet(blame),

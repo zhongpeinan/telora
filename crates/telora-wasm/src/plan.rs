@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use telora_core::mir::{
-    GenericInstanceId, HirId, HirKind, Mir, ResolveState, Role, SealedExecutable, SymbolId, TypeId,
-    TypeState,
+    FunctionBodyDependency, GenericInstanceId, HirId, HirKind, Mir, ResolveState, Role,
+    SealedExecutable, SymbolId, TypeId, TypeState,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -79,6 +79,7 @@ pub(crate) struct Plan {
     pub instances: BTreeMap<GenericInstanceId, Key>,
     pub demands: BTreeMap<Key, u32>,
     pub captures: BTreeMap<Key, Vec<SymbolId>>,
+    pub capture_types: BTreeMap<Key, Vec<TypeId>>,
     pub instance_captures: BTreeMap<Key, Vec<GenericInstanceId>>,
     pub local_instances: BTreeSet<GenericInstanceId>,
     pub layouts: Vec<telora_core::candidate_layout::Entry>,
@@ -88,9 +89,15 @@ pub(crate) struct Plan {
     pub comparisons: BTreeMap<TypeId, Key>,
     pub parsers: BTreeMap<TypeId, Key>,
     pub parser_evidence: BTreeMap<TypeId, usize>,
+    pub display_evidence: BTreeMap<TypeId, usize>,
+    pub parse_codecs: BTreeSet<TypeId>,
+    pub display_codecs: BTreeSet<TypeId>,
+    pub codec_property_type: Option<TypeId>,
     pub reflection: Vec<u8>,
     pub origins: crate::value_origins::OriginConstants,
     pub native_signatures: BTreeSet<TypeId>,
+    /// Transitive demand roots indexed by generated function-table ordinal.
+    pub function_demand_roots: Vec<Vec<u32>>,
 }
 
 impl Plan {
@@ -110,6 +117,7 @@ impl Plan {
             instances: BTreeMap::new(),
             demands: BTreeMap::new(),
             captures: BTreeMap::new(),
+            capture_types: BTreeMap::new(),
             instance_captures: BTreeMap::new(),
             local_instances: BTreeSet::new(),
             layouts: telora_core::candidate_layout::calculate(executable.sealed_mir())?,
@@ -119,9 +127,14 @@ impl Plan {
             comparisons: BTreeMap::new(),
             parsers: BTreeMap::new(),
             parser_evidence: BTreeMap::new(),
+            display_evidence: BTreeMap::new(),
+            parse_codecs: BTreeSet::new(),
+            display_codecs: BTreeSet::new(),
+            codec_property_type: None,
             reflection: vec![],
             origins: Default::default(),
             native_signatures: BTreeSet::new(),
+            function_demand_roots: vec![],
         };
         for &symbol in executable.globals() {
             if !mir.symbol_generics[symbol.index()].is_empty() {
@@ -134,10 +147,15 @@ impl Plan {
             // A monomorphic trait implementation can be reached only through
             // a selected instance. Emit exactly the contexts sealed by MIR;
             // global scope alone does not admit another initializer.
-            if executable.closure().nodes().binary_search(&telora_core::mir::ExecutionRoot {
-                node,
-                instance: None,
-            }).is_err() {
+            if executable
+                .closure()
+                .nodes()
+                .binary_search(&telora_core::mir::ExecutionRoot {
+                    node,
+                    instance: None,
+                })
+                .is_err()
+            {
                 continue;
             }
             let key = Key {
@@ -307,16 +325,25 @@ impl Plan {
             plan.reflection =
                 crate::reflection_data::build(executable.sealed_mir().types(), &plan.layouts)?;
         }
+        plan.validate_function_dependencies(executable)?;
         // Constructor identity is (closed signature, variant), independent of
         // the expression's source location. Values carry their own source head.
         let mut constructors = BTreeMap::new();
         for key in plan.functions.keys().copied().collect::<Vec<_>>() {
-            if !key.callable || key.special != Special::Normal { continue; }
-            let Some(fact @ telora_core::mir::ValueMaterialization::EnumVariant { .. }) = mir.value_materializations[key.node.index()] else { continue; };
+            if !key.callable || key.special != Special::Normal {
+                continue;
+            }
+            let Some(fact @ telora_core::mir::ValueMaterialization::EnumVariant { .. }) =
+                mir.value_materializations[key.node.index()]
+            else {
+                continue;
+            };
             let identity = (key.ty(mir, key.node)?, fact);
             let canonical = *constructors.entry(identity).or_insert(key);
             plan.constructor_aliases.insert(key, canonical);
-            if canonical != key { plan.functions.remove(&key); }
+            if canonical != key {
+                plan.functions.remove(&key);
+            }
         }
         for (index, function) in plan.functions.values_mut().enumerate() {
             *function = u32::try_from(index)
@@ -332,6 +359,7 @@ impl Plan {
                 .and_then(|n| n.checked_add(static_base))
                 .ok_or("Wasm: demand offset overflow")?;
         }
+        plan.function_demand_roots = plan.build_function_demand_roots(executable)?;
         for &key in plan.functions.keys().filter(|key| key.callable) {
             if matches!(
                 key.special,
@@ -346,7 +374,7 @@ impl Plan {
             }
             let mut pending = vec![key.node];
             let mut declared = BTreeSet::new();
-            let mut referenced = BTreeSet::new();
+            let mut referenced = BTreeMap::new();
             let mut instances = BTreeSet::new();
             while let Some(node) = pending.pop() {
                 let syntax = &mir.hir[node.index()];
@@ -393,13 +421,19 @@ impl Plan {
                     {
                         instances.insert(instance);
                     } else if mir.symbol_generics[symbol.index()].is_empty() {
-                        referenced.insert(symbol);
+                        referenced.insert(symbol, key.effective_ty(mir, node)?);
                     }
                 }
                 pending.extend(syntax.children.iter().map(|edge| edge.node));
             }
+            let captures = referenced
+                .into_iter()
+                .filter(|(symbol, _)| !declared.contains(symbol))
+                .collect::<Vec<_>>();
             plan.captures
-                .insert(key, referenced.difference(&declared).copied().collect());
+                .insert(key, captures.iter().map(|(symbol, _)| *symbol).collect());
+            plan.capture_types
+                .insert(key, captures.into_iter().map(|(_, ty)| ty).collect());
             plan.instance_captures.insert(
                 key,
                 instances
@@ -409,12 +443,119 @@ impl Plan {
             );
         }
         for key in plan.functions.keys() {
-            if key.callable && key.special == Special::Normal
-                && crate::natives::identity(mir, key.node).is_some() {
+            if key.callable
+                && key.special == Special::Normal
+                && crate::natives::identity(mir, key.node).is_some()
+            {
                 plan.native_signatures.insert(key.ty(mir, key.node)?);
             }
         }
         Ok(plan)
+    }
+
+    fn validate_function_dependencies(
+        &self,
+        executable: &SealedExecutable<'_>,
+    ) -> Result<(), String> {
+        let graph = executable.function_dependencies();
+        for function in graph.functions() {
+            let key = Key {
+                node: function.root.node,
+                instance: function.root.instance,
+                callable: true,
+                special: Special::Normal,
+            };
+            if !self.functions.contains_key(&key) {
+                return Err(format!(
+                    "Wasm: sealed function {} has no planned body",
+                    function.id.index()
+                ));
+            }
+            for dependency in &function.dependencies {
+                match dependency {
+                    FunctionBodyDependency::Function(target) => {
+                        if graph.function(*target).is_none() {
+                            return Err(format!(
+                                "Wasm: sealed function {} depends on missing function {}",
+                                function.id.index(),
+                                target.index()
+                            ));
+                        }
+                    }
+                    FunctionBodyDependency::TopLevel(symbol) => {
+                        if !executable.globals().contains(symbol) {
+                            return Err(format!(
+                                "Wasm: sealed function {} depends on unplanned top-level {}",
+                                function.id.index(),
+                                symbol.index()
+                            ));
+                        }
+                    }
+                    FunctionBodyDependency::Property(property) => {
+                        if !self.properties.contains_key(&property.index()) {
+                            return Err(format!(
+                                "Wasm: sealed function {} depends on unplanned property {}",
+                                function.id.index(),
+                                property.index()
+                            ));
+                        }
+                    }
+                    FunctionBodyDependency::Conservative(_) => {}
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn build_function_demand_roots(
+        &self,
+        executable: &SealedExecutable<'_>,
+    ) -> Result<Vec<Vec<u32>>, String> {
+        let static_base = crate::compose::static_base()?;
+        let demand_index = |key: Key| -> Result<Option<u32>, String> {
+            self.demands
+                .get(&key)
+                .map(|offset| {
+                    offset
+                        .checked_sub(static_base)
+                        .filter(|bytes| bytes % crate::abi::DEMAND_BYTES == 0)
+                        .map(|bytes| bytes / crate::abi::DEMAND_BYTES)
+                        .ok_or_else(|| "Wasm: invalid demand offset".to_owned())
+                })
+                .transpose()
+        };
+        let mut result = vec![vec![]; self.functions.len()];
+        let graph = executable.function_dependencies();
+        for function in graph.functions() {
+            let key = Key {
+                node: function.root.node,
+                instance: function.root.instance,
+                callable: true,
+                special: Special::Normal,
+            };
+            let ordinal = self.functions[&key]
+                .checked_sub(crate::abi::FIRST_FUNCTION)
+                .ok_or("Wasm: invalid generated function index")?
+                as usize;
+            let (globals, properties, _) = graph.reachable_state(function.id);
+            let mut roots = BTreeSet::new();
+            for symbol in globals {
+                if let Some(&key) = self.globals.get(&symbol)
+                    && let Some(index) = demand_index(key)?
+                {
+                    roots.insert(index);
+                }
+            }
+            for property in properties {
+                if let Some(&key) = self.properties.get(&property.index())
+                    && let Some(index) = demand_index(key)?
+                {
+                    roots.insert(index);
+                }
+            }
+            result[ordinal] = roots.into_iter().collect();
+        }
+        Ok(result)
     }
 }
 

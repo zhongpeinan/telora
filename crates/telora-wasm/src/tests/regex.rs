@@ -40,31 +40,48 @@ fn string_parse_constructs_nested_and_recursive_sealed_records() {
 
 #[test]
 fn unrelated_records_do_not_expand_static_regex_parsers() {
-    let source = |noise: &str| format!(r#"
-        import "std/regex" as regex;
-        import "std/string" as string;
-        @regex.parse_by(regex.compile("^(?P<value>.+)$"))
+    let source = |noise: &str| {
+        format!(
+            r#"
+        use std::regex as regex;
+        use std::string as string;
+        @regex::parse_by(regex::compile("^(?P<value>.+)$"))
         type Parsed = struct {{ value: Int }};
         {noise}
-        export def answer: Fn() -> Bool = fn() {{
+        pub def answer: Fn() -> Bool = fn() {{
             match string.parse@[Parsed]("42") {{
                 Ok(value) => value.value == 42,
                 Err(_) => False,
             }}
         }};
-    "#);
+    "#
+        )
+    };
     let analyze = |source: &str| {
         let mir = graph(source);
-        let export = mir.exports.iter().flatten().copied()
-            .find(|id| mir.symbols[id.index()].name == "answer").unwrap();
+        let export = mir
+            .exports
+            .iter()
+            .flatten()
+            .copied()
+            .find(|id| mir.symbols[id.index()].name == "answer")
+            .unwrap();
         let executable = mir.seal_export(export).unwrap();
         let plan = crate::plan::Plan::new(&executable).unwrap();
         let bytes = crate::compile_executable(&executable).unwrap();
-        let locals = wasmparser::Parser::new(0).parse_all(&bytes).filter_map(|payload| match payload.unwrap() {
-            wasmparser::Payload::CodeSectionEntry(body) => Some(body.get_locals_reader().unwrap()
-                .into_iter().map(|local| local.unwrap().0).sum::<u32>()),
-            _ => None,
-        }).collect::<Vec<_>>();
+        let locals = wasmparser::Parser::new(0)
+            .parse_all(&bytes)
+            .filter_map(|payload| match payload.unwrap() {
+                wasmparser::Payload::CodeSectionEntry(body) => Some(
+                    body.get_locals_reader()
+                        .unwrap()
+                        .into_iter()
+                        .map(|local| local.unwrap().0)
+                        .sum::<u32>(),
+                ),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         (plan.parsers.len(), locals)
     };
     let baseline = analyze(&source(""));

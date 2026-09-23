@@ -156,12 +156,13 @@ Host 是权限边界，不只是 foreign-function interface。
 ### 应用入口
 
 应用入口来自封闭模块图中的显式导出。普通 eval 选择 Value 导出；服务选择
-实现 TransformService 的具体类型 MainService。没有名为 @main 的特权模块，
+标记 `@service::collection` 的具体 MainService struct。没有名为 @main 的特权模块，
 应用只能消费 Host 显式提供的数据。
 
 ### Entry 与 TransformService
 
-服务入口是模块导出的具体类型 MainService，必须实现 std/transform-service.TransformService：
+服务入口是模块公开的 `@service::collection` MainService struct；每个字段的具体类型实现
+`std::transform_service::TransformService`：
 
 ```telora
 trait TransformService {
@@ -170,21 +171,21 @@ trait TransformService {
 };
 ```
 
-Context 为 {sources: Dict(Value)}。@service.source("name") 是普通类型 property，
-多次声明归并为稳定来源清单，重复声明报错。Host 提供的来源必须与清单一致。
-MainService 可以是正常类型别名或重导出，所有类型参数和方法实例都在 MIR 中确定。
-内置 entry 包装方法调用，无运行时 trait 派发，也不按模块成员 shape 猜测入口。
+集合字段使用 `@service::slot("name")` 声明静态服务适配器和请求方法，
+可附加 `@http::get/post("/path")` 声明 HTTP 路由。Context 为 {sources: Dict(Value)}。
+字段服务的 `@service::source("name")` 声明归并为稳定来源清单；Host 来源必须与清单一致。
+所有类型参数和方法实例都在 MIR 中确定。内置 entry 包装方法调用，无运行时 trait 派发。
 
-模块顶层值与 property 初始化完成后，Host 准备来源并调用 init；随后每次调用 transform。
+模块顶层值与 property 初始化完成后，Host 准备来源并初始化各字段；随后按路由调用 transform。
 来源只读取一次，服务间隙 reset 到初始化后的确定基线。transform 不产生跨请求状态更新。
 init 失败不发布实例。内置 with_diagnostics 捕获普通语言 failure 并保留完整诊断；
 fuel/memory 耗尽由执行器结束当前请求，下一个请求仍从同一基线获得独立预算。
 配额用于可停机，不是精确计费，reset 和页级计量方式不构成语言契约。
 
-run 从 stdin 读取一个 JSON，成功输出一个 JSON Value；serve --bind stdio+jsonl:// 读取 JSONL，
+run 从 stdin 读取一个 JSON，成功输出一个 JSON Value；`run --serve stdio+jsonl://` 读取 JSONL，
 每条输入对应 {ok, error, diagnostics} 响应，按输入顺序处理。diagnostics 包含 severity、
 message、labels、notes；已捕获诊断不重复输出。服务不接受 stdin 初始化 source；单次 run/JSONL 使用 stdin，HTTP 使用请求体。--source name=path.json 或 file+FORMAT://path 使用已有格式验证和来源管线。
-初始化来源使用 @service/name，请求来源使用 @request；物理路径不进入来源身份。
+初始化来源使用 @service/name；逐次请求输入不注册规范来源路径，物理路径不进入来源身份。
 
 服务不获得环境、进程、网络或任意文件能力；需要的业务输入由 Host 显式转成 Value。
 旧 eval-with、entry.Eval/Run/Serve、应用 EES 与 reducer 协议均已删除。
@@ -211,13 +212,13 @@ message、labels、notes；已捕获诊断不重复输出。服务不接受 stdi
 
 **Canonical source path（规范来源路径）**是 Source 对语言值和诊断公开的稳定名字。
 它与 Host 用于读取数据的物理 locator 分离，也不必是 module identity。运行上下文中的
-服务初始化来源使用 `@service/<key>`，逐次输入使用 `@request`。
+服务初始化来源使用 `@service/<key>`；逐次请求输入不注册规范来源路径。
 数据文件保留格式特定的解析规则和字段级来源。
 
 ### Value
 
 **值**是具有确定类型身份的不可变运行时数据，可携带诊断位置；位置不参与相等比较。
-`std/value.Value` 则是一个具体的递归 enum，不能把它与“所有语言值”混用。
+`std::value::Value` 则是一个具体的递归 enum，不能把它与“所有语言值”混用。
 
 ### Provenance
 
@@ -235,16 +236,16 @@ resolver 按 vendor 顺序注册 crate，并以 crate 为颗粒采用 first-win�
 
 **Workspace config** 为 workspace 中的每个 crate name 选择唯一 source：workspace
 member 或确定的远程 tarball。**Crate manifest** 声明 crate 的 canonical name、权威
-普通 module catalog 和直接 dependency names。**Workspace lock** 固定完整精确 package
+固定 crate 根和直接 dependency names。**Workspace lock** 固定完整精确 package
 graph；除显式 lock 操作外，Host 只验证和消费它。
 
 **Package preparation** 是 resolver 之前的 Host 阶段。它验证 config 与 lock、通过内嵌
-`telora-ees` 的 IMOS component 物化远程 source、校验物化 manifest，并产生一次命令
+IMOS store 物化远程 source、校验物化 manifest，并产生一次命令
 生命周期内不变的 crate-name 到 root 映射。Package source 和物理 root 不进入 module
 identity。
 
 包管理 Host 使用私有 IMOS 服务物化依赖；业务 TransformService 不获得外部 effect 能力。
-run/serve 共用静态方法协议，差异仅在单次输入和持续请求流。
+`run` 的单次执行与 `--serve URI` 持续服务共用静态方法协议。
 
 只有模块图节点拥有 module identity 和 `ModuleId`。Telora module 与 static data module
 的 canonical source path 通常等于其 module identity；运行上下文 source 等非模块输入
@@ -326,7 +327,7 @@ property 的函数。目标的 TypeMetadata、TypeId 和 canonical member index 
 运行前已经封闭；provider 从只读 context 计算并返回 property value。类型骨架和
 property registry 是两个独立的数据域，协议与执行顺序保证目标的结构和身份稳定。
 Property carrier 必须是由
-`@property(PropertyTarget.Type)` 这类标记修饰的具体具名类型；参数是具名 enum
+`@property(PropertyTarget::Type)` 这类标记修饰的具体具名类型；参数是具名 enum
 `PropertyTarget` 的值，其成员为 `Type`、`StructType`、`EnumType`、`Member`、
 `Field` 和 `Variant`，多个标记按位合并。声明与表达式类型在静态阶段解析；目标标记的值及 property payload 在工具阶段计算。
 

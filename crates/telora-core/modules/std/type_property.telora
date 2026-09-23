@@ -1,0 +1,39 @@
+type FieldPropertyCtx = struct {
+    owner: Type,
+    index: Int,
+    name: String,
+    ty: Type,
+};
+
+type TypedFieldPropertyCtx(T) = struct {
+    owner: Type,
+    index: Int,
+    name: String,
+    ty: TypeOf(T),
+};
+
+type VariantPropertyCtx = struct {
+    owner: Type,
+    index: Int,
+    name: String,
+    payload: Option(Type),
+};
+
+native get_type_prop: for(P) Fn(Type, TypeOf(P)) -> Option(P);
+native get_field_prop: for(P) Fn(Type, Int, TypeOf(P)) -> Option(P);
+native get_variant_prop: for(P) Fn(Type, Int, TypeOf(P)) -> Option(P);
+native evidence: for(P, T: Property(P)) Fn(TypeOf(T), TypeOf(P)) -> P;
+native required: for(P, T: Property(P)) Fn() -> P;
+native optional: for(P, T: ?Property(P)) Fn() -> Option(P);
+
+pub use self::{
+    FieldPropertyCtx,
+    TypedFieldPropertyCtx,
+    VariantPropertyCtx,
+    get_type_prop,
+    get_field_prop,
+    get_variant_prop,
+    evidence,
+    required,
+    optional,
+};

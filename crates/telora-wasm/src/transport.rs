@@ -1,5 +1,5 @@
 //! Typed host handles into Wasm memory; no host copy of language object graphs.
-use crate::{abi, artifact::Kind, output::Output, session::Session};
+use crate::{artifact::Kind, output::Output, session::Session};
 
 /// A borrowed language handle. Initialization compacts its owned graph: inject
 /// pre-initialization inputs into their demand slots, then acquire fresh handles
@@ -66,7 +66,7 @@ impl Session {
             .types
             .get(ty as usize)
             .ok_or("Wasm: invalid transport type")?;
-        if value.ty != ty || self.output().word(value.pointer as u64 + abi::TYPE)? != ty {
+        if value.ty != ty {
             return Err("Wasm: host value differs from sealed protocol type".into());
         }
         self.output()
@@ -102,7 +102,8 @@ impl Session {
         let args = self.allocate(
             arguments
                 .len()
-                .checked_add(1).ok_or("Wasm: argument count overflow")?
+                .checked_add(1)
+                .ok_or("Wasm: argument count overflow")?
                 .checked_mul(4)
                 .ok_or("Wasm: argument size overflow")?,
         )?;
@@ -114,9 +115,16 @@ impl Session {
             .instance
             .get_typed_func::<(i32, i32), i32>(&self.store, "telora_invoke")
             .map_err(|e| e.to_string())?;
-        let pointer = invoke
-            .call(&mut self.store, (closure.pointer as i32, args as i32))
-            .map_err(|e| e.to_string())? as u32;
+        if self.execution_quota.is_none() {
+            self.start_execution()?;
+        }
+        let called = self.execution_quota.as_mut().unwrap().call(
+            &mut self.store,
+            invoke,
+            (closure.pointer as i32, args as i32),
+        );
+        self.metered_fuel = self.execution_quota.as_ref().map(|quota| quota.consumed());
+        let pointer = called? as u32;
         if pointer == 0 {
             return Ok(None);
         }

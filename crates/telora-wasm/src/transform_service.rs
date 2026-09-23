@@ -5,7 +5,7 @@ mod buffers;
 mod input;
 
 struct Baseline {
-    memory: Vec<u8>,
+    snapshot: Vec<u8>,
     globals: Vec<(String, wasmi::Val)>,
     manifest: Manifest,
     registered_sources: usize,
@@ -41,7 +41,9 @@ pub struct TransformSession {
 
 impl TransformSession {
     pub fn new(mut session: Session) -> Result<Self, String> {
-        let count = session.exports.source_count
+        let count = session
+            .exports
+            .source_count
             .call(&mut session.store, ())
             .map_err(|e| e.to_string())?;
         let result = buffers::alloc(&mut session, 12, 4)?;
@@ -80,19 +82,46 @@ impl TransformSession {
     }
 
     pub fn usage(&self) -> crate::session::Usage {
-        let mut usage = self.session.usage();
-        if let Some(baseline) = &self.baseline {
-            usage.memory_limit = usage.memory_limit.saturating_add(baseline.memory.len());
+        self.session.usage()
+    }
+
+    pub fn publication_snapshot(
+        &self,
+    ) -> Result<telora_wasm_shared::snapshot_artifact::Snapshot, String> {
+        use telora_wasm_shared::snapshot_artifact::{GlobalValue, Snapshot};
+        let baseline = self
+            .baseline
+            .as_ref()
+            .ok_or("service initialization is not sealed")?;
+        let mut globals = Vec::with_capacity(baseline.globals.len());
+        for (name, value) in &baseline.globals {
+            let value = match value {
+                wasmi::Val::I32(value) => GlobalValue::I32(*value),
+                wasmi::Val::I64(value) => GlobalValue::I64(*value),
+                wasmi::Val::F32(value) => GlobalValue::F32(value.to_bits()),
+                wasmi::Val::F64(value) => GlobalValue::F64(value.to_bits()),
+                _ => return Err("snapshot reset globals must be scalar".into()),
+            };
+            globals.push((name.clone(), value));
         }
-        usage
+        globals.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(Snapshot {
+            guest: baseline.snapshot.clone(),
+            globals,
+        })
     }
 
     pub fn initialize(&mut self, sources: &[SourceInput<'_>]) -> Result<Initialization, String> {
-        self.initialize_readers(sources.iter().map(|source| Ok(SourceReader {
-            name: source.name.to_owned(),
-            reader: Box::new(std::io::Cursor::new(source.data)),
-            format: source.format,
-        })), u32::MAX as usize)
+        self.initialize_readers(
+            sources.iter().map(|source| {
+                Ok(SourceReader {
+                    name: source.name.to_owned(),
+                    reader: Box::new(std::io::Cursor::new(source.data)),
+                    format: source.format,
+                })
+            }),
+            u32::MAX as usize,
+        )
     }
 
     pub fn initialize_readers<'a>(
@@ -104,6 +133,9 @@ impl TransformSession {
             return Err("service initialization cannot be repeated".into());
         }
         self.poisoned = true;
+        self.session
+            .initialization_quota
+            .get_or_insert_with(|| crate::fuel_quota::FuelQuota::new(self.session.fuel_budget));
         let mut buffer = input::TransferBuffer::new();
         let set = self.session.exports.set_source;
         let mut supplied = 0;
@@ -113,29 +145,37 @@ impl TransformSession {
                 return Err("service sources do not match declared sources".into());
             }
             let id = self.source_ids[supplied];
-            let length = buffer.read(&mut self.session, &mut source.reader, max_bytes)
+            let length = buffer
+                .read(&mut self.session, &mut source.reader, max_bytes)
                 .map_err(|error| format!("service source {:?}: {error}", source.name))?;
             let format = match source.format {
                 Format::Json => 1,
                 Format::Yaml => 2,
                 Format::Toml => 3,
             };
-            set.call(
+            self.session.initialization_quota.as_mut().unwrap().call(
                 &mut self.session.store,
+                set,
                 (id, buffer.pointer, length, format),
-            )
-            .map_err(|e| e.to_string())?;
+            )?;
             supplied += 1;
         }
         buffer.free(&mut self.session)?;
         if supplied != self.sources.len() {
             return Err("service sources do not match declared sources".into());
         }
-        let status = self.session.exports.create_service
-            .call(&mut self.session.store, ())
-            .map_err(|e| e.to_string())?;
+        let status = self.session.initialization_quota.as_mut().unwrap().call(
+            &mut self.session.store,
+            self.session.exports.create_service,
+            (),
+        )?;
         let diagnostics = self.initialization_diagnostics()?;
         self.ready = status == 0;
+        self.session.metered_fuel = self
+            .session
+            .initialization_quota
+            .as_ref()
+            .map(|quota| quota.consumed());
         // A failed initialization has no baseline and can never be retried.
         self.poisoned = !self.ready;
         Ok(Initialization {
@@ -146,7 +186,9 @@ impl TransformSession {
 
     fn initialization_diagnostics(&mut self) -> Result<serde_json::Value, String> {
         let result = buffers::alloc(&mut self.session, 12, 4)?;
-        self.session.exports.diagnostics
+        self.session
+            .exports
+            .diagnostics
             .call(&mut self.session.store, (1, 0, result))
             .map_err(|e| e.to_string())?;
         let bytes = buffers::response(&mut self.session, result)?;
@@ -166,7 +208,8 @@ impl TransformSession {
         if !self.ready || self.poisoned {
             return Err("service is not initialized".into());
         }
-        let globals = self
+        self.session.initialization_quota = None;
+        let globals: Vec<(String, wasmi::Val)> = self
             .session
             .instance
             .exports(&self.session.store)
@@ -183,13 +226,27 @@ impl TransformSession {
                     .then(|| (name, global.get(&self.session.store)))
             })
             .collect();
+        let snapshot = export_snapshot(&mut self.session)?;
+        let mut compact = self.session.fresh_instance()?;
+        import_snapshot(&mut compact, &snapshot)?;
+        for (name, value) in &globals {
+            compact
+                .instance
+                .get_global(&compact.store, name)
+                .ok_or("missing reset global")?
+                .set(&mut compact.store, value.clone())
+                .map_err(|error| error.to_string())?;
+        }
+        compact.usage_reporter = self.session.usage_reporter.take();
+        self.session = compact;
         self.baseline = Some(Baseline {
-            memory: self.session.memory.data(&self.session.store).to_vec(),
+            snapshot,
             globals,
             manifest: self.session.manifest.clone(),
             registered_sources: self.session.registered_sources,
             emitted_debug: self.session.emitted_debug.get(),
         });
+        self.session.start_execution()?;
         Ok(())
     }
 
@@ -197,76 +254,64 @@ impl TransformSession {
     /// A trapped/poisoned instance is restored from the initialization snapshot.
     pub fn reset(&mut self) -> Result<(), String> {
         let baseline = self.baseline.as_ref().ok_or("service is not initialized")?;
-        let limit = baseline
-            .memory
-            .len()
-            .checked_add(self.session.memory_limit)
-            .ok_or("service memory limit overflow")?;
+        let limit = self.session.memory_limit;
         if !self.poisoned {
             // Cleanup is not charged to the next request, and must not inherit
             // the previous request's nearly exhausted fuel.
-            self.session.store.set_fuel(self.session.fuel_budget).map_err(|e| e.to_string())?;
-            if self.session.exports.reset_service.call(&mut self.session.store, ()).is_ok() {
+            self.session
+                .store
+                .set_fuel(self.session.fuel_budget)
+                .map_err(|e| e.to_string())?;
+            if self
+                .session
+                .exports
+                .reset_service
+                .call(&mut self.session.store, ())
+                .is_ok()
+            {
                 for (name, value) in &baseline.globals {
-                    self.session.instance.get_global(&self.session.store, name)
+                    self.session
+                        .instance
+                        .get_global(&self.session.store, name)
                         .ok_or("missing reset global")?
-                        .set(&mut self.session.store, value.clone()).map_err(|e| e.to_string())?;
+                        .set(&mut self.session.store, value.clone())
+                        .map_err(|e| e.to_string())?;
                 }
                 *self.session.store.data_mut() = wasmi::StoreLimitsBuilder::new()
-                    .memory_size(limit).table_elements(1_000_000).trap_on_grow_failure(true).build();
-                self.session.store.set_fuel(self.session.fuel_budget).map_err(|e| e.to_string())?;
+                    .memory_size(limit)
+                    .table_elements(1_000_000)
+                    .trap_on_grow_failure(true)
+                    .build();
+                self.session
+                    .store
+                    .set_fuel(self.session.fuel_budget)
+                    .map_err(|e| e.to_string())?;
                 self.session.emitted_debug.set(baseline.emitted_debug);
+                self.session.metered_fuel = None;
                 return Ok(());
             }
             self.poisoned = true;
         }
-        let engine = self.session.module.engine();
-        let limits = wasmi::StoreLimitsBuilder::new()
-            .memory_size(limit)
-            .table_elements(1_000_000)
-            .trap_on_grow_failure(true)
-            .build();
-        let mut store = wasmi::Store::new(engine, limits);
-        store.limiter(|limits| limits);
-        store
-            .set_fuel(self.session.fuel_budget)
-            .map_err(|e| e.to_string())?;
-        let instance = wasmi::Linker::new(engine)
-            .instantiate_and_start(&mut store, &self.session.module)
-            .map_err(|e| e.to_string())?;
-        let memory = instance
-            .get_memory(&store, "memory")
-            .ok_or("missing service memory")?;
-        let current = memory.data_size(&store);
-        if baseline.memory.len() > current {
-            memory
-                .grow(
-                    &mut store,
-                    ((baseline.memory.len() - current) / 65536) as u64,
-                )
-                .map_err(|e| e.to_string())?;
-        }
-        memory
-            .write(&mut store, 0, &baseline.memory)
-            .map_err(|e| e.to_string())?;
+        let mut compact = self.session.fresh_instance()?;
+        import_snapshot(&mut compact, &baseline.snapshot)?;
         for (name, value) in &baseline.globals {
-            instance
-                .get_global(&store, name)
+            compact
+                .instance
+                .get_global(&compact.store, name)
                 .ok_or("missing reset global")?
-                .set(&mut store, value.clone())
+                .set(&mut compact.store, value.clone())
                 .map_err(|e| e.to_string())?;
         }
-        store
+        compact
+            .store
             .set_fuel(self.session.fuel_budget)
             .map_err(|e| e.to_string())?;
-        let exports = crate::session::exports::Exports::bind(instance, &store)?;
-        self.session.exports = exports;
-        self.session.store = store;
-        self.session.instance = instance;
-        self.session.memory = memory;
-        self.session.manifest = baseline.manifest.clone();
-        self.session.registered_sources = baseline.registered_sources;
-        self.session.emitted_debug.set(baseline.emitted_debug);
+        compact.manifest = baseline.manifest.clone();
+        compact.registered_sources = baseline.registered_sources;
+        compact.emitted_debug.set(baseline.emitted_debug);
+        compact.metered_fuel = None;
+        compact.usage_reporter = self.session.usage_reporter.take();
+        self.session = compact;
         self.poisoned = false;
         Ok(())
     }
@@ -283,13 +328,47 @@ impl TransformSession {
             .write(&mut self.session.store, pointer as usize, input)
             .map_err(|e| e.to_string())?;
         let result = buffers::alloc(&mut self.session, 12, 4)?;
-        self.session.exports.run_service
-            .call(&mut self.session.store, (pointer, length, 1, 0, result))
-            .map_err(|e| e.to_string())?;
+        let mut quota = crate::fuel_quota::FuelQuota::new(self.session.fuel_budget);
+        let called = quota.call(
+            &mut self.session.store,
+            self.session.exports.run_service,
+            (pointer, length, 1, 0, result),
+        );
+        self.session.metered_fuel = Some(quota.consumed());
+        called?;
         // No free after a trap: the next reset discards the entire failed instance.
         buffers::free(&mut self.session, pointer, length, 1)?;
         let response = buffers::response(&mut self.session, result)?;
         self.poisoned = false;
         Ok(response)
     }
+}
+
+fn export_snapshot(session: &mut Session) -> Result<Vec<u8>, String> {
+    let result = buffers::alloc(session, 12, 4)?;
+    session
+        .exports
+        .snapshot_export
+        .call(&mut session.store, result)
+        .map_err(|error| error.to_string())?;
+    let [pointer, length, _] = buffers::words(session, result)?;
+    let bytes = buffers::bytes(session, pointer, length)?;
+    buffers::free(session, pointer, length, 1)?;
+    buffers::free(session, result, 12, 4)?;
+    Ok(bytes)
+}
+
+fn import_snapshot(session: &mut Session, snapshot: &[u8]) -> Result<(), String> {
+    let length = u32::try_from(snapshot.len()).map_err(|_| "service snapshot exceeds wasm32")?;
+    let pointer = buffers::alloc(session, length, 1)?;
+    session
+        .memory
+        .write(&mut session.store, pointer as usize, snapshot)
+        .map_err(|error| error.to_string())?;
+    session
+        .exports
+        .snapshot_import
+        .call(&mut session.store, (pointer, length))
+        .map_err(|error| error.to_string())?;
+    buffers::free(session, pointer, length, 1)
 }

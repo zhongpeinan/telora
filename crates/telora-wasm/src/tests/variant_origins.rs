@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 fn sources(eol: &str) -> BTreeMap<String, String> {
     let directory =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/variant-origins");
-    ["main", "model", "alias", "reexport"]
+    let mut sources: BTreeMap<_, _> = ["main", "model", "alias", "reexport"]
         .into_iter()
         .map(|name| {
             (
@@ -16,7 +16,13 @@ fn sources(eol: &str) -> BTreeMap<String, String> {
                     .replace('\n', eol),
             )
         })
-        .collect()
+        .collect();
+    sources.insert(
+        "origins".into(),
+        "mod model; mod alias; mod reexport; mod main; pub use self::main::{observe, rejected};"
+            .replace('\n', eol),
+    );
+    sources
 }
 
 fn build(sources: &BTreeMap<String, String>) -> Mir {
@@ -35,7 +41,7 @@ fn build(sources: &BTreeMap<String, String>) -> Mir {
             },
         })
         .collect();
-    let mut mir = module_resolve::resolve(inventory, &["origins/main".into()], |_, name| {
+    let mut mir = module_resolve::resolve(inventory, &["origins".into()], |_, name| {
         Ok(sources.get(name).cloned().unwrap_or_else(|| {
             static_sources::BUILTINS
                 .iter()
@@ -110,7 +116,9 @@ fn variants_materialize_at_use_and_value_forwarding_preserves_origins() {
                     .find(|source| source.name.as_ref() == "origins/main")
                     .unwrap();
                 let location = source
-                    .byte_location(telora_core::source::SourceCoordinates(diagnostics[0].origin))
+                    .byte_location(telora_core::source::SourceCoordinates(
+                        diagnostics[0].origin,
+                    ))
                     .unwrap();
                 assert!(
                     source

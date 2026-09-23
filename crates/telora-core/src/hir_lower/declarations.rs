@@ -145,12 +145,25 @@ impl Lower<'_> {
                 }
                 // Self is a lexical type alias in an implementation body, not
                 // a new generic parameter or a runtime value.
-                let self_name = self.synthetic(Role::Name, *target, HirKind::Name("Self".into()), vec![]);
-                let self_alias = self.synthetic(Role::Binding, *target,
-                    HirKind::Binding {kind: B::Type, initializer: None, imported: None},
-                    vec![self_name, Input::with(Role::Value, *target, Mode::Contract)]);
+                let self_name =
+                    self.synthetic(Role::Name, *target, HirKind::Name("Self".into()), vec![]);
+                let self_alias = self.synthetic(
+                    Role::Binding,
+                    *target,
+                    HirKind::Binding {
+                        kind: B::Type,
+                        initializer: None,
+                        imported: None,
+                    },
+                    vec![self_name, Input::with(Role::Value, *target, Mode::Contract)],
+                );
                 let body = self.synthetic(Role::Result, node, HirKind::Dict, fields);
-                inputs.push(self.synthetic(Role::Value, node, HirKind::Block, vec![self_alias, body]));
+                inputs.push(self.synthetic(
+                    Role::Value,
+                    node,
+                    HirKind::Block,
+                    vec![self_alias, body],
+                ));
                 B::Impl
             }
             _ => return Err(self.error(node, "unexpected binding rule")),
@@ -173,11 +186,17 @@ impl Lower<'_> {
             .children(node)
             .filter(|child| self.rule(*child) == Some(Rule::TraitBound))
         {
-            inputs.push(Input::with(
-                Role::Bound,
-                self.contract_child(bound)?,
-                Mode::Contract,
-            ));
+            let contract = self.contract_child(bound)?;
+            if self.token(bound, Token::Question).is_some() {
+                inputs.push(self.synthetic(
+                    Role::Bound,
+                    bound,
+                    HirKind::OptionalBound,
+                    vec![Input::with(Role::Operand, contract, Mode::Contract)],
+                ));
+            } else {
+                inputs.push(Input::with(Role::Bound, contract, Mode::Contract));
+            }
         }
         Ok(Shape::Node(HirKind::TypeParameter, inputs))
     }

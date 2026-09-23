@@ -4,6 +4,14 @@ use crate::{abi::*, values::word};
 
 static mut STATS: [u32; 5] = [0; 5];
 
+pub(super) unsafe fn snapshot_stats() -> [u32; 5] {
+    unsafe { *core::ptr::addr_of!(STATS) }
+}
+
+pub(super) unsafe fn restore_stats(stats: [u32; 5]) {
+    unsafe { STATS = stats; }
+}
+
 /// Arena bytes before/after, demand roots, and linear memory before/after GC.
 /// Wasm cannot shrink its memory, so the latter includes the collection peak.
 #[unsafe(no_mangle)]
@@ -25,8 +33,7 @@ pub(crate) unsafe fn collect() {
             let slot = demands + index * DEMAND_BYTES;
             if word(slot, 0) == 2 {
                 roots += 1;
-                let value = gc.value(word(slot, 4));
-                gc.put(slot + 4, value);
+                gc.demand(index);
             }
         }
         crate::service::collect_initialization(&mut gc);
@@ -34,7 +41,7 @@ pub(crate) unsafe fn collect() {
         // their order also preserves Host diagnostic/debug cursors.
         for table in [DIAGNOSTICS, DEBUG_EVENTS] {
             for id in 0..gc.old[table as usize].length {
-                assert_eq!(gc.object(table, id), id);
+                assert_eq!(gc.object(table, id, u32::MAX), id);
             }
         }
         gc.finish();

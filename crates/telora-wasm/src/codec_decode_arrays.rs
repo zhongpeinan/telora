@@ -110,14 +110,14 @@ impl Emitter<'_> {
             I::End,
             I::End,
         ]);
-        let id = self.local(ValType::I32);
+        let count = self.local(ValType::I32);
         self.extend([
-            I::I32Const(table_address(ARRAYS) as i32),
-            I::LocalGet(data),
-            I::LocalGet(bytes),
-            I::Call(TABLE_PUSH),
-            I::LocalSet(id),
+            I::LocalGet(end),
+            I::LocalGet(start),
+            I::I32Sub,
+            I::LocalSet(count),
         ]);
+        let id = self.array_object(data, count, count, inner)?;
         let value = self.value_as(self.key.node, target, STRING_BYTES)?;
         self.copy(value, 0, input, LOC_BYTES);
         if dict {

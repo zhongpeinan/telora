@@ -11,7 +11,14 @@ fn run_selector_uses_the_manifest_discovery_start() {
     .unwrap();
     refresh_fixture_workspace(&other);
     let run = telora(&cwd)
-        .args(["-C", other.to_str().unwrap(), "serve", "@src/app", "--bind", "stdio+jsonl://"])
+        .args([
+            "-C",
+            other.to_str().unwrap(),
+            "run",
+            "@src/app",
+            "--serve",
+            "stdio+jsonl://",
+        ])
         .output()
         .unwrap();
     assert!(
@@ -28,7 +35,7 @@ fn check_and_query_context_select_the_manifest_discovery_start() {
     let other = fixture();
     fs::write(
         other.join("src/lib.telora"),
-        "type Answer = Int; export {Answer};",
+        "type Answer = Int; pub use self::{Answer};",
     )
     .unwrap();
     refresh_fixture_workspace(&other);

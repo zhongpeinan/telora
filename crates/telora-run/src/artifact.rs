@@ -6,7 +6,8 @@ use serde::Deserialize;
 pub struct Publication {
     pub version: u32,
     pub abi: u32,
-    pub fuel: u64,
+    pub initialization_fuel: u64,
+    pub request_fuel: u64,
     pub memory_limit: u64,
 }
 
@@ -40,11 +41,12 @@ struct Bundle {
 pub(crate) struct Artifact {
     pub publication: Publication,
     pub modules: Vec<ModuleData>,
+    pub snapshot: Option<telora_wasm_shared::snapshot_artifact::Snapshot>,
 }
 
 impl Artifact {
     pub fn read(bytes: &[u8]) -> Result<Self> {
-        let (mut publication, mut manifest, mut bundle) = (None, None, None);
+        let (mut publication, mut manifest, mut bundle, mut snapshot) = (None, None, None, None);
         for payload in wasmparser::Parser::new(0).parse_all(bytes) {
             match payload? {
                 wasmparser::Payload::CustomSection(s) => match s.name() {
@@ -59,6 +61,13 @@ impl Artifact {
                     "telora.data" => {
                         ensure!(bundle.is_none(), "duplicate data bundle");
                         bundle = Some(serde_json::from_slice::<Bundle>(s.data())?);
+                    }
+                    telora_wasm_shared::snapshot_artifact::SECTION => {
+                        ensure!(snapshot.is_none(), "duplicate service snapshot");
+                        snapshot = Some(
+                            telora_wasm_shared::snapshot_artifact::decode(s.data())
+                                .map_err(anyhow::Error::msg)?,
+                        );
                     }
                     _ => {}
                 },
@@ -79,13 +88,15 @@ impl Artifact {
             publication.ok_or_else(|| anyhow::anyhow!("not a telora build artifact"))?;
         let manifest = manifest.ok_or_else(|| anyhow::anyhow!("missing manifest"))?;
         ensure!(
-            publication.version == 2
+            publication.version == 3
                 && publication.abi == telora_wasm_shared::abi::VERSION
                 && manifest.abi == publication.abi,
             "unsupported publication/Guest ABI version"
         );
         ensure!(
-            publication.fuel > 0 && publication.memory_limit > 0,
+            publication.memory_limit > 0
+                && publication.initialization_fuel > 0
+                && publication.request_fuel > 0,
             "invalid execution limits"
         );
         let modules = {
@@ -113,6 +124,7 @@ impl Artifact {
         Ok(Self {
             publication,
             modules,
+            snapshot,
         })
     }
 }

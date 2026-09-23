@@ -1,6 +1,20 @@
 use super::*;
 
 #[test]
+fn codec_traits_drive_the_existing_value_plan() {
+    let source = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/codec-traits.telora"
+    ))
+    .expect("read test source");
+    let bytes = compile(&source).unwrap();
+    let mut session = crate::session::Session::load(&bytes, 100_000_000).unwrap();
+    session.initialize().unwrap();
+    assert_eq!(session.call(&[]).unwrap(), true);
+    assert!(session.diagnostics().unwrap().is_empty());
+}
+
+#[test]
 fn data_parse_rejection_preserves_original_input_location() {
     let source = &std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -61,7 +75,7 @@ fn codec_rename_collision_is_a_captured_evaluation_error() {
 }
 
 #[test]
-fn codec_parse_display_markers_must_be_paired() {
+fn codec_parse_and_display_markers_select_independent_bridges() {
     let bytes = compile(
         &std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -73,12 +87,7 @@ fn codec_parse_display_markers_must_be_paired() {
     let mut session = crate::session::Session::load(&bytes, 100_000_000).unwrap();
     session.initialize().unwrap();
     let result = session.call(&[]).unwrap();
-    for index in 0..2 {
-        assert_eq!(
-            result[index]["message"],
-            "std/string.decode_by_parse and std/string.encode_by_display must be used together"
-        );
-    }
+    assert_eq!(result, serde_json::json!([true, true, true, true]));
     assert!(session.diagnostics().unwrap().is_empty());
 }
 
@@ -145,7 +154,7 @@ fn codec_decode_untagged_keeps_rejection_evidence_and_propagates_failure() {
     );
     assert_eq!(
         diagnostic_point(&result[0][0]["labels"][1]["location"]["start"]),
-        point(source, source.find("Value.String(\"bad\")").unwrap())
+        point(source, source.find("Value::String(\"bad\")").unwrap())
     );
     assert_eq!(
         result[1][0]["message"],
@@ -211,10 +220,16 @@ fn codec_decode_tuple_honors_array_slice_start() {
         .unwrap();
     // Array slicing has no source syntax; exercise a valid ABI slice descriptor.
     session
-        .write(value as usize + crate::abi::DATA as usize + 4, &1u32.to_le_bytes())
+        .write(
+            value as usize + crate::abi::DATA as usize + 4,
+            &1u32.to_le_bytes(),
+        )
         .unwrap();
     session
-        .write(value as usize + crate::abi::DATA as usize + 8, &3u32.to_le_bytes())
+        .write(
+            value as usize + crate::abi::DATA as usize + 8,
+            &3u32.to_le_bytes(),
+        )
         .unwrap();
     let args = session.allocate(4).unwrap();
     session.write(args as usize, &value.to_le_bytes()).unwrap();
@@ -249,7 +264,7 @@ fn codec_decode_nested_error_keeps_path_and_leaf_origin() {
     assert_eq!(result["message"], "$[0][1]: expected Int");
     assert_eq!(
         diagnostic_point(&result["labels"][1]["location"]["start"]),
-        point(source, source.find("Value.String(").unwrap())
+        point(source, source.find("Value::String(").unwrap())
     );
     assert!(session.diagnostics().unwrap().is_empty());
 }
@@ -268,7 +283,7 @@ fn codec_decode_mismatch_retains_input_origin() {
     assert_eq!(result["message"], "$: expected Int");
     assert_eq!(
         diagnostic_point(&result["labels"][1]["location"]["start"]),
-        point(source, source.find("Value.String(").unwrap())
+        point(source, source.find("Value::String(").unwrap())
     );
     assert!(session.diagnostics().unwrap().is_empty());
 }
@@ -286,13 +301,8 @@ fn codec_display_failure_propagates_without_duplicate_diagnostics() {
     let mut session = crate::session::Session::load(&bytes, 100_000_000).unwrap();
     session.initialize().unwrap();
     let result = session.call(&[]).unwrap();
-    assert_eq!(result[0].as_array().unwrap().len(), 1);
-    assert_eq!(result[1].as_array().unwrap().len(), 1);
-    assert_eq!(
-        result[0][0]["message"],
-        "text codec requires a DisplayBy property"
-    );
-    assert_eq!(result[1][0]["message"], "display execution failed");
+    assert_eq!(result.as_array().unwrap().len(), 1);
+    assert_eq!(result[0]["message"], "display execution failed");
     assert!(session.diagnostics().unwrap().is_empty());
 }
 
@@ -467,7 +477,7 @@ fn stringify_rejections_are_captured_once_and_preserve_subjects() {
     }
     assert_eq!(
         diagnostic_point(&result[0]["labels"][1]["location"]["start"]),
-        point(source, source.find("Value.Bytes(b").unwrap())
+        point(source, source.find("Value::Bytes(b").unwrap())
     );
     assert_eq!(result[3], "true");
     assert!(session.diagnostics().unwrap().is_empty());

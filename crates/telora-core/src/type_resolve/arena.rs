@@ -29,9 +29,14 @@ impl Solver<'_> {
                 }
             }
         }
-        if constructor == TypeConstructor::Unchecked && arguments.len() == 1
-            && self.term(arguments[0]).is_some_and(|term| term.constructor == TypeConstructor::Unchecked)
-        { return arguments[0]; }
+        if constructor == TypeConstructor::Unchecked
+            && arguments.len() == 1
+            && self
+                .term(arguments[0])
+                .is_some_and(|term| term.constructor == TypeConstructor::Unchecked)
+        {
+            return arguments[0];
+        }
         let slot = self.fresh();
         let term = TypeTermId(
             self.mir
@@ -93,15 +98,21 @@ impl Solver<'_> {
     ) {
         let left = self.find(left);
         let right = self.find(right);
-        if let (TypeState::Conflicted(id), _) | (_, TypeState::Conflicted(id)) =
-            (self.mir.ty_slots[left.index()], self.mir.ty_slots[right.index()])
-        {
-            if left == right { return; }
+        if let (TypeState::Conflicted(id), _) | (_, TypeState::Conflicted(id)) = (
+            self.mir.ty_slots[left.index()],
+            self.mir.ty_slots[right.index()],
+        ) {
+            if left == right {
+                return;
+            }
             let value_slot = self.value_slots[left.index()] || self.value_slots[right.index()];
+            let changed = self.value_slots[left.index()] != value_slot
+                || self.value_slots[right.index()] != value_slot;
             self.value_slots[left.index()] = value_slot;
             self.value_slots[right.index()] = value_slot;
-            self.inherit_conflict(left, right, id);
-            self.revision += 1;
+            if self.inherit_conflict(left, right, id) || changed {
+                self.revision += 1;
+            }
             return;
         }
         let id = self.record_conflict(left, right, location, message);
@@ -113,12 +124,22 @@ impl Solver<'_> {
         self.revision += 1;
     }
 
-    fn inherit_conflict(&mut self, left: TypeSlotId, right: TypeSlotId, id: TypeConflictId) {
+    fn inherit_conflict(
+        &mut self,
+        left: TypeSlotId,
+        right: TypeSlotId,
+        id: TypeConflictId,
+    ) -> bool {
+        let mut changed = false;
         for slot in [left, right] {
-            if !self.contract_slots[slot.index()] {
+            if !self.contract_slots[slot.index()]
+                && self.mir.ty_slots[slot.index()] != TypeState::Conflicted(id)
+            {
                 self.mir.ty_slots[slot.index()] = TypeState::Conflicted(id);
+                changed = true;
             }
         }
+        changed
     }
 
     /// A failed relation does not invalidate either operand's type identity.
@@ -130,7 +151,13 @@ impl Solver<'_> {
         location: Option<Location>,
         message: String,
     ) -> TypeConflictId {
-        let id = TypeConflictId(self.mir.type_conflicts.len().try_into().expect("type conflict capacity"));
+        let id = TypeConflictId(
+            self.mir
+                .type_conflicts
+                .len()
+                .try_into()
+                .expect("type conflict capacity"),
+        );
         let contracts = self.failed_contract_sources();
         self.mir.type_conflicts.push(TypeConflict {
             origin: self.constraint_origin,
@@ -157,9 +184,15 @@ impl Solver<'_> {
         for annotation in contracts {
             let location = self.mir.hir[annotation.index()].location;
             let diagnostic = self.mir.diagnostics.last_mut().unwrap();
-            if !diagnostic.labels.iter().any(|label| label.location == location) {
+            if !diagnostic
+                .labels
+                .iter()
+                .any(|label| label.location == location)
+            {
                 diagnostic.labels.push(crate::source::Label {
-                    location, message: "type contract declared here".into(), primary: false,
+                    location,
+                    message: "type contract declared here".into(),
+                    primary: false,
                 });
             }
         }
@@ -181,6 +214,8 @@ impl Solver<'_> {
                 continue;
             }
             let value_slot = self.value_slots[left.index()] || self.value_slots[right.index()];
+            let value_changed = self.value_slots[left.index()] != value_slot
+                || self.value_slots[right.index()] != value_slot;
             self.value_slots[left.index()] = value_slot;
             self.value_slots[right.index()] = value_slot;
             let a = self.mir.ty_slots[left.index()];
@@ -190,7 +225,10 @@ impl Solver<'_> {
                     // Inherit the existing failed evidence only into inference
                     // state. A declaration remains inspectable even when its
                     // implementation or a consumer already failed.
-                    self.inherit_conflict(left, right, id);
+                    if self.inherit_conflict(left, right, id) || value_changed {
+                        self.revision += 1;
+                    }
+                    continue;
                 }
                 (TypeState::Unknown, _) => {
                     if self.occurs(left, right) {
@@ -209,7 +247,9 @@ impl Solver<'_> {
                 (TypeState::Structure(a), TypeState::Structure(b)) => {
                     let a = &self.mir.type_terms[a.index()];
                     let b = &self.mir.type_terms[b.index()];
-                    if a.constructor == TypeConstructor::ArrayLiteral && b.constructor == TypeConstructor::ArrayLiteral {
+                    if a.constructor == TypeConstructor::ArrayLiteral
+                        && b.constructor == TypeConstructor::ArrayLiteral
+                    {
                         // Array literal children are element evidence, not
                         // positional type arguments, even at equal lengths.
                         self.compatible_structure(left, right, location, &mut queue);
@@ -219,8 +259,11 @@ impl Solver<'_> {
                         if self.compatible_structure(left, right, location, &mut queue) {
                             continue;
                         }
-                        let message = format!("type mismatch between {} and {}",
-                            self.diagnostic_type(left), self.diagnostic_type(right));
+                        let message = format!(
+                            "type mismatch between {} and {}",
+                            self.diagnostic_type(left),
+                            self.diagnostic_type(right)
+                        );
                         self.record_conflict(left, right, location, message);
                     } else {
                         queue.extend(a.arguments.iter().copied().zip(b.arguments.iter().copied()));
@@ -300,15 +343,26 @@ impl Solver<'_> {
                 state => state,
             };
         }
-        let mut reported_unknowns = self.mir.diagnostics.iter().flat_map(|diagnostic|
-            diagnostic.labels.iter().filter(|label| label.primary).map(|label| label.location))
+        let mut reported_unknowns = self
+            .mir
+            .diagnostics
+            .iter()
+            .flat_map(|diagnostic| {
+                diagnostic
+                    .labels
+                    .iter()
+                    .filter(|label| label.primary)
+                    .map(|label| label.location)
+            })
             .collect::<BTreeSet<_>>();
         for (index, required) in self.mir.required_types.iter().enumerate() {
             if *required && self.mir.ty_slots[index] == TypeState::Unknown {
                 self.mir.type_unknowns.push(TypeSlotId(index as u32));
                 let location = self.mir.hir[index].location;
                 if reported_unknowns.insert(location) {
-                    self.mir.diagnostics.push(Diagnostic::error("unknown type", location));
+                    self.mir
+                        .diagnostics
+                        .push(Diagnostic::error("unknown type", location));
                 }
             }
         }

@@ -5,10 +5,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-mod wasm;
 mod backend_surface;
-mod usage;
 mod declaration_shapes;
+mod usage;
+mod wasm;
 
 fn fixture() -> PathBuf {
     let unique = SystemTime::now()
@@ -46,45 +46,46 @@ fn telora(cwd: &Path) -> Command {
 }
 
 fn refresh_fixture_workspace(root: &Path) {
-    fn modules(root: &Path, directory: &Path, found: &mut Vec<String>) {
-        let Ok(entries) = fs::read_dir(directory) else {
-            return;
+    let lib = root.join("src/lib.telora");
+    const GENERATED_ROOT: &str = "# generated test root\n";
+    let generated = !lib.exists()
+        || fs::read_to_string(&lib).is_ok_and(|source| source.starts_with(GENERATED_ROOT));
+    if generated {
+        let mut modules = fs::read_dir(root.join("src"))
+            .unwrap()
+            .flatten()
+            .filter_map(|entry| {
+                let path = entry.path();
+                (path.is_file() && path.extension().is_some_and(|ext| ext == "telora"))
+                    .then(|| path.file_stem()?.to_str().map(str::to_owned))
+                    .flatten()
+            })
+            .filter(|name| {
+                name != "lib"
+                    && name.chars().enumerate().all(|(index, ch)| {
+                        ch == '_'
+                            || ch.is_ascii_alphanumeric() && (index > 0 || !ch.is_ascii_digit())
+                    })
+            })
+            .collect::<Vec<_>>();
+        modules.sort();
+        let source = if modules.is_empty() {
+            format!("{GENERATED_ROOT}pub type Fixture = struct {{}};\n")
+        } else {
+            format!(
+                "{GENERATED_ROOT}{}",
+                modules
+                    .iter()
+                    .map(|name| format!("pub mod {name};\n"))
+                    .collect::<String>(),
+            )
         };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Ok(kind) = entry.file_type() else {
-                continue;
-            };
-            if kind.is_dir() {
-                modules(root, &path, found);
-                continue;
-            }
-            if !kind.is_file() {
-                continue;
-            }
-            let extension = path.extension().and_then(|value| value.to_str());
-            if !matches!(extension, Some("telora" | "json" | "yaml" | "yml" | "toml")) {
-                continue;
-            }
-            let mut relative = path.strip_prefix(root).unwrap().to_owned();
-            if extension == Some("telora") {
-                relative.set_extension("");
-            }
-            found.push(format!(
-                "@src/{}",
-                relative.to_string_lossy().replace('\\', "/")
-            ));
-        }
+        fs::write(&lib, source).unwrap();
     }
-
-    let mut declared = Vec::new();
-    modules(&root.join("src"), &root.join("src"), &mut declared);
-    declared.sort();
     fs::write(
         root.join("telora-crate.json"),
         serde_json::to_vec(&serde_json::json!({
             "name": "fixture",
-            "modules": declared,
             "dependencies": [],
         }))
         .unwrap(),
@@ -97,7 +98,6 @@ fn refresh_fixture_workspace(root: &Path) {
             "packages": {
                 "fixture": {
                     "source": {"workspace":""},
-                    "modules": declared,
                     "dependencies": [],
                 }
             }
@@ -115,7 +115,12 @@ fn jsonl(bytes: &[u8]) -> Vec<Value> {
 }
 
 fn input_command(mut command: Command, input: &[u8]) -> std::process::Output {
-    let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
     child.stdin.take().unwrap().write_all(input).unwrap();
     child.wait_with_output().unwrap()
 }
@@ -123,22 +128,32 @@ fn input_command(mut command: Command, input: &[u8]) -> std::process::Output {
 fn execute_value(cwd: &Path, mode: &str, selector: &str) -> std::process::Output {
     let mut command = telora(cwd);
     command.args([mode, selector]);
-    input_command(command, b"null")
+    let input: &[u8] = if mode == "run" {
+        br#"{"method":"transform","input":null}"#
+    } else {
+        b"null"
+    };
+    input_command(command, input)
 }
 
 fn runtime_source(name: &str) -> String {
-    fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/runtime").join(name)).unwrap()
+    fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/runtime")
+            .join(name),
+    )
+    .unwrap()
 }
 
 mod source_runtime;
 
 mod checks;
-mod queries;
+mod codegen_stack_safety;
 mod command_surface;
+mod context;
 mod entry_services;
 mod evaluation;
 mod language;
-mod codegen_stack_safety;
-mod context;
-mod test_command;
+mod queries;
 mod static_mir;
+mod test_command;

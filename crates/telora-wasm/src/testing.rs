@@ -33,7 +33,7 @@ pub struct TestSession {
 
 impl TestSession {
     /// Requires a successfully initialized graph. It is never reinitialized per case.
-    pub fn new(session: Session) -> Result<Self, String> {
+    pub fn new(mut session: Session) -> Result<Self, String> {
         let phase = session
             .instance
             .get_global(&session.store, "telora_phase")
@@ -41,6 +41,7 @@ impl TestSession {
         if phase.get(&session.store).i32() != Some(2) {
             return Err("Wasm: test graph is not initialized".into());
         }
+        session.start_execution()?;
         Ok(Self {
             session,
             failed: false,
@@ -77,13 +78,13 @@ impl TestSession {
         let count = output.word(base + 4)?;
         if operation > 3
             || count != if operation < 2 { 1 } else { 2 }
-            || bytes != 8 + count as u64 * 4
+            || bytes != 8 + count as u64 * 8
         {
             return Err("Wasm: invalid Test description".into());
         }
         let input = |index: u64| -> Result<Value, String> {
             let pointer = output.word(base + 8 + index * 4)?;
-            let ty = output.word(pointer as u64 + abi::TYPE)?;
+            let ty = output.word(base + 8 + u64::from(count) * 4 + index * 4)?;
             let value = Value { pointer, ty };
             session.expect_value(value, ty)?;
             Ok(value)

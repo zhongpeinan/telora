@@ -18,7 +18,57 @@ impl Emitter<'_> {
             _ => Err("Wasm: type has no closed value layout".into()),
         }
     }
-    pub fn table_push(&mut self, table: u32, payload: u32, bytes: u32) -> u32 {
+    pub fn table_push(
+        &mut self,
+        table: u32,
+        payload: u32,
+        bytes: u32,
+        ty: Option<TypeId>,
+    ) -> Result<u32, String> {
+        if matches!(table, RECORDS | ARRAYS | VALUES | NEWTYPES) {
+            let ty = ty.ok_or("Wasm: ordinary object requires a closed layout")?;
+            let header = if table == ARRAYS { 16 } else { 8 };
+            let result = self.alloc(header + bytes);
+            self.store32(result, 0, ty.index() as u32);
+            if table == ARRAYS {
+                let width = self.width(ty)?;
+                let count = if width == 0 {
+                    if bytes != 0 {
+                        return Err("Wasm: uninhabited array has storage".into());
+                    }
+                    0
+                } else {
+                    if bytes % width != 0 {
+                        return Err("Wasm: array storage is not stride-aligned".into());
+                    }
+                    bytes / width
+                };
+                self.extend([
+                    I::LocalGet(result),
+                    I::I32Const(header as i32),
+                    I::I32Add,
+                    I::LocalGet(payload),
+                    I::I32Const(bytes as i32),
+                    I::MemoryCopy {
+                        src_mem: 0,
+                        dst_mem: 0,
+                    },
+                ]);
+                self.extend([
+                    I::LocalGet(result),
+                    I::LocalGet(result),
+                    I::I32Const(header as i32),
+                    I::I32Add,
+                    I::I32Store(memory(4, 2)),
+                ]);
+                self.store32(result, 8, count);
+                self.store32(result, 12, count);
+            } else {
+                self.store32(result, 4, bytes);
+                self.copy(result, 8, payload, bytes);
+            }
+            return Ok(result);
+        }
         let result = self.local(ValType::I32);
         self.extend([
             I::I32Const(table_address(table) as i32),
@@ -27,19 +77,60 @@ impl Emitter<'_> {
             I::Call(TABLE_PUSH),
             I::LocalSet(result),
         ]);
-        result
+        Ok(result)
     }
     pub fn table_data(&mut self, table: u32, value: u32, field: u64) -> u32 {
         let result = self.local(ValType::I32);
-        self.extend([
-            I::I32Const(table_address(table) as i32),
-            I::LocalGet(value),
-            I::I32Load(memory(field, 2)),
-            I::Call(TABLE_GET),
-            I::I32Load(memory(0, 2)),
-            I::LocalSet(result),
-        ]);
+        if matches!(table, RECORDS | VALUES | NEWTYPES) {
+            self.extend([
+                I::LocalGet(value),
+                I::I32Load(memory(field, 2)),
+                I::I32Const(8),
+                I::I32Add,
+            ]);
+        } else if table == ARRAYS {
+            self.extend([
+                I::LocalGet(value),
+                I::I32Load(memory(field, 2)),
+                I::I32Load(memory(4, 2)),
+            ]);
+        } else {
+            self.extend([
+                I::I32Const(table_address(table) as i32),
+                I::LocalGet(value),
+                I::I32Load(memory(field, 2)),
+                I::Call(TABLE_GET),
+                I::I32Load(memory(0, 2)),
+            ]);
+        }
+        self.emit(I::LocalSet(result));
         result
+    }
+    pub fn array_object(
+        &mut self,
+        payload: u32,
+        count: u32,
+        capacity: u32,
+        ty: TypeId,
+    ) -> Result<u32, String> {
+        // Publish only after the backing store has been initialized. Until this
+        // header exists, a recoverable language failure leaves no reachable
+        // partial Array and the next collection can discard the backing store.
+        let result = self.local(ValType::I32);
+        self.extend([I::I32Const(16), I::Call(ALLOC), I::LocalSet(result)]);
+        self.store32(result, 0, ty.index() as u32);
+        self.extend([
+            I::LocalGet(result),
+            I::LocalGet(payload),
+            I::I32Store(memory(4, 2)),
+            I::LocalGet(result),
+            I::LocalGet(count),
+            I::I32Store(memory(8, 2)),
+            I::LocalGet(result),
+            I::LocalGet(capacity),
+            I::I32Store(memory(12, 2)),
+        ]);
+        Ok(result)
     }
     pub fn copy(&mut self, destination: u32, offset: u32, source: u32, bytes: u32) {
         self.extend([
@@ -249,9 +340,12 @@ impl Emitter<'_> {
             }
             self.extend([
                 I::LocalGet(result),
-                I::I32Const(DATA as i32), I::I32Add,
-                I::LocalGet(data), I::I32Const(bytes.len() as i32),
-                I::Call(CONTENT_WRITE), I::Drop,
+                I::I32Const(DATA as i32),
+                I::I32Add,
+                I::LocalGet(data),
+                I::I32Const(bytes.len() as i32),
+                I::Call(CONTENT_WRITE),
+                I::Drop,
             ]);
         }
         Ok(result)

@@ -27,18 +27,14 @@ impl Emitter<'_> {
         ]);
         result
     }
-    fn parse_column(&mut self, base: u32, count: u32, stride: u32) -> u32 {
-        let id = self.local(ValType::I32);
-        self.extend([
-            I::I32Const(table_address(ARRAYS) as i32),
-            I::LocalGet(base),
-            I::LocalGet(count),
-            I::I32Const(stride as i32),
-            I::I32Mul,
-            I::Call(TABLE_PUSH),
-            I::LocalSet(id),
-        ]);
-        id
+    fn parse_column(
+        &mut self,
+        base: u32,
+        count: u32,
+        _stride: u32,
+        ty: TypeId,
+    ) -> Result<u32, String> {
+        self.array_object(base, count, count, ty)
     }
     pub fn data_parse_native(&mut self, parser: u32) -> Result<u32, String> {
         let node = self.key.node;
@@ -68,7 +64,11 @@ impl Emitter<'_> {
         self.enum_value(node, args[2], 1, Some(value))
     }
 
-    pub(crate) fn materialize_data_plan(&mut self, target: TypeId, packet: u32) -> Result<u32, String> {
+    pub(crate) fn materialize_data_plan(
+        &mut self,
+        target: TypeId,
+        packet: u32,
+    ) -> Result<u32, String> {
         let node = self.key.node;
         let rows = self.read32(packet, 0);
         let count = self.read32(packet, 4);
@@ -174,10 +174,12 @@ impl Emitter<'_> {
         Ok(self.read32(slot, 0))
     }
     fn parse_location(&mut self, value: u32, record: u32, offset: u64) {
-        for field in [0, 4, 8] {
-            self.extend([I::LocalGet(value), I::LocalGet(record),
-                I::I32Load(memory(offset + field, 2)), I::I32Store(memory(field, 2))]);
-        }
+        self.extend([
+            I::LocalGet(value),
+            I::LocalGet(record),
+            I::I64Load(memory(offset, 3)),
+            I::I64Store(memory(0, 3)),
+        ]);
     }
     fn parse_collection(
         &mut self,
@@ -228,10 +230,11 @@ impl Emitter<'_> {
             I::End,
             I::End,
         ]);
-        let id = self.parse_column(data, count, width);
+        let element = self.mir.types[ty.index()].arguments[0];
+        let id = self.parse_column(data, count, width, element)?;
         let output = self.value_as(self.key.node, ty, STRING_BYTES)?;
         if let Some(keys) = keys {
-            let key_id = self.parse_column(keys, count, STRING_BYTES);
+            let key_id = self.parse_column(keys, count, STRING_BYTES, self.string_type()?)?;
             for (offset, local) in [(DATA, key_id), (DATA + 4, count), (DATA + 8, id)] {
                 self.extend([
                     I::LocalGet(output),
@@ -255,7 +258,6 @@ impl Emitter<'_> {
     }
 }
 
-
 /// The same sealed Value construction used by std parsers and external inputs.
 /// Parameters are (parse packet, reserved); no runtime type selection occurs.
 pub(crate) fn materializer(
@@ -263,10 +265,22 @@ pub(crate) fn materializer(
     plan: &crate::plan::Plan,
     target: Option<u32>,
 ) -> Result<crate::object::ObjectFunction, String> {
-    let mut emit = Emitter::new(mir, plan, crate::plan::Key { callable: true, ..plan.root });
+    let mut emit = Emitter::new(
+        mir,
+        plan,
+        crate::plan::Key {
+            callable: true,
+            ..plan.root
+        },
+    );
     if let Some(target) = target {
         let error = emit.read32(0, 12);
-        emit.extend([I::LocalGet(error), I::If(BlockType::Empty), I::Unreachable, I::End]);
+        emit.extend([
+            I::LocalGet(error),
+            I::If(BlockType::Empty),
+            I::Unreachable,
+            I::End,
+        ]);
         let value = emit.materialize_data_plan(plan.layouts[target as usize].id(), 0)?;
         emit.emit(I::LocalGet(value));
     } else {

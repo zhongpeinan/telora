@@ -1,26 +1,30 @@
 //! Session-owned, partially solved IR. No resolver, type checker or VM lives here.
+use crate::source::{Diagnostic, Location, SourceDatabase, SourceId};
 use crate::syntax::kinds::{
     BinaryOperator, BindingKind, BlameAction, DeclaredInitializerKind, UnaryOperator,
 };
-use crate::source::{Diagnostic, Location, SourceDatabase, SourceId};
 use crate::syntax::telora::cst::{CstData, NodeRef};
 use std::fmt::Write;
 
-mod seal;
-mod record_boundaries;
-mod executable;
-mod type_schemes;
-mod properties;
-mod materializations;
-mod declaration_contracts;
 mod constraint_outcomes;
+mod declaration_contracts;
+mod executable;
+mod function_dependencies;
+mod materializations;
+mod properties;
+mod record_boundaries;
 mod resolution;
+mod seal;
 mod substitution;
-pub use resolution::{ResolutionFacts, ResolveTask};
-pub use substitution::TypeSubstitution;
+mod type_schemes;
 pub use declaration_contracts::{DeclarationContract, DeclarationContractState};
-pub use seal::SealedMir;
 pub use executable::{ExecutionClosure, ExecutionRoot, SealedExecutable};
+pub use function_dependencies::{
+    FunctionBodyDependency, FunctionBodyDependencyGraph, FunctionDependencyFallback, SealedFunction,
+};
+pub use resolution::{ResolutionFacts, ResolveTask};
+pub use seal::SealedMir;
+pub use substitution::TypeSubstitution;
 
 macro_rules! id {
     ($($name:ident),*) => {$(
@@ -41,6 +45,12 @@ id!(
 id!(ScopeId);
 id!(TypeSchemeId, SchemeNodeId);
 
+impl ModuleId {
+    pub fn from_index(index: usize) -> Self {
+        Self(index.try_into().expect("module index exceeds u32"))
+    }
+}
+
 /// A normalized quantified type. Scheme identity describes a type contract,
 /// not the runtime identity of a function implementing that contract.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -54,11 +64,15 @@ pub struct TypeScheme {
 pub enum SchemeNode {
     Known(TypeId),
     Bound(u32),
-    Apply { constructor: TypeConstructor, arguments: Vec<SchemeNodeId> },
+    Apply {
+        constructor: TypeConstructor,
+        arguments: Vec<SchemeNodeId>,
+    },
 }
 id!(TypeTermId, TypeConflictId);
 id!(GenericInstanceId);
 id!(PropertyId);
+id!(FuncId, FuncProtoId);
 
 /// The type pass decides whether a reference publishes a quantified contract
 /// or selects a declaration instance. Consumers must not infer this from names
@@ -66,7 +80,10 @@ id!(PropertyId);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GenericReference {
     /// A static export of a declaration contract; never an executable value.
-    Scheme { symbol: SymbolId, scheme: TypeSchemeId },
+    Scheme {
+        symbol: SymbolId,
+        scheme: TypeSchemeId,
+    },
     /// The type pass has selected this use's instance before publication.
     Instance(GenericInstanceId),
 }
@@ -92,32 +109,52 @@ pub struct GenericInstance {
     pub types: Vec<(HirId, TypeId)>,
     pub references: Vec<(HirId, GenericInstanceId)>,
     pub implementations: Vec<(HirId, GenericInstanceId)>,
+    pub evidence: Vec<(HirId, Vec<usize>)>,
     pub adjustments: Vec<(HirId, TypeId)>,
 }
 
 impl Mir {
     /// Stable instance identities paired with their solved records.
     pub fn generic_instances(&self) -> impl Iterator<Item = (GenericInstanceId, &GenericInstance)> {
-        self.generic_instances.iter().enumerate().map(|(index, instance)|
-            (GenericInstanceId(index as u32), instance))
+        self.generic_instances
+            .iter()
+            .enumerate()
+            .map(|(index, instance)| (GenericInstanceId(index as u32), instance))
     }
 }
 
 impl GenericInstance {
     pub fn implementation(&self, node: HirId) -> Option<GenericInstanceId> {
-        self.implementations.binary_search_by_key(&node, |(node, _)| *node).ok().map(|index| self.implementations[index].1)
+        self.implementations
+            .binary_search_by_key(&node, |(node, _)| *node)
+            .ok()
+            .map(|index| self.implementations[index].1)
     }
     pub fn adjustment(&self, node: HirId) -> Option<TypeId> {
-        self.adjustments.binary_search_by_key(&node, |(node, _)| *node).ok().map(|index| self.adjustments[index].1)
+        self.adjustments
+            .binary_search_by_key(&node, |(node, _)| *node)
+            .ok()
+            .map(|index| self.adjustments[index].1)
     }
     pub fn ty(&self, node: HirId) -> Option<TypeId> {
-        self.types.binary_search_by_key(&node, |(node, _)| *node)
-            .ok().map(|index| self.types[index].1)
+        self.types
+            .binary_search_by_key(&node, |(node, _)| *node)
+            .ok()
+            .map(|index| self.types[index].1)
     }
 
     pub fn reference(&self, node: HirId) -> Option<GenericInstanceId> {
-        self.references.binary_search_by_key(&node, |(node, _)| *node)
-            .ok().map(|index| self.references[index].1)
+        self.references
+            .binary_search_by_key(&node, |(node, _)| *node)
+            .ok()
+            .map(|index| self.references[index].1)
+    }
+
+    pub fn evidence(&self, node: HirId) -> &[usize] {
+        self.evidence
+            .binary_search_by_key(&node, |(node, _)| *node)
+            .ok()
+            .map_or(&[], |index| self.evidence[index].1.as_slice())
     }
 }
 
@@ -164,7 +201,10 @@ pub struct NativeTypeId {
     pub slot: u32,
 }
 impl NativeTypeId {
-    pub const TEST: Self = Self { module: 33, slot: 0 };
+    pub const TEST: Self = Self {
+        module: 33,
+        slot: 0,
+    };
     /// Native ABI identity used by diagnostic syntax and the source inventory.
     pub const BLAME_ERROR: Self = Self {
         module: 34,
@@ -278,6 +318,7 @@ pub enum TypeConstructor {
     FoldControl,
     PropertyTarget,
     PropertyBound,
+    OptionalPropertyBound,
     Unchecked,
     TypeFunction(TypeFunction),
     Nominal(SymbolId),
@@ -392,7 +433,10 @@ pub struct PropertyRecord {
 pub enum PropertyAdmission {
     /// The admitted native marker bootstraps capability records themselves.
     Capability,
-    Require { capability: PropertyId, targets: i64 },
+    Require {
+        capability: PropertyId,
+        targets: i64,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -412,6 +456,8 @@ pub enum BoundState {
     Pending,
     Assumed(SymbolId),
     Property(usize),
+    OptionalProperty(usize),
+    OptionalAbsent,
     Implementation(SymbolId),
     Ambiguous,
     Unresolved,
@@ -422,7 +468,11 @@ impl BoundState {
     pub fn is_proven(self) -> bool {
         matches!(
             self,
-            Self::Assumed(_) | Self::Property(_) | Self::Implementation(_)
+            Self::Assumed(_)
+                | Self::Property(_)
+                | Self::OptionalProperty(_)
+                | Self::OptionalAbsent
+                | Self::Implementation(_)
         )
     }
 }
@@ -433,6 +483,9 @@ pub struct TraitImplementation {
     /// A trait skeleton applied to its target, possibly with rigid parameters.
     pub trait_type: TypeId,
     pub requirements: Vec<(SymbolId, TypeId)>,
+    /// Compiler-owned derivation is the last-resort implementation. Source
+    /// modules cannot declare this flag.
+    pub compiler_fallback: bool,
 }
 
 #[derive(Debug)]
@@ -597,17 +650,21 @@ pub enum HirKind {
     Name(String),
     Parameter,
     TypeParameter,
+    OptionalBound,
     ReturnType,
     Decorator {
         configured: bool,
     },
-    ConstructionCheck { configured: bool },
+    ConstructionCheck {
+        configured: bool,
+    },
     Int(i64),
     Float(f64),
     String(String),
     Bytes(Vec<u8>),
     Atom(String),
     Variable(String),
+    StaticPath(Vec<String>),
     InterpolatedString,
     Array,
     Tuple,
@@ -739,7 +796,10 @@ impl Mir {
         );
         let resolution = matches!(
             kind,
-            HirKind::Variable(_) | HirKind::PatternName(_) | HirKind::Field
+            HirKind::Variable(_)
+                | HirKind::StaticPath(_)
+                | HirKind::PatternName(_)
+                | HirKind::Field
         )
         .then(|| {
             let id = ResolveSlotId(
@@ -822,13 +882,23 @@ impl Mir {
                 writeln!(out, "constructor {id} => {constructor}").unwrap();
             }
         }
-        for (id, constructor) in self.resolution_facts.constructor_namespaces.iter().enumerate() {
+        for (id, constructor) in self
+            .resolution_facts
+            .constructor_namespaces
+            .iter()
+            .enumerate()
+        {
             if let Some(constructor) = constructor {
                 writeln!(out, "constructor-namespace {id} => {constructor}").unwrap();
             }
         }
         if !self.type_substitution.nodes.is_empty() {
-            writeln!(out, "type-substitution-parameters {:?}", self.type_substitution.parameters).unwrap();
+            writeln!(
+                out,
+                "type-substitution-parameters {:?}",
+                self.type_substitution.parameters
+            )
+            .unwrap();
             for (id, node) in self.type_substitution.nodes.iter().enumerate() {
                 writeln!(out, "type-substitution {id} {node:?}").unwrap();
             }
@@ -846,15 +916,29 @@ impl Mir {
             writeln!(out, "construction-check {id} {check:?}").unwrap();
         }
         for (node, target) in self.value_adjustments.iter().enumerate() {
-            if let Some(target) = target { writeln!(out, "value-adjustment {node} {:?}", self.ty_slots[target.index()]).unwrap(); }
+            if let Some(target) = target {
+                writeln!(
+                    out,
+                    "value-adjustment {node} {:?}",
+                    self.ty_slots[target.index()]
+                )
+                .unwrap();
+            }
         }
         for (node, target) in self.callable_boundaries.iter().enumerate() {
             if let Some(target) = target {
-                writeln!(out, "callable-boundary {node} {target:?} => {:?}", self.ty_slots[target.index()]).unwrap();
+                writeln!(
+                    out,
+                    "callable-boundary {node} {target:?} => {:?}",
+                    self.ty_slots[target.index()]
+                )
+                .unwrap();
             }
         }
         for (node, boundary) in self.propagation_boundaries.iter().enumerate() {
-            if let Some(boundary) = boundary { writeln!(out, "propagation-boundary {node} {boundary:?}").unwrap(); }
+            if let Some(boundary) = boundary {
+                writeln!(out, "propagation-boundary {node} {boundary:?}").unwrap();
+            }
         }
         for (id, bound) in self.bound_requirements.iter().enumerate() {
             writeln!(out, "bound {id} {bound:?}").unwrap();

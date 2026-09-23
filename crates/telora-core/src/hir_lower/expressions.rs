@@ -45,6 +45,20 @@ impl Lower<'_> {
                 let token = self.token(node, Token::Identifier).ok_or(())?;
                 Shape::Node(HirKind::Variable(self.text(token).into_owned()), vec![])
             }
+            Some(Rule::StaticPathExpr) => {
+                Shape::Alias(self.child(node, Rule::StaticPath)?, Mode::Expression)
+            }
+            Some(Rule::StaticPath) => {
+                let last = self
+                    .cst
+                    .children(node)
+                    .filter(|child| {
+                        matches!(self.cst.get(*child), Node::Token(Token::Identifier, _))
+                    })
+                    .last()
+                    .ok_or(())?;
+                Shape::Alias(node, Mode::Path(last))
+            }
             Some(Rule::ArrayExpr | Rule::ParenExpr) => {
                 let items = self.expressions(node);
                 let array = self.rule(node) == Some(Rule::ArrayExpr);

@@ -1,0 +1,18 @@
+use std::dyn as dyn;
+use std::transform_service as service;
+use std::value::{Value};
+
+type Constructed = struct {answer: Int};
+
+impl service::TransformService for Constructed {
+    init: fn(ctx) {
+        match dyn::construct@[Constructed]([dyn::pack(Int.type, 42)]) {
+            Ok(value) => value,
+            Err(_) => fail!("service construction failed"),
+        }
+    },
+    transform: fn(self, input) {Value::Int(self.answer)},
+};
+
+@service::collection
+pub type MainService = struct { @service::slot("transform") service: Constructed };

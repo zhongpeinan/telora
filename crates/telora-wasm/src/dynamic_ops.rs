@@ -5,6 +5,9 @@ use wasm_encoder::{BlockType, Instruction as I, ValType};
 
 impl Emitter<'_> {
     pub fn dynamic_native(&mut self, name: &str) -> Result<u32, String> {
+        if name == "from_dyn_fields" {
+            return self.dynamic_construct();
+        }
         if name == "field_raw" {
             return self.dynamic_named_field();
         }
@@ -47,7 +50,7 @@ impl Emitter<'_> {
                 self.emit(I::Unreachable);
                 return Ok(input);
             }
-            let id = self.table_push(VALUES, input, width);
+            let id = self.table_push(VALUES, input, width, Some(args[1]))?;
             let result = self.value_as(node, output, DYN_BYTES)?;
             self.store32(result, DATA, args[1].index() as u32);
             self.store32(result, DATA + 4, 1);

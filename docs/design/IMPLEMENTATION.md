@@ -37,7 +37,7 @@ seal 的 MIR；执行入口必须通过 seal。后续阶段直接使用静态结
 | 封闭与只读查询 | `mir/seal.rs`、`mir_query.rs` |
 | 静态执行闭包与类型镜像 | `mir/executable.rs`、`type_image.rs` |
 | Wasm 生成与内存组装 | `crates/telora-wasm/src/{codegen,compose,template}.rs` |
-| 初始化、需求求值 | `crates/telora-wasm/src/{entry,properties,session}.rs` |
+| 初始化、需求求值 | `crates/telora-wasm/src/{transform_service,properties,session}.rs` |
 | Rust RT、值与复制回收 | `crates/telora-wasm/rt/`、`rt/collect.rs`、`rt/collect_trace.rs` |
 | RT 共享 ABI、JSON 文本原语 | `crates/telora-wasm-shared/src/` |
 | package 与 Host 契约 | `package.rs`、`runtime_host.rs` |
@@ -46,8 +46,8 @@ seal 的 MIR；执行入口必须通过 seal。后续阶段直接使用静态结
 
 codegen 消费 SealedExecutable，生成 Wasm 指令和类型确定的胶水。Rust RT 在 Cargo
 构建期间预编译、预链接并嵌入 Telora；用户执行期间无需外部 linker，不写临时代码文件。
-执行统一为 Wasm/wasmi；`telora build` 可保存普通 Wasm，`telora-run` 独立执行制品。
-没有运行后端选择开关或持久化 snapshot 功能。
+执行统一为 Wasm/wasmi；`telora build` 可保存普通 Wasm，也可嵌入初始化 snapshot，
+`telora-run` 独立执行制品。没有运行后端选择开关。
 
 ## 2. Frontend 与静态诊断
 
@@ -103,7 +103,7 @@ HIR 保留仍有意义的操作和绑定，以 `Missing` 表示没有语法证�
 拼接或替换 parser 的结论。后续静态 Pass 可以继续求解已有信息，但含 `Missing` 的图不能 seal。
 
 模块状态包括 `Unloaded`、`Source`、`Data` 和 `Unavailable`。符号求解结果包括
-`Bound`、`Unresolved` 和 `Conflicted`；冲突区分重复定义、多个 import 候选等。
+`Bound`、`Unresolved` 和 `Conflicted`；冲突区分重复定义、多个 `use` 候选等。
 `ResolveState::Member` 表示已交给类型阶段的成员约束，不是遗留的词法名称查找。
 
 类型求解中的槽状态为：
@@ -158,27 +158,28 @@ CLI 的 `package_host` 先准备 `ResolvedWorkspace`：发现 workspace、校验
 manifest，并完成需要的 package 安装。解析器和 VM 不执行 package acquisition，也不
 隐式重写 lock。package preparation 与业务服务初始化分离。
 
-`static_input::Inventory` 从所有可用模块名称建立清单。module Pass 先排序清单并分配
-ModuleId，再从所选根逐级读取可达源码。共享依赖只读入并解析一次，未到达模块保持
-Unloaded。完整 inventory 的身份分配与源码读取、初始化顺序无关。
+`static_input::Inventory` 保存 package root 和可按 cname 访问的来源。module Pass 从
+固定根开始，解析 CST 后沿 `mod` / `data` 边发现并分配 ModuleId。共享依赖只读入并
+解析一次；未挂载文件不进入 MIR。发现顺序确定，且与源码读取和初始化顺序无关。
 
 源码访问边界以规范化 cname 为键，逻辑路径始终使用 `/`。Host 根据
 `telora-config.json`、`telora-crate.json` 和 `telora-lock.json` 建立资源地图，
-负责物理路径规范化、目录包含性检查和文件读取；传入 module Pass 的只有逻辑模块清单、
-入口 cname 和按 cname 读取文本的回调。物理路径不进入 MIR 的模块身份。
-入口直接从逻辑清单选择，不构造假文件路径或 `<pending>` 模块。内置源码、磁盘源码和
+负责物理路径规范化、目录包含性检查和文件读取；传入 module Pass 的只有入口 cname、
+发现回调和按 cname 读取文本的回调。物理路径不进入 MIR 的模块身份。
+入口直接从固定根或测试访问边界选择，不构造假文件路径或 `<pending>` 模块。内置源码、磁盘源码和
 编辑器文档使用同一逻辑身份边界。旧的基于物理路径的 `ModuleResolver` 已删除。
 
-`telora-crate.json` 的 modules 是源码与静态数据模块的权威清单。未声明文件只能产生
-warning，不能成为隐式 import 候选。测试选择额外递归建立当前 crate 的 `tests/` 清单，
-拒绝 symlink；测试模块可相互导入，普通源码不能反向导入测试。
+`telora-crate.json` 只声明 crate 名和直接依赖。每个 crate 固定从 `src/lib.telora`
+开始，CST 中的 `mod` / `data` 声明驱动按需发现；`use` 不能装载未挂载文件。测试选择
+额外递归建立当前 crate 的 `tests/` 访问边界并拒绝 symlink；测试模块可相互引用，
+普通源码不能反向访问测试。
 
 数据模块在静态阶段只有编译器生成的接口：
 
 ```telora
-import "std/value" { Value };
+use std::value::{ Value };
 decl data: Value;
-export { data };
+pub use self::{ data };
 ```
 
 数据内容在静态阶段不读取、不解析；因此类型检查成功不代表 JSON/YAML/TOML 内容有效。
@@ -208,10 +209,10 @@ Guest 中的数据解析使用 telora-data。独立 runner 的制品 envelope、
 协议使用 serde_json；这些 Host 协议与 Telora 的 JSON 数据解析不是同一入口。
 数据字节先传入 Guest，再接受格式与 DataLimits 检查；只有成功解析才安装为语言值。
 
-symbol Pass 先索引模块的声明、导出和作用域，再闭合引用。import * 建立搜索范围，
-具体引用才选择绑定；显式绑定与遮蔽按普通名称解析规则处理。内置类型的特殊身份来自
+symbol Pass 先索引模块声明、公开项和作用域，再闭合引用。`use` 的 namespace alias
+和选择性绑定都建立普通静态绑定；显式绑定与遮蔽按普通名称解析规则处理。内置类型的特殊身份来自
 native 声明的 NativeTypeId，不能根据 Int、Array 等拼写识别。默认的
-`import "std/prelude" *;` 提供普通名称；`@property` 等装饰器也遵循这些绑定规则。
+`std::prelude` fallback 提供普通名称；`@property` 等装饰器也遵循这些绑定规则。
 
 MIR 的模块、符号和类型身份都是本次完整构建中的索引。不要把旧 module/package API
 的 ID 编码或预留区间套用到 MIR 的 ID，也不承诺源码改变后数字保持不变。
@@ -300,8 +301,11 @@ codegen 的公开编译入口接受 SealedExecutable。表达式类型、泛型�
 普通构造拒绝产生运行时失败，codec 解码拒绝返回 Err。读取或复制已完成的值不会重新
 执行构造校验；新构造与 `<~` 更新会检查其结果。
 
-运行时值头包含 12 字节 Loc（src/start/end 三个 u32）和 4 字节 TypeId（共 16 字节），
-后接由静态布局决定的 payload。标量值为 24 字节；函数保存函数表索引与闭包环境。
+运行时值头是一个 8 字节 packed Loc（src-id:14、start/end:25），后接由静态布局
+决定的 payload。普通值不逐值保存 TypeId：函数签名、字段/元素布局、demand 根和 Host
+typed handle 提供封闭类型；Dyn payload 保留具体 TypeId。标量值为 16 字节；函数保存
+函数表索引与闭包环境。闭包环境将捕获指针和对应封闭 TypeId 分列存储，collector 不从
+被捕获值反查类型。
 Array、Record 等对象位于各自 typed table；Tuple/Record 共用 Record table。
 String/Bytes 共用独立的 `Vec<u8>` 内容池：不足 16 字节时直接内联，最后一字节保存
 长度；其余值保存 `start/end/raw_start` 三个绝对偏移，最后一字节为 16。
@@ -328,7 +332,7 @@ pattern 使用单独的 member selection 事实，不执行值物化。
 enum 构造器代码按封闭签名和 variant 复用。其函数值的 environment 为 0，invoke
 将函数值地址作为第一个参数交给构造器胶水，用于复制 12 字节 Loc；payload
 仍按原布局搬运，不重写其来源。普通闭包使用非零环境句柄，调用约定不变。
-内部 ABI 版本为 25；旧 Wasm 制品需重新生成，不能混用旧布局或调用约定。
+内部 ABI 版本为 28；旧 Wasm 制品需重新生成，不能混用旧布局或调用约定。
 `interpreter!` 在构造时捕获输入函数，工厂和适配器使用普通值引用环境；
 没有适配器 memo 槽或 raw-parent 环境，回收不再扫描、修补冻结环境中的该类缓存。
 
@@ -370,6 +374,12 @@ SealedExecutable 确定全局值、具体函数实例与 property 初始化集�
 TypeId、carrier TypeId 和 member/site 身份建立键。同一键的 provider 按既定顺序
 fold，最终只有一个有效结果；不同成员仍是不同键。
 
+类型阶段证明 `Property(P)` 只检查声明关系，不执行 provider。执行阶段的需求表虽然
+允许依赖在首次读取时求值，但当前选入制品的具体 property 都是初始化根：生成的
+`telora_initialize` 会在服务发布前主动读取这些根，并完成其依赖。因此成功发布的
+service 不会在某次请求中首次计算这批 property；运行期通过 `Type` 和 member index
+反射查询的也是已初始化结果。这不意味着未进入执行闭包的 property 也被计算。
+
 生成代码访问 Wasm 内的需求状态表：Pending、Running、Ready、Failed。读取已完成值
 直接复用结果；再次请求 Running 节点报告依赖环，Failed 传播已有失败。
 codegen 不与运行时共用可变推导状态。
@@ -387,7 +397,9 @@ Host 缓冲区和 Rust 临时对象不经过这层语言对象存储。
 分类表的 payload 指向 words；Regex 等 Rust 资源独立持有。复制回收释放旧 words/content，
 不覆盖分配器元数据。释放允许分配器复用空间，不意味着 Wasm 线性内存缩页。
 
-初始化采用保守根集合进行 copy-collect；测试等显式保活边界继续支持 work copy-collect。
+初始化采用保守根集合进行 copy-collect，所有 Ready demand（包括 property 结果）
+均作为根保留；这不是按 service 实际会查询的 property 行进行的精确裁剪。
+测试等显式保活边界继续支持 work copy-collect。
 遍历依据闭合类型布局，更新所有移动句柄，保留共享与环。冻结前缀引用保持稳定。
 正常服务请求没有需要延续的临时根，直接 truncate 请求后缀，复用容量而不重建实例。
 线性内存允许保留高水位；只有 trap/poisoned 状态使用初始化快照恢复。
@@ -424,16 +436,20 @@ Wasmi 提供 fuel、内存增长与调用栈限制，Session 管理诊断和终�
 耗尽终止会话，不能伪装为可恢复语言失败，也不重置 fuel 后继续测试。
 
 目标是执行有边界、失控时能停机，不是精确计费或限制进程的实际资源占用。
-直接使用引擎 fuel；CLI 线性内存增长默认上限为 1024 MiB（1 GiB），函数表上限为 100 万项，
+直接使用引擎 fuel；CLI 线性内存增长默认上限为 64 MiB，函数表上限为 100 万项，
 调用栈沿用引擎限制。增长超限直接 trap，不模拟逻辑分配量，也不核算每次复制。
 这些是私有实现阈值；Wasm 内存边界不是进程 RSS 上限。
 
-workspace 配置的 `runtime.fuel` 和 `runtime.memoryLimit` 提供会话默认值，分别为
-100 和 1024，单位为 1,000,000 fuel 和 MiB（`1 << 20` 字节，16 个 Wasm 页）。CLI 正式参数
-`--with-fuel N`、`--with-memory-limit N` 仅在显式传入时逐项覆盖对应配置。
-N 必须为正整数，超出可表示范围的输入在配置或参数解析时拒绝。
-参数适用于所有执行命令；批量 roots、初始化与后续执行共享预算，不按模块数量放大，
-也不在用例或请求之间重置。`check --only-types` 不创建执行会话，因此没有执行用量报告。
+workspace 配置的 `runtime.initializationFuel` 与 `runtime.requestFuel` 默认分别为
+5000 和 1000（单位：百万 fuel）。`telora` CLI 的 `--initialization-fuel N` 与
+`--request-fuel N` 直接覆盖相应配置值；`telora build` 将最终预算写入制品，
+内存中的 Wasm 也采用同一规则。独立 `telora-run` 的同名参数覆盖制品预算。
+`runtime.memoryLimit` 默认 64 MiB（每 MiB 为 `1 << 20` 字节，即 16 个 Wasm 页）。
+`--with-memory-limit N` 覆盖内存边界。N 必须为正整数，超出可表示范围的
+输入在配置或参数解析时拒绝。惰性字节码翻译/验证不扣 Guest fuel。
+参数适用于所有执行命令。`check`/`test` 的批量 roots、初始化与用例在同一会话内共享
+预算，不按模块数量放大，也不在用例之间重置；`run`（含 `--serve URI`）在每次请求前 reset，每个
+请求获得独立预算，初始化不占用请求预算。`check --only-types` 不创建执行会话，因此没有执行用量报告。
 `--report-usage` 在执行会话结束时向 stderr 输出合法的 info 级 JSON 诊断
 （`schema: telora.execution/v1`、`record: diagnostic`、`code: execution-usage`）。
 `usage.fuel` 包含原始单位的 `limit`、`consumed`、`remaining`；`usage.linear_memory`
@@ -442,7 +458,7 @@ N 必须为正整数，超出可表示范围的输入在配置或参数解析时
 实例创建前的失败没有可报告的会话。这不是精确计费信息，也不进入命令的结果流。
 
 验收用持续尾递归与持续扩大数组的语言用例，验证分别因 fuel 和内存边界终止。
-测试使用较小内存边界，避免真的分配 1 GiB；不断言精确扣费次数。
+测试使用较小内存边界，避免真实耗尽默认配额；不断言精确扣费次数。
 
 数据入口单独使用 DataLimits 检查文件大小、节点数、深度、单容器成员数和 payload
 大小。通过 admission 后才物化 Value。Wasm 内的 codec/parse 同受引擎终止边界约束。
@@ -452,9 +468,9 @@ fixture 仅累计已接受的源文本字节作为粗略输入边界，保留展
 
 包管理继续使用私有 IMOS Host。应用不再创建 EES service。
 
-内置 std/_entry/transform 与应用在同一 MIR 中求解，MainService 的 init/transform
-实例由静态 trait 证据选择。Plan 是内部 (sources, initializer)；initializer 返回捕获 Self
-的已类型化 handler，with_diagnostics 包装每次调用。Host 不解码 Self。
+内置 std/_entry/collection 与应用在同一 MIR 中求解，MainService 各字段的 init/transform
+实例由静态 trait 证据选择。Plan 是内部 (sources, initializer)；initializer 构造集合并返回
+按静态路由选择字段服务的 handler，with_diagnostics 包装每次调用。Host 不解码服务状态。
 
 正常完成请求后，reset-service 先释放请求 Regex 资源，再恢复分类表基线并 truncate
 words/content，保留容量；Host 恢复执行 globals、debug 游标和每次请求的 fuel。
@@ -464,22 +480,22 @@ words/content，保留容量；Host 恢复执行 globals、debug 游标和每次
 恢复初始化快照及全部 mutable globals（包括 Rust stack pointer）。函数表固定。
 两条恢复路径都不重复 codegen、数据加载或 init；保留快照是异常恢复策略，不是旧值布局。
 
-## 9. CLI## 9. CLI 与 LSP 的阶段边界
+## 9. CLI 与 LSP 的阶段边界
 
 | 命令 | 消费边界 |
 | --- | --- |
-| query modules | inventory 清单 |
+| query modules | package root 与已发现模块 |
 | query exports / at、LSP 语义查询 | 三个静态 Pass 后的 MIR，可保留错误和未知事实 |
 | check --only-types | 三个 Pass 与 seal，不读取数据内容或执行 Telora 代码 |
 | check | seal、codegen、链接、数据注入及整图初始化 |
 | eval | 初始化后取得选中 Value 导出 |
 | test NAME | 初始化后执行该测试模块直接导出的 Test |
-| run / serve | 初始化 MainService，按请求调用 transform，间隙 reset |
+| run / serve | 初始化 MainService 集合，按 method 或 HTTP 路由调用字段服务，间隙 reset |
 
-`check MODULE_ID` 选择一个根。`check --lib` 选择当前 crate 清单里的全部模块，包括
-私有模块和数据模块；`check --tests` 递归选择当前 crate 的 tests/ 模块。两个开关
-可以组合，与显式 selector 互斥。依赖按导入加入同一张图；不会对每个根重启编译器。
-空集合成功，未声明文件仍不进入图。
+`check MODULE_ID` 选择一个根。`check --lib` 从当前 crate 的 `src/lib.telora` 发现并
+选择整个可达模块树，包括私有模块和数据模块；`check --tests` 递归选择当前 crate 的
+tests/ 模块。两个开关可以组合，与显式 selector 互斥。依赖按静态模块边加入同一张图；
+不会对每个根重启编译器。空集合成功，未挂载文件不进入图。
 
 批量 check 输出一份 `telora.check/v1` summary，roots 列出所选根。独立静态问题可
 一起报告，但任一静态错误都会阻止整图初始化，不提供逐模块独立成功/失败 session。
@@ -503,19 +519,21 @@ LSP 的 `mir_workspace` 把文档覆盖内容和磁盘清单送入同一静态�
 - 名称解析只做一次，类型阶段接受其 Bound/Unresolved/Conflicted 结论。
 - 类型推导只在静态阶段完成；codegen 与 VM 消费完整证据，不补猜类型。
 - seal 不隐藏未知、冲突或遗漏的泛型/构造证据，也不重新编号。
-- native 特殊身份来自声明的稳定标识，普通名称受 import、遮蔽和作用域规则约束。
+- native 特殊身份来自声明的稳定标识，普通名称受 `use`、遮蔽和作用域规则约束。
 - 类型骨架不依赖 property 值，数据内容不进入静态求解。
 - 初始化所选执行图的根并统一发布；移动回收保留共享、封闭类型身份和来源。
 - 构造校验覆盖新的合法值边界，不能用跳过检查换取性能。
 - query/LSP 可观察失败图，执行入口只能接受成功 seal 的图。
 
 验证入口包括三个 resolve 模块的单元测试、`crates/telora-wasm/src/tests/` 的
-执行与回收测试，以及 `crates/telora/tests/cli.rs`、`tests/runtime/` 和
+执行与回收测试，以及 `crates/telora/tests/cli/`、`tests/runtime/` 和
 `tests/language/`。语言规则与诊断回归优先使用 Telora 用例，检查成功、拒绝、来源、
 泛型实例以及构造/解码/更新边界。
 
 完整构建的确定性覆盖静态身份与所选执行闭包；Wasm 测试覆盖生成代码、初始化、
-数据来源和长期服务根。普通 Wasm 制品由 `telora build` 发布；`telora-run` 使用 wasmi 独立加载、注入和初始化。
+数据来源和长期服务根。Wasm 制品由 `telora build` 发布；`--snapshot` 可在 custom
+section 中携带 ready service 状态，同时保留原始代码与数据 bundle。`telora-run`
+使用 wasmi 独立加载；无显式 source 时恢复快照，有 source 时忽略快照并重新注入、初始化。
 两个 CLI 共用 `telora-run::transport` 的 JSONL/TCP HTTP/Unix socket HTTP 传输层，
 执行回调保持串行，各自执行入口负责 reset 和资源配额。HTTP 分帧由 Hyper 处理。
-持久化 snapshot、引擎替换与进一步减少复制不属于当前路径。
+引擎替换与进一步减少复制不属于当前路径。

@@ -1,7 +1,7 @@
-import "std/dyn" as dyn;
-import "std/codec" {encode, Value};
-import "std/transform-service" as entry;
-def erased: Fn(Dyn) -> Int = fn(value) { match dyn.check_int(value) { Some(value) => value, None => 0 } };
+use std::dyn as dyn;
+use std::codec::{encode, Value};
+use std::transform_service as entry;
+def erased: Fn(Dyn) -> Int = fn(value) { match dyn::check_int(value) { Some(value) => value, None => 0 } };
 def factory: for(T) Fn(TypeOf(T)) -> Fn(T) -> Int = interpreter!(dbg!(erased, "operand"));
 def other: for(T) Fn(TypeOf(T)) -> Fn(T) -> Int = interpreter!(erased);
 def initialized: Fn(Int) -> Int = factory(Int.type);
@@ -18,7 +18,7 @@ def nested: Fn(Int) -> Int = make_nested(42);
 def unused: for(T) Fn(TypeOf(T)) -> Fn(Int) -> Int = interpreter!(fn(value) {value});
 def checks: Fn() -> Value = fn() {
     let repeated = factory(Int.type);
-    encode(Value.type, [
+    encode([
         initialized != repeated,
         initialized != other(Int.type),
         repeated(42) == 42,
@@ -29,10 +29,11 @@ def checks: Fn() -> Value = fn() {
         unused(String.type)(42) == 42,
     ])
 };
-export def answer: Value = checks();
-type MainService = struct {};
-impl entry.TransformService for MainService {
+pub def answer: Value = checks();
+type LegacyService = struct {};
+impl entry::TransformService for LegacyService {
     init: fn(ctx) { {}.ty!(Self) },
     transform: fn(self, input) { checks() },
 };
-export {MainService};
+@entry::collection
+pub type MainService = struct { @entry::slot("transform") service: LegacyService };

@@ -78,9 +78,10 @@ impl<'a> Emitter<'a> {
         }
         let scratch = self.locals.len() as u32 + 2;
         self.locals.extend([ValType::I32, ValType::I64]);
-        let mut function = crate::object::ObjectFunction::new(Function::new(
-            self.locals.into_iter().map(|ty| (1, ty)),
-        ), scratch);
+        let mut function = crate::object::ObjectFunction::new(
+            Function::new(self.locals.into_iter().map(|ty| (1, ty))),
+            scratch,
+        );
         let count = FIRST_FUNCTION + self.plan.functions.len() as u32 + self.plan.generated_helpers;
         if demand.is_some() {
             function.instruction(&I::Block(wasm_encoder::BlockType::Result(ValType::I32)));
@@ -157,10 +158,22 @@ impl<'a> Emitter<'a> {
             I::I32Store(memory(offset, 2)),
         ]);
     }
+    pub fn store64(&mut self, pointer: u32, offset: u64, value: u64) {
+        self.extend([
+            I::LocalGet(pointer),
+            I::I64Const(value as i64),
+            I::I64Store(memory(offset, 3)),
+        ]);
+    }
     pub fn store_location(&mut self, pointer: u32, loc: telora_core::Loc) {
-        self.store32(pointer, SOURCE, loc.source.get());
-        self.store32(pointer, START, loc.start);
-        self.store32(pointer, END, loc.end);
+        let loc = telora_wasm_shared::source_range::SourceRange::checked(
+            loc.source.get(),
+            loc.start,
+            loc.end,
+            telora_wasm_shared::source_range::OFFSET_LIMIT - 1,
+        )
+        .expect("source location exceeds packed range");
+        self.store64(pointer, SOURCE, loc.packed());
     }
     pub fn value(&mut self, node: HirId, bytes: u32) -> Result<u32, String> {
         let ty = self.effective_ty(node)?;
@@ -172,7 +185,6 @@ impl<'a> Emitter<'a> {
         }
         let result = self.alloc(bytes);
         self.produced_origin(result, node)?;
-        self.store32(result, TYPE, ty.index() as u32);
         Ok(result)
     }
     pub fn scalar(&mut self, node: HirId, bits: i64) -> Result<u32, String> {
@@ -205,12 +217,18 @@ impl<'a> Emitter<'a> {
         let pointer = self.alloc(DIAGNOSTIC_BYTES);
         self.store_location(pointer, location);
         self.store32(pointer, DIAG_CODE, code);
+        self.store32(
+            pointer,
+            DIAG_MESSAGE_TYPE,
+            self.string_type().expect("sealed String type").index() as u32,
+        );
         self.extend([
             I::LocalGet(pointer),
             I::GlobalGet(INITIALIZATION_ROOT_GLOBAL),
             I::I32Store(memory(DIAG_ROOT, 2)),
         ]);
-        self.table_push(DIAGNOSTICS, pointer, DIAGNOSTIC_BYTES);
+        self.table_push(DIAGNOSTICS, pointer, DIAGNOSTIC_BYTES, None)
+            .expect("diagnostic table push");
         self.extend([
             I::LocalGet(pointer),
             I::GlobalSet(ERROR_GLOBAL),
@@ -600,7 +618,6 @@ impl<'a> Emitter<'a> {
             self.construction_check(node, target, telora_core::mir::PropertySite::Type, value)?;
             let result = self.value_as(node, target, self.width(target)?)?;
             self.copy(result, 0, value, self.width(target)?);
-            self.store32(result, TYPE, target.index() as u32);
             return Ok(result);
         }
         Ok(value)
@@ -820,7 +837,7 @@ pub(crate) fn compile(
             let local = emit.local(ValType::I32);
             emit.extend([
                 I::LocalGet(0),
-                I::I32Load(memory(index as u64 * 4, 2)),
+                I::I32Load(memory(8 + index as u64 * 4, 2)),
                 I::LocalSet(local),
             ]);
             emit.bindings.insert(*symbol, local);
@@ -829,7 +846,10 @@ pub(crate) fn compile(
             let local = emit.local(ValType::I32);
             emit.extend([
                 I::LocalGet(0),
-                I::I32Load(memory((index + plan.captures[&key].len()) as u64 * 4, 2)),
+                I::I32Load(memory(
+                    8 + (index + plan.captures[&key].len()) as u64 * 4,
+                    2,
+                )),
                 I::LocalSet(local),
             ]);
             emit.local_instances.insert(*instance, local);

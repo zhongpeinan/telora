@@ -15,9 +15,12 @@ impl Session {
             self.write(data as usize, bytes)?;
             let length =
                 u32::try_from(bytes.len()).map_err(|_| "Wasm: string input size overflow")?;
-            let write = self.instance.get_typed_func::<(u32, u32, u32), u32>(
-                &self.store, "telora_content_write").map_err(|e| e.to_string())?;
-            write.call(&mut self.store, (pointer + DATA as u32, data, length))
+            let write = self
+                .instance
+                .get_typed_func::<(u32, u32, u32), u32>(&self.store, "telora_content_write")
+                .map_err(|e| e.to_string())?;
+            write
+                .call(&mut self.store, (pointer + DATA as u32, data, length))
                 .map_err(|e| e.to_string())?;
         }
         Ok(())
@@ -43,7 +46,41 @@ impl Session {
         table: u32,
         payload: u32,
         bytes: u32,
+        ty: Option<u32>,
     ) -> Result<u32, String> {
+        if matches!(table, RECORDS | ARRAYS | VALUES | NEWTYPES) {
+            let ty = ty.ok_or("Wasm: ordinary input object requires a closed layout")?;
+            let header = if table == ARRAYS { 16 } else { 8 };
+            let object = self.allocate((header + bytes) as usize)?;
+            self.write(object as usize, &ty.to_le_bytes())?;
+            if table == ARRAYS {
+                let width = self
+                    .manifest
+                    .types
+                    .get(ty as usize)
+                    .ok_or("Wasm: invalid array element TypeId")?
+                    .bytes;
+                let length = if width == 0 {
+                    if bytes != 0 {
+                        return Err("Wasm: uninhabited array has storage".into());
+                    }
+                    0
+                } else {
+                    if bytes % width != 0 {
+                        return Err("Wasm: array storage is not stride-aligned".into());
+                    }
+                    bytes / width
+                };
+                self.write((object + 4) as usize, &(object + header).to_le_bytes())?;
+                self.write((object + 8) as usize, &length.to_le_bytes())?;
+                self.write((object + 12) as usize, &length.to_le_bytes())?;
+                self.copy_input(object + header, payload, bytes as usize)?;
+            } else {
+                self.write((object + 4) as usize, &bytes.to_le_bytes())?;
+                self.copy_input(object + header, payload, bytes as usize)?;
+            }
+            return Ok(object);
+        }
         let push = self
             .instance
             .get_typed_func::<(i32, i32, i32), i32>(&self.store, "telora_table_push")
@@ -80,7 +117,6 @@ impl Session {
             return Err("Wasm: input has no value layout".into());
         }
         let pointer = self.allocate(descriptor.bytes as usize)?;
-        self.write(pointer as usize + TYPE as usize, &ty.to_le_bytes())?;
         match descriptor.kind {
             Kind::Unit => {
                 if !value.is_null() {
@@ -126,9 +162,12 @@ impl Session {
                     let value = self.input(element, item, depth + 1)?;
                     self.copy_input(data + index as u32 * stride, value, stride as usize)?;
                 }
-                let id = self.push_input(ARRAYS, data, bytes)?;
+                let id = self.push_input(ARRAYS, data, bytes, Some(element))?;
                 self.write(pointer as usize + (DATA as usize), &id.to_le_bytes())?;
-                self.write(pointer as usize + (DATA + 8) as usize, &length.to_le_bytes())?;
+                self.write(
+                    pointer as usize + (DATA + 8) as usize,
+                    &length.to_le_bytes(),
+                )?;
             }
             Kind::Record | Kind::Tuple => {
                 let valid = match descriptor.kind {
@@ -160,7 +199,7 @@ impl Session {
                     let width = self.manifest.types[field.ty as usize].bytes;
                     self.copy_input(data + field.offset, value, width as usize)?;
                 }
-                let id = self.push_input(RECORDS, data, bytes)?;
+                let id = self.push_input(RECORDS, data, bytes, Some(ty))?;
                 self.write(pointer as usize + (DATA as usize), &id.to_le_bytes())?;
             }
             Kind::Dict => self.input_dict(pointer, &descriptor, value, depth)?,
@@ -177,6 +216,7 @@ impl Session {
                     NEWTYPES,
                     payload,
                     self.manifest.types[field.ty as usize].bytes,
+                    Some(ty),
                 )?;
                 self.write(pointer as usize + (DATA as usize), &id.to_le_bytes())?;
             }

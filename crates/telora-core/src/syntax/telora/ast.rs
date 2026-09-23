@@ -157,8 +157,9 @@ pub enum Binding<'tree> {
     Type(TypeBinding<'tree>),
     Trait(TraitBinding<'tree>),
     Impl(ImplBinding<'tree>),
-    Import(ImportBinding<'tree>),
-    Export(ExportBinding<'tree>),
+    Module(ModuleDeclaration<'tree>),
+    Use(UseBinding<'tree>),
+    Data(DataBinding<'tree>),
 }
 
 impl<'tree> Binding<'tree> {
@@ -175,8 +176,9 @@ impl<'tree> Binding<'tree> {
             Rule::TypeBinding => Some(Self::Type(TypeBinding { syntax })),
             Rule::TraitBinding => Some(Self::Trait(TraitBinding { syntax })),
             Rule::ImplBinding => Some(Self::Impl(ImplBinding { syntax })),
-            Rule::ImportBinding => Some(Self::Import(ImportBinding { syntax })),
-            Rule::ExportStatement => Some(Self::Export(ExportBinding { syntax })),
+            Rule::ModuleDeclaration => Some(Self::Module(ModuleDeclaration { syntax })),
+            Rule::UseBinding => Some(Self::Use(UseBinding { syntax })),
+            Rule::DataBinding => Some(Self::Data(DataBinding { syntax })),
             _ => None,
         }
     }
@@ -191,8 +193,9 @@ impl<'tree> Binding<'tree> {
             Self::Type(node) => node.syntax,
             Self::Trait(node) => node.syntax,
             Self::Impl(node) => node.syntax,
-            Self::Import(node) => node.syntax,
-            Self::Export(node) => node.syntax,
+            Self::Module(node) => node.syntax,
+            Self::Use(node) => node.syntax,
+            Self::Data(node) => node.syntax,
         }
     }
 
@@ -206,8 +209,9 @@ impl<'tree> Binding<'tree> {
             Self::Type(node) => node.name(),
             Self::Trait(node) => node.name(),
             Self::Impl(_) => None,
-            Self::Import(node) => node.name(),
-            Self::Export(_) => None,
+            Self::Module(node) => node.name(),
+            Self::Use(_) => None,
+            Self::Data(node) => node.name(),
         }
     }
 }
@@ -239,8 +243,40 @@ binding_node!(NativeTypeBinding);
 binding_node!(TypeBinding);
 binding_node!(TraitBinding);
 binding_node!(ImplBinding);
-binding_node!(ImportBinding);
-binding_node!(ExportBinding);
+binding_node!(ModuleDeclaration);
+binding_node!(UseBinding);
+binding_node!(DataBinding);
+
+impl<'tree> DataBinding<'tree> {
+    pub fn annotation(self) -> Option<SyntaxNode<'tree>> {
+        child_node(self.syntax, Rule::TypeScheme)
+    }
+
+    pub fn import(self) -> Option<DataImport<'tree>> {
+        child_node(self.syntax, Rule::DataImport).map(|syntax| DataImport { syntax })
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct DataImport<'tree> {
+    syntax: SyntaxNode<'tree>,
+}
+
+impl<'tree> DataImport<'tree> {
+    pub fn syntax(self) -> SyntaxNode<'tree> {
+        self.syntax
+    }
+
+    pub fn format(self) -> Option<SyntaxToken<'tree>> {
+        child_node(self.syntax, Rule::DataFormat)?
+            .children()
+            .find_map(SyntaxNode::token)
+    }
+
+    pub fn source(self) -> Option<StringLiteral<'tree>> {
+        child_node(self.syntax, Rule::StringLiteral).map(|syntax| StringLiteral { syntax })
+    }
+}
 
 #[derive(Clone, Copy)]
 pub struct Decorator<'tree> {
@@ -418,23 +454,6 @@ impl<'tree> EnumInitializer<'tree> {
     }
 }
 
-impl<'tree> ImportBinding<'tree> {
-    pub fn path(self) -> Option<StringLiteral<'tree>> {
-        child_node(self.syntax, Rule::StringLiteral).map(|syntax| StringLiteral { syntax })
-    }
-
-    pub fn has_items(self) -> bool {
-        child_node(self.syntax, Rule::ImportSelector)
-            .and_then(|selector| child_node(selector, Rule::ImportItems))
-            .is_some()
-    }
-
-    pub fn has_selector(self) -> bool {
-        child_node(self.syntax, Rule::ImportSelector).is_some()
-            || child_node(self.syntax, Rule::MemberSelector).is_some()
-    }
-}
-
 #[derive(Clone, Copy)]
 pub struct Expr<'tree> {
     syntax: SyntaxNode<'tree>,
@@ -538,10 +557,7 @@ pub(super) fn validate_cancellable(
         if cancelled() {
             return None;
         }
-        if binding.name().is_none()
-            && !matches!(binding, Binding::Import(import) if import.has_selector())
-            && !matches!(binding, Binding::Export(_) | Binding::Impl(_))
-        {
+        if binding.name().is_none() && !matches!(binding, Binding::Impl(_) | Binding::Use(_)) {
             issues.push(missing_after_keyword(source, binding));
         }
         match binding {
@@ -572,13 +588,9 @@ pub(super) fn validate_cancellable(
                     Some(Token::Semicolon),
                     ExpectedSyntax::BindingValue,
                 )),
-            Binding::Import(node)
-                if node.path().is_none()
-                    && child_node(node.syntax, Rule::MemberSelector).is_none() =>
-            {
+            Binding::Data(node) if node.import().is_none_or(|import| import.source().is_none()) => {
                 issues.push(missing_at(source, node.syntax, ExpectedSyntax::ImportPath))
             }
-            Binding::Export(_) => {}
             _ => {}
         }
     }
@@ -642,6 +654,7 @@ fn is_expression_slot(syntax: SyntaxNode<'_>) -> bool {
                 | Rule::ReturnExpr
                 | Rule::SectionExpr
                 | Rule::SpreadExpr
+                | Rule::StaticPathExpr
                 | Rule::StringExpr
                 | Rule::TypeApplyExpr
                 | Rule::UnaryExpr
@@ -685,8 +698,9 @@ fn missing_after_keyword(source: SourceId, binding: Binding<'_>) -> SyntaxIssue 
         Binding::Type(_) => Token::Type,
         Binding::Trait(_) => Token::Trait,
         Binding::Impl(_) => Token::Impl,
-        Binding::Import(_) => Token::Import,
-        Binding::Export(_) => Token::Export,
+        Binding::Module(_) => Token::Mod,
+        Binding::Use(_) => Token::Use,
+        Binding::Data(_) => Token::Data,
     };
     let syntax = binding.syntax();
     let mut found_keyword = false;

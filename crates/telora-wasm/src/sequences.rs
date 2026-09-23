@@ -17,9 +17,14 @@ impl Emitter<'_> {
             .filter(|edge| edge.role == Role::Item)
             .map(|edge| edge.node)
             .collect::<Vec<_>>();
-        if items.iter().all(|item| !matches!(self.mir.hir[item.index()].kind, HirKind::Spread)) {
+        if items
+            .iter()
+            .all(|item| !matches!(self.mir.hir[item.index()].kind, HirKind::Spread))
+        {
             let count = u32::try_from(items.len()).map_err(|_| "Wasm: array length overflow")?;
-            let bytes = count.checked_mul(width).ok_or("Wasm: array size overflow")?;
+            let bytes = count
+                .checked_mul(width)
+                .ok_or("Wasm: array size overflow")?;
             let data = self.alloc(bytes);
             for (index, item) in items.into_iter().enumerate() {
                 self.extend([
@@ -30,12 +35,15 @@ impl Emitter<'_> {
                 self.expression_on_stack(item, element)?;
                 self.extend([
                     I::I32Const(width as i32),
-                    I::MemoryCopy { src_mem: 0, dst_mem: 0 },
+                    I::MemoryCopy {
+                        src_mem: 0,
+                        dst_mem: 0,
+                    },
                 ]);
             }
             let length = self.local(ValType::I32);
             self.extend([I::I32Const(count as i32), I::LocalSet(length)]);
-            return self.array_result_at(node, ty, data, length, width);
+            return self.array_result_at(node, ty, data, length, length, width);
         }
         let total = self.local(ValType::I64);
         let mut parts = Vec::new();
@@ -131,7 +139,7 @@ impl Emitter<'_> {
                 I::LocalSet(cursor),
             ]);
         }
-        self.array_result_at(node, ty, data, count, width)
+        self.array_result_at(node, ty, data, count, count, width)
     }
 
     pub fn tuple_expression(&mut self, node: HirId) -> Result<u32, String> {

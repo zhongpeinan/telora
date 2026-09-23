@@ -17,7 +17,7 @@ hello/
   telora-crate.json
   telora-lock.json
   src/
-    app.telora
+    lib.telora
 ```
 
 `telora-config.json` 定义 workspace package 来源：
@@ -34,7 +34,6 @@ hello/
 ```json
 {
   "name": "hello",
-  "modules": ["@src/app"],
   "dependencies": []
 }
 ```
@@ -43,7 +42,7 @@ hello/
 
 ```bash
 telora lock
-telora check @src/app
+telora check --lib
 telora query modules
 ```
 
@@ -54,11 +53,12 @@ telora query modules
 | 文件 | 所有权 | 内容 |
 | --- | --- | --- |
 | `telora-config.json` | workspace 作者 | member、远程 source 和开发 override |
-| `telora-crate.json` | crate 作者 | crate 名、普通模块清单和直接依赖名称 |
+| `telora-crate.json` | crate 作者 | crate 名和直接依赖名称 |
 | `telora-lock.json` | `telora lock` | 完整、精确且排序稳定的 package graph |
 
 workspace 中同一个 crate name 只有一个来源。crate 依赖只写名称；config 为名称选择
-workspace member 或远程 tarball；lock 固定选择结果、模块清单和依赖边。
+workspace member 或远程 tarball；lock 固定选择结果和依赖边。模块树不写入任何配置或
+lock 文件，而是从每个 crate 的 `src/lib.telora` 开始按 `mod` 声明发现。
 
 这三个 JSON 文件的正式属性名统一使用 camelCase。`sources`、`overrides` 和
 `packages` 中的键是 crate 名称，遵循 crate 命名规则，不进行大小写或连字符转换。
@@ -81,8 +81,9 @@ Telora 不进行语义版本求解，也不在同一 workspace 中安装同名 c
     "maxTypeArguments": 4096
   },
   "runtime": {
-    "fuel": 100,
-    "memoryLimit": 1024
+    "initializationFuel": 5000,
+    "requestFuel": 1000,
+    "memoryLimit": 64
   },
   "sources": {
     "codec-lib": {
@@ -107,16 +108,20 @@ Telora 不进行语义版本求解，也不在同一 workspace 中安装同名 c
 | `compiler.maxTypeDepth` | 256 | 归一化类型结构深度，叶节点深度为 1；不沿名义类型成员布局递归计数 |
 | `compiler.maxTupleItems` | 1024 | 单个 Tuple 的最大单元数 |
 | `compiler.maxTypeArguments` | 4096 | 单个类型节点的直接子类型数量，包括 Tuple、Record、类型列表和函数签名（含返回类型）；不是实例总数 |
-| `runtime.fuel` | 100 | 会话 fuel，1 表示 1,000,000 fuel |
-| `runtime.memoryLimit` | 1024 | Wasm 线性内存上限，单位 MiB：1 表示 `1 << 20` 字节（16 个 64 KiB 页）；不是进程 RSS |
+| `runtime.initializationFuel` | 5000 | 初始化预算，1 表示 1,000,000 fuel |
+| `runtime.requestFuel` | 1000 | 单次请求预算，1 表示 1,000,000 fuel |
+| `runtime.memoryLimit` | 64 | Wasm 线性内存上限，单位 MiB：1 表示 `1 << 20` 字节（16 个 64 KiB 页）；不是进程 RSS |
 
 编译限制只在此配置，没有对应 CLI 参数。整个静态求解 session 使用 workspace 根的
 配置，依赖 crate 不能覆盖；CLI 和 LSP 共用该设置。直接处理标准库模块时也读取
 当前 workspace 配置，没有 workspace 时才使用内置默认值。
 
-运行时限制按字段分别采用 **CLI 显式参数 > workspace 配置 > 内置默认值**：
-`--with-fuel N` 覆盖 `runtime.fuel`，`--with-memory-limit N` 覆盖 `runtime.memoryLimit`。
-显式传入默认数值也属于覆盖。初始化和后续运行共享会话预算；普通 `check` 使用
+运行时预算按字段采用 **CLI 显式参数 > workspace 配置 > 内置默认值**；CLI 的
+`--initialization-fuel N`、`--request-fuel N` 分别直接覆盖对应预算，
+`--with-memory-limit N` 覆盖 `runtime.memoryLimit`。
+`telora build` 保存最终预算；`telora-run` 同名参数可覆盖制品预算。
+`check`/`test` 的初始化与用例在同一会话内共享预算，
+`run`（含 `--serve URI`）每个请求在 reset 后获得独立预算；普通 `check` 使用
 运行时配置，`check --only-types` 不创建 VM。
 
 这两类配置不写入 `telora-lock.json`，调整限制不需要重新生成 lock。超出编译限制
@@ -203,39 +208,18 @@ override 不创建新的 package 身份。移除 override 后，同一个 crate/
 ```json
 {
   "name": "app",
-  "modules": [
-    "@src/main",
-    "@src/model",
-    "@src/schema/request.json"
-  ],
   "dependencies": ["query"]
 }
 ```
 
 ### `name`
 
-`name` 是 crate 的规范身份，也是其他 crate import 路径的首段。名称使用 ASCII 字母、
+`name` 是 crate 的规范身份，也是其他 crate 静态路径的首段。名称使用 ASCII 字母、
 数字和 `-`，不包含 `/`、`.` 或 `\\`，也不以 `_` 或 `@` 开头。
 
-### `modules`
-
-`modules` 是 `src/` 下普通模块的权威清单。每一项必须以 `@src/` 开头：
-
-```text
-@src/main                -> src/main.telora
-@src/model/user          -> src/model/user.telora
-@src/schema/request.json -> src/schema/request.json
-@src/schema/rules.yaml   -> src/schema/rules.yaml
-@src/config.toml         -> src/config.toml
-```
-
-Telora selector 省略且不能写 `.telora`。JSON、YAML、YML 和 TOML 静态数据模块保留格式
-后缀。模块文件名只能包含一个已知后缀；以 `.` 开头的文件不构成模块。
-
-清单中的文件必须存在并保持在 crate root 内。存在于 `src/`、但不在清单中的 Telora 或
-静态数据文件不会进入 resolver；`telora check` 会为它们产生 warning。
-
-`src/` 内的目录只组织逻辑路径，不赋予文件特殊执行身份。服务模块导出实现 TransformService 的具体类型 MainService。
+每个 crate 必须提供 `src/lib.telora`。它是唯一固定入口，使用 `mod` 或 `pub mod` 挂载
+其他源码模块；未从根可达的文件不属于模块图。manifest 中不存在 `modules` 字段。
+服务 crate 通常从根模块公开实现 TransformService 的具体类型 MainService。
 
 ### `dependencies`
 
@@ -247,75 +231,64 @@ Telora selector 省略且不能写 `.telora`。JSON、YAML、YML 和 TOML 静态
 }
 ```
 
-被引用的名称必须出现在 workspace members 或 config sources 中。一个 crate 只能 import
+被引用的名称必须出现在 workspace members 或 config sources 中。一个 crate 只能引用
 自己的模块和直接依赖；传递依赖不会自动成为可见依赖。
 
-## Module Identity 与 Import
+## Module Identity 与发现
 
 模块身份由 crate name 和逻辑路径组成，不包含 workspace、下载缓存或用户目录的物理
 路径：
 
 ```text
-当前 crate 的 @src/model -> app/model
+当前 crate 的 src/lib.telora       -> app
+当前 crate 的 src/model.telora     -> app/model
+当前 crate 的 src/model/user.telora -> app/model/user
 依赖 query 的 @src/types -> query/types
 内置标准库              -> std/...
 测试 @test/compiler      -> app/tests/compiler
 ```
 
-当前 crate 内推荐使用 root selector 或相对 selector：
+父模块先声明子模块，再通过静态路径绑定名字：
 
 ```telora
-import "@src/model" {User};
-import "./helpers" {normalize};
-import "../schema/request.json" {data as request_schema};
+pub mod model;
+mod helpers;
+use crate::model::{User};
+use self::helpers::{normalize};
+data request_schema = import(json) "../schema/request.json";
 ```
 
 依赖模块使用 crate name 作为首段：
 
 ```telora
-import "query/types" {Query};
-import "std/array" as array;
+use query::types::{Query};
+use std::array as array;
 ```
 
-`@src/` 始终相对于 importing module 所属 crate。依赖自身源码中的 `@src/types` 仍指向
-该依赖的 `src/types.telora`。`./` 和 `../` 按 importing module 的逻辑目录解析，不能
-越过 crate source root。
+`use` 只绑定已经存在的模块或公开成员，不读取文件，也不增加模块图边。`mod child;`
+从当前逻辑目录挂载 `child.telora`；位于根模块时对应 `src/child.telora`。嵌套模块采用
+同样规则，例如 `src/model.telora` 中的 `mod user;` 对应
+`src/model/user.telora`。模块发现不能越过 crate 的 `src/` 根。
 
-module import graph 在求值前封闭，并且不允许初始化 cycle。需要递归时，在单个模块或
+module graph 在求值前封闭，并且不允许初始化 cycle。需要递归时，在单个模块或
 已经建立的模块接口内使用语言的递归函数和递归 TypeMetadata。
 
 ## Public 与 Private Module
 
-文件 stem 以 `_` 开头的模块是 crate-private：
-
-```text
-src/_internal.telora
-src/model/_lowering.telora
-```
-
-同 crate 模块可以 import private module；依赖方只能看到公开模块。`telora query modules`
-会列出当前 crate 的 public/private 模块、直接依赖的 public 模块和公开 builtin 模块。
-
-私有性属于整个模块，不改变模块内 export 的含义。公开模块仍需显式 export 向依赖方
-承诺的类型和值。
+`mod child;` 挂载私有子模块，`pub mod child;` 同时把它加入父模块公开接口。模块中的
+声明默认私有；`pub def`、`pub type`、`pub trait` 及 `pub use` 明确形成
+公共接口。以下划线开头不再决定语义可见性。`telora query modules` 会列出当前 crate
+已发现的 public/private 模块、直接依赖中已发现的 public 模块和公开 builtin 模块。
 
 ## Static Data Module
 
-声明在 `modules` 中的 JSON、YAML 和 TOML 文件是静态数据模块：
-
-```json
-{
-  "modules": ["@src/config/defaults.json"]
-}
-```
-
 ```telora
-import "@src/config/defaults.json" {data as defaults};
+data defaults = import(json) "config/defaults.json";
 ```
 
-静态数据模块统一导出 `data: std/value.Value`。Host 在构造封闭模块图时加载数据并保留
-字段 provenance；这不是运行时文件 I/O。格式或字段导致的后续诊断可以引用稳定模块
-来源和 authored location。
+`data` 声明创建静态数据模块边，并在当前模块绑定一个 `std::value::Value`。路径相对
+声明它的源码模块；格式由 `import(json|yaml|toml)` 显式决定，扩展名不参与类型身份。
+Host 在构造封闭模块图时加载数据并保留字段 provenance；这不是运行时文件 I/O。
 
 ## Test Root
 
@@ -330,24 +303,24 @@ import "@src/config/defaults.json" {data as defaults};
 @test/parser/expressions -> tests/parser/expressions.telora
 ```
 
-选中测试时，Host 递归枚举当前 crate 的 `tests/`，为所有 Telora、JSON、YAML 和 TOML
-文件建立本次调用的固定清单。它不写入 `telora-crate.json.modules` 或 lock，也不加入
-普通 `query modules` 的结果。符号链接（包括 `tests/` 根目录）不允许进入测试清单。
-其他后缀文件被忽略；未引用模块的源码不会被解析或求值。
+选中测试时，Host 递归枚举当前 crate 的 `tests/`，为测试入口和辅助文件建立本次调用
+的访问边界。它不写入 manifest 或 lock，也不加入普通 `query modules` 的结果。
+符号链接（包括 `tests/` 根目录）不允许进入测试边界。其他后缀文件被忽略；未引用
+模块的源码不会被解析或求值。
 `tests/x.telora` 与已声明的 `src/tests/x.telora` 会产生相同的 canonical name，
 测试准备阶段会拒绝这种命名冲突。
 
-测试通过 `@src/...` 导入所属 crate 已声明的普通模块，通过 `@test/...`、
-`<crate>/tests/...` 或相对路径导入测试模块。顶层测试和子目录辅助模块可以相互导入，
+测试通过所属 crate 的公开模块树访问普通模块，通过 `@test/...`、
+`<crate>/tests/...` 或相对路径访问测试模块。顶层测试和子目录辅助模块可以相互引用，
 所有合法拼写保持同一模块身份。相对路径不能越出测试清单；源码模块和其他 crate
 不能反向访问测试模块。循环依赖仍产生错误。
 
-清单中的文件不会自动执行。Host 只从选中根发现完整可达图，再严格初始化。
+访问边界中的文件不会自动执行。Host 只从选中根发现完整可达图，再严格初始化。
 被导入测试的错误会使本次测试失败；未引用测试的语法或求值错误不会影响本次
 结果。入口必须是非 private 的 Telora 模块，名称不带 `.telora`，可以包含子目录。
 当前必须显式指定一个名称，不提供无参数批量发现。初始化无错误后，`test` 按公开
-导出名执行入口直接导出的 `std/test.Test`；普通导入不执行依赖模块的 Test。
-`check` 和 query 不执行 Test。fixture 由 Host 作为数据源准备，不形成 import 边；
+公开名称执行入口直接公开的 `std::test::Test`；普通 `use` 不执行依赖模块的 Test。
+`check` 和 query 不执行 Test。fixture 由 Host 作为数据源准备，不形成模块边；
 其路径相对构造 `with_fixtures` 的模块，并限制在该模块所属 crate 内。
 API、失败规则和输出协议见 [CLI 指南](TELORA-CLI.md)。
 
@@ -359,7 +332,7 @@ telora check @test/compiler
 
 ## Workspace Lock
 
-`telora-lock.json` 固定 workspace 中每个 package 的 source、module 清单和直接依赖：
+`telora-lock.json` 固定 workspace 中每个 package 的 source 和直接依赖：
 
 ```json
 {
@@ -367,41 +340,44 @@ telora check @test/compiler
   "packages": {
     "app": {
       "source": {"workspace": "app"},
-      "modules": ["@src/main"],
       "dependencies": ["query"]
     },
     "query": {
       "source": {
         "tarball": "https://packages.example/query-r17.tar.gz"
       },
-      "modules": ["@src/lib"],
       "dependencies": []
     }
   }
 }
 ```
 
-lock 是完整 package graph，而不是单个 crate 的依赖片段。模块和依赖数组使用确定顺序。
+lock 是完整 package graph，而不是单个 crate 的依赖片段。依赖数组使用确定顺序；模块
+不进入 lock，从相应发布内容的 `src/lib.telora` 发现。
 workspace config、member manifest 或远程基线发生变化后运行：
 
 ```bash
 telora lock
 ```
 
-`eval`、`run`、`serve`、`test`、`check`、`query` 和 LSP 都要求 lock 存在且与当前
+`eval`、`run`、`test`、`check`、`query` 和 LSP 都要求 lock 存在且与当前
 config、manifest 和远程物化结果一致。发现陈旧 lock 时，命令会要求刷新，不会隐式
 改写它。
 
+远程 tarball 由 Host 通过 IMOS store 物化，默认使用 IMOS 的用户缓存目录。
+`TELORA_IMOS_STORE` 可覆盖该目录；空值会报错。包获取只发生在 Host 的
+workspace 准备阶段，不向 Telora 程序提供外部 I/O 能力。
+
 ## Resolver 顺序
 
-resolver 在加载模块前冻结 crate 清单：
+resolver 在加载模块前冻结 package graph：
 
-1. builtin vendor 提供 `std` crate；
-2. 当前 crate 提供自身模块；
-3. manifest 中的直接依赖提供各自公开模块。
+1. builtin vendor 提供以 `std/lib.telora` 为根的 `std` crate；
+2. 当前 crate 以自身 `src/lib.telora` 为根；
+3. manifest 中的直接依赖各自以 `src/lib.telora` 为根。
 
 选择以整个 crate 为颗粒，并采用 first-win。一个来源已经提供某个 crate name 后，后续
-来源不能补充或覆盖其中的 module；配置中的 `std` 也不能改变内置 `std`。
+来源不能补充或覆盖其中的 module tree；配置中的 `std` 也不能改变内置 `std`。
 
 ## 常用工作流
 
@@ -412,10 +388,10 @@ telora lock
 telora query modules
 ```
 
-检查 crate 模块和未声明文件：
+检查 crate 的可达模块树：
 
 ```bash
-telora -C app check @src/main
+telora -C app check --lib
 ```
 
 发现依赖接口和本地定义：
@@ -431,5 +407,5 @@ telora -C app query at @src/main
 telora -C app eval @src/model:schema
 telora -C app run @src/compiler < request.json
 telora -C app run @src/service:run
-telora -C app serve @src/service --bind stdio+jsonl://
+telora -C app run @src/service --serve stdio+jsonl://
 ```

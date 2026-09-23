@@ -1,16 +1,17 @@
-import "std/path" as path;
-import "std/array" as array;
-import "std/codec" {encode, Value};
-import "std/transform-service" as entry;
+use std::path as path;
+use std::array as array;
+use std::codec::{encode, Value};
+use std::transform_service as entry;
 
 def inputs: Array(String) = ["", ".", "..", "/", "/../a//b/./../c/", "../../a/../b", "a/../../..", "a/..", "a", "/a", "a\\b", "目录/../文件", "a/../.."];
-export def answer: Value = encode(Value.type, (
-    array.map(inputs, fn(input) { (path.normalize(input), path.parent(input), path.file_name(input)) }),
-    [path.join([]), path.join(["a", "b", "..", "c"]), path.join(["a", "/b", "c"]), path.join(["a", "", ".."]), path.join(["..", "..", "a"])],
+pub def answer: Value = encode((
+    array::map(inputs, fn(input) { (path::normalize(input), path::parent(input), path::file_name(input)) }),
+    [path::join([]), path::join(["a", "b", "..", "c"]), path::join(["a", "/b", "c"]), path::join(["a", "", ".."]), path::join(["..", "..", "a"])],
 ));
-type MainService = struct {};
-impl entry.TransformService for MainService {
+type LegacyService = struct {};
+impl entry::TransformService for LegacyService {
     init: fn(ctx) { {}.ty!(Self) },
     transform: fn(self, input) { answer },
 };
-export {MainService};
+@entry::collection
+pub type MainService = struct { @entry::slot("transform") service: LegacyService };
